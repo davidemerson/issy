@@ -20,12 +20,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/zig
-          key: zig-linux-x86_64-${{ env.ZIG_VERSION }}
+          key: zig-x86_64-linux-${{ env.ZIG_VERSION }}
 
       - name: Install Zig
         if: steps.cache-zig.outputs.cache-hit != 'true'
         run: |
-          curl -L -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
+          curl -L -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
           mkdir -p ~/zig
           tar xf zig.tar.xz -C ~/zig --strip-components=1
 
@@ -59,12 +59,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/zig
-          key: zig-linux-x86_64-${{ env.ZIG_VERSION }}
+          key: zig-x86_64-linux-${{ env.ZIG_VERSION }}
 
       - name: Install Zig
         if: steps.cache-zig.outputs.cache-hit != 'true'
         run: |
-          curl -L -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
+          curl -L -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
           mkdir -p ~/zig
           tar xf zig.tar.xz -C ~/zig --strip-components=1
 
