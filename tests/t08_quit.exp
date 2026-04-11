@@ -1,0 +1,53 @@
+#!/usr/bin/expect -f
+# t08_quit.exp -- quit behavior tests
+
+set timeout 8
+set issy [lindex $argv 0]
+set test_dir [lindex $argv 1]
+source "$test_dir/helpers.tcl"
+
+# --- H1: Clean quit (no modifications) ---
+spawn $issy --no-config
+sleep 0.8
+send "\x11"; # Ctrl+Q
+expect eof
+wait
+puts stderr "PASS H1_clean_quit"
+record_result 1
+
+# --- H2: Modified buffer, Ctrl+Q doesn't exit, Escape cancels ---
+spawn $issy --no-config
+sleep 0.8
+send "x"
+sleep 0.2
+send "\x11"; # Ctrl+Q (should enter confirm mode, not exit)
+sleep 0.3
+send "\x1b"; # Escape (cancel confirm)
+sleep 0.3
+# Editor should still be alive -- type more to prove it
+send "y"
+sleep 0.2
+# Now force quit
+send "\x11"
+sleep 0.2
+send "\x11"
+expect eof
+wait
+puts stderr "PASS H2_confirm_escape"
+record_result 1
+
+# --- H3: Double Ctrl+Q force quits ---
+spawn $issy --no-config
+sleep 0.8
+send "x"
+sleep 0.2
+send "\x11"; # First Ctrl+Q
+sleep 0.3
+send "\x11"; # Second Ctrl+Q (force quit)
+expect eof
+wait
+puts stderr "PASS H3_force_quit"
+record_result 1
+
+# Cleanup
+report_results "t08_quit"

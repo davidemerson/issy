@@ -1,0 +1,202 @@
+#!/usr/bin/expect -f
+# t04_cursor.exp -- cursor movement tests using marker insertion
+
+set timeout 8
+set issy [lindex $argv 0]
+set test_dir [lindex $argv 1]
+source "$test_dir/helpers.tcl"
+
+set tmpdir [exec mktemp -d]
+
+# --- D1: Home key moves to start ---
+set f "$tmpdir/d1.txt"
+spawn $issy --no-config
+sleep 0.8
+send "abc"
+sleep 0.2
+send "\x1b\[H"; # Home
+sleep 0.2
+send "!"
+sleep 0.3
+send "\x13"
+sleep 0.5
+send "$f\r"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "!abc" "D1_home"]
+
+# --- D2: End key moves to end ---
+set f "$tmpdir/d2.txt"
+spawn $issy --no-config
+sleep 0.8
+send "abc"
+sleep 0.2
+send "\x1b\[H"; # Home
+sleep 0.2
+send "\x1b\[F"; # End
+sleep 0.2
+send "!"
+sleep 0.3
+send "\x13"
+sleep 0.5
+send "$f\r"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "abc!" "D2_end"]
+
+# --- D3: Right arrow ---
+set f "$tmpdir/d3.txt"
+spawn $issy --no-config
+sleep 0.8
+send "abc"
+sleep 0.2
+send "\x1b\[H"; # Home
+sleep 0.1
+send "\x1b\[C"; # Right
+sleep 0.1
+send "\x1b\[C"; # Right
+sleep 0.2
+send "!"
+sleep 0.3
+send "\x13"
+sleep 0.5
+send "$f\r"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "ab!c" "D3_right_arrow"]
+
+# --- D4: Left at start wraps to end of previous line ---
+set f "$tmpdir/d4.txt"
+spawn $issy --no-config
+sleep 0.8
+send "ab"
+sleep 0.1
+send "\r"; # Enter
+sleep 0.1
+send "cd"
+sleep 0.1
+send "\x1b\[H"; # Home (start of line 2)
+sleep 0.2
+send "\x1b\[D"; # Left (should wrap to end of line 1)
+sleep 0.2
+send "!"
+sleep 0.3
+send "\x13"
+sleep 0.5
+send "$f\r"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "ab!\ncd" "D4_left_wraps_prev"]
+
+# --- D5: Right at end wraps to start of next line ---
+set f "$tmpdir/d5.txt"
+spawn $issy --no-config
+sleep 0.8
+send "ab"
+sleep 0.1
+send "\r"
+sleep 0.1
+send "cd"
+sleep 0.1
+send "\x1b\[A"; # Up
+sleep 0.1
+send "\x1b\[F"; # End
+sleep 0.2
+send "\x1b\[C"; # Right (should wrap to start of line 2)
+sleep 0.2
+send "!"
+sleep 0.3
+send "\x13"
+sleep 0.5
+send "$f\r"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "ab\n!cd" "D5_right_wraps_next"]
+
+# --- D6: Up arrow ---
+set f "$tmpdir/d6.txt"
+spawn $issy --no-config
+sleep 0.8
+send "abc"
+sleep 0.1
+send "\r"
+sleep 0.1
+send "def"
+sleep 0.2
+send "\x1b\[A"; # Up
+sleep 0.2
+send "!"
+sleep 0.3
+send "\x13"
+sleep 0.5
+send "$f\r"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+# Cursor was at col 3 on line 2, up should go to col 3 on line 1
+record_result [assert_file $f "abc!\ndef" "D6_up"]
+
+# --- D7: Down arrow ---
+set f "$tmpdir/d7.txt"
+spawn $issy --no-config
+sleep 0.8
+send "abc"
+sleep 0.1
+send "\r"
+sleep 0.1
+send "def"
+sleep 0.2
+send "\x1b\[A"; # Up
+sleep 0.1
+send "\x1b\[B"; # Down
+sleep 0.2
+send "!"
+sleep 0.3
+send "\x13"
+sleep 0.5
+send "$f\r"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "abc\ndef!" "D7_down"]
+
+# --- D8: col_want preserved through up/down ---
+set f "$tmpdir/d8.txt"
+spawn $issy --no-config
+sleep 0.8
+send "abcdef"
+sleep 0.1
+send "\r"
+sleep 0.1
+send "xy"
+sleep 0.2
+send "\x1b\[A"; # Up (col_want=2, but line 1 has 6 chars so col=2)
+sleep 0.1
+send "\x1b\[B"; # Down (should return to col 2 on line 2)
+sleep 0.2
+send "!"
+sleep 0.3
+send "\x13"
+sleep 0.5
+send "$f\r"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "abcdef\nxy!" "D8_col_want"]
+
+# Cleanup
+exec rm -rf $tmpdir
+report_results "t04_cursor"

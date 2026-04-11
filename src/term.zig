@@ -224,7 +224,7 @@ fn readKeyPosix() !Key {
         readBufConsume(1);
         return .tab;
     }
-    if (b == 0x7f or b == 0x08) {
+    if (b == 0x7f) {
         readBufConsume(1);
         return .backspace;
     }
@@ -273,7 +273,9 @@ fn readKeyPosix() !Key {
 fn escapeLen(buf: []const u8) usize {
     // Determine how many bytes the escape sequence consumed
     if (buf.len < 2) return 1;
-    if (buf[1] != '[') return 2; // ESC + one char
+    // Only consume the next byte if it starts a real escape sequence (CSI)
+    // Otherwise treat ESC as standalone — don't eat the following character
+    if (buf[1] != '[') return 1;
 
     // CSI sequence: ESC [ ... <letter>
     var i: usize = 2;

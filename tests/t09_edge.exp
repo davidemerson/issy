@@ -1,0 +1,67 @@
+#!/usr/bin/expect -f
+# t09_edge.exp -- edge case tests
+
+set timeout 8
+set issy [lindex $argv 0]
+set test_dir [lindex $argv 1]
+source "$test_dir/helpers.tcl"
+
+set tmpdir [exec mktemp -d]
+set fixtures "$test_dir/fixtures"
+
+# --- I1: Empty file -- can type and save ---
+set f "$tmpdir/i1.txt"
+exec cp "$fixtures/empty.txt" $f
+spawn $issy --no-config $f
+sleep 0.8
+send "x"
+sleep 0.3
+send "\x13"; # Ctrl+S
+sleep 0.3
+send "\x11"; # Ctrl+Q
+expect eof
+wait
+record_result [assert_file $f "x" "I1_empty_file"]
+
+# --- I2: Long line -- End key, insert marker at end ---
+set f "$tmpdir/i2.txt"
+exec cp "$fixtures/longline.txt" $f
+set original [read_file $f]
+spawn $issy --no-config $f
+sleep 0.8
+send "\x1b\[F"; # End
+sleep 0.3
+send "!"
+sleep 0.3
+send "\x13"; # Ctrl+S
+sleep 0.3
+send "\x11"; # Ctrl+Q
+expect eof
+wait
+set expected "${original}!"
+record_result [assert_file $f $expected "I2_long_line_end"]
+
+# --- I3: File of only newlines ---
+set f "$tmpdir/i3.txt"
+exec cp "$fixtures/newlines.txt" $f
+spawn $issy --no-config $f
+sleep 0.8
+send "x"
+sleep 0.3
+send "\x13"; # Ctrl+S
+sleep 0.3
+send "\x11"; # Ctrl+Q
+expect eof
+wait
+set content [read_file $f]
+if {[string index $content 0] eq "x"} {
+    puts stderr "PASS I3_newlines_file"
+    record_result 1
+} else {
+    puts stderr "FAIL I3_newlines_file (first char = '[string index $content 0]')"
+    record_result 0
+}
+
+# Cleanup
+exec rm -rf $tmpdir
+report_results "t09_edge"

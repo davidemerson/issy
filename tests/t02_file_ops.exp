@@ -1,0 +1,99 @@
+#!/usr/bin/expect -f
+# t02_file_ops.exp -- file operation tests
+
+set timeout 8
+set issy [lindex $argv 0]
+set test_dir [lindex $argv 1]
+source "$test_dir/helpers.tcl"
+
+set tmpdir [exec mktemp -d]
+set fixtures "$test_dir/fixtures"
+
+# --- B1: Open existing file, quit without changes, file unchanged ---
+exec cp "$fixtures/multiline.txt" "$tmpdir/b1.txt"
+set original [read_file "$tmpdir/b1.txt"]
+spawn $issy --no-config "$tmpdir/b1.txt"
+sleep 0.8
+send "\x11"; # Ctrl+Q (clean quit, no changes)
+expect eof
+wait
+record_result [assert_file "$tmpdir/b1.txt" $original "B1_open_unchanged"]
+
+# --- B2: Open with file:line syntax, insert marker, verify line ---
+exec cp "$fixtures/multiline.txt" "$tmpdir/b2.txt"
+spawn $issy --no-config "$tmpdir/b2.txt:3"
+sleep 0.8
+send "!"; # Insert marker at line 3
+sleep 0.2
+send "\x13"; # Ctrl+S
+sleep 0.3
+send "\x11"; # Ctrl+Q
+expect eof
+wait
+# Line 3 is "line three", marker should be at start: "!line three"
+set content [read_file "$tmpdir/b2.txt"]
+set lines [split $content "\n"]
+set line3 [lindex $lines 2]
+if {[string index $line3 0] eq "!"} {
+    puts stderr "PASS B2_file_line_syntax"
+    record_result 1
+} else {
+    puts stderr "FAIL B2_file_line_syntax (line 3 = '$line3')"
+    record_result 0
+}
+
+# --- B3: Save existing file with edits ---
+exec echo -n "original" > "$tmpdir/b3.txt"
+spawn $issy --no-config "$tmpdir/b3.txt"
+sleep 0.8
+send "NEW "
+sleep 0.3
+send "\x13"; # Ctrl+S
+sleep 0.3
+send "\x11"; # Ctrl+Q
+expect eof
+wait
+record_result [assert_file "$tmpdir/b3.txt" "NEW original" "B3_save_existing"]
+
+# --- B4: Save-as for untitled buffer ---
+set f "$tmpdir/b4.txt"
+spawn $issy --no-config
+sleep 0.8
+send "new content"
+sleep 0.3
+send "\x13"; # Ctrl+S (enters command mode for save-as)
+sleep 0.5
+send "$f\r"
+sleep 0.3
+send "\x11"; # Ctrl+Q
+expect eof
+wait
+record_result [assert_file $f "new content" "B4_save_as_untitled"]
+
+# --- B5: New buffer (Ctrl+N) on clean buffer exits cleanly ---
+spawn $issy --no-config
+sleep 0.8
+send "\x0e"; # Ctrl+N
+sleep 0.3
+send "\x11"; # Ctrl+Q (should quit immediately since new buffer is clean)
+expect eof
+wait
+puts stderr "PASS B5_new_buffer"
+record_result 1
+
+# --- B6: Open non-existent file, no crash ---
+spawn $issy --no-config "/nonexistent/file.txt"
+sleep 0.8
+send "x"
+sleep 0.2
+send "\x11"; # Ctrl+Q
+sleep 0.2
+send "\x11"; # Force quit
+expect eof
+wait
+puts stderr "PASS B6_open_nonexistent"
+record_result 1
+
+# Cleanup
+exec rm -rf $tmpdir
+report_results "t02_file_ops"

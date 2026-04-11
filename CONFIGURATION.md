@@ -88,36 +88,44 @@ All colors use `#rrggbb` hex format.
 
 ### Default Theme Colors
 
+Black background with restrained syntax colors.
+
 ```
-bg = "#1a1b26"
-fg = "#a9b1d6"
-keyword = "#bb9af7"
-string_color = "#9ece6a"
-comment = "#3b4261"
-number_color = "#a9b1d6"
+bg = "#000000"
+fg = "#b0b8c8"
+keyword = "#c4a0f7"
+string_color = "#a0d06e"
+comment = "#444c5e"
+number_color = "#b0b8c8"
 type_color = "#7dcfff"
-function_color = "#a9b1d6"
+function_color = "#b0b8c8"
 operator_color = "#89ddff"
 preprocessor_color = "#e0af68"
-line_number_color = "#2a2e3f"
-line_number_active = "#545c7e"
-cursor_line_color = "#1e2030"
-selection_color = "#283457"
-trailing_ws_color = "#2a1f1f"
-indent_mismatch_color = "#2a1f1f"
+line_number_color = "#282c36"
+line_number_active = "#586070"
+cursor_line_color = "#0a0a0e"
+selection_color = "#1a2844"
+trailing_ws_color = "#1a1010"
+indent_mismatch_color = "#1a1010"
 ```
 
-### Paper Theme Colors
+### Paper Theme Colors (Solarized Light)
 
 ```
-bg = "#fafafa"
-fg = "#4a4a4a"
-keyword = "#7c3aed"
-string_color = "#16a34a"
-comment = "#c4c4c4"
-line_number_color = "#e0e0e0"
-cursor_line_color = "#f5f5f5"
-selection_color = "#e8e0ff"
+bg = "#fdf6e3"
+fg = "#657b83"
+keyword = "#6c71c4"
+string_color = "#2aa198"
+comment = "#93a1a1"
+number_color = "#d33682"
+type_color = "#b58900"
+function_color = "#268bd2"
+operator_color = "#657b83"
+preprocessor_color = "#cb4b16"
+line_number_color = "#eee8d5"
+line_number_active = "#93a1a1"
+cursor_line_color = "#eee8d5"
+selection_color = "#eee8d5"
 ```
 
 ## Boolean Values

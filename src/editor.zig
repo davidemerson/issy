@@ -628,27 +628,20 @@ pub const Editor = struct {
             while (remaining > 0) {
                 const sub = self.cursorVisualSubLine();
                 if (sub > 0) {
-                    // Move up to start of previous visual sub-line
+                    // Move up within wrapped line — preserve col_want relative to sub-line
                     self.cursor.col = self.subLineStartCol(sub - 1);
                     remaining -= 1;
                 } else if (self.cursor.line > 0) {
-                    // Move to previous buffer line, last visual sub-line
+                    // Move to previous buffer line — use col_want to preserve column
                     self.cursor.line -= 1;
-                    const prev_vlines = self.visualLinesForBufferLine(self.cursor.line);
-                    if (prev_vlines > 1) {
-                        self.cursor.col = self.subLineStartCol(prev_vlines - 1);
-                    } else {
-                        self.cursor.col = 0;
-                    }
                     const line_len = self.currentLineLen();
-                    self.cursor.col = @min(self.cursor.col, line_len);
+                    self.cursor.col = @min(self.cursor.col_want, line_len);
                     remaining -= 1;
                 } else {
                     self.cursor.col = 0;
                     break;
                 }
             }
-            self.cursor.col_want = self.cursor.col;
         } else {
             if (self.cursor.line >= count) {
                 self.cursor.line -= count;
@@ -668,17 +661,18 @@ pub const Editor = struct {
                 const sub = self.cursorVisualSubLine();
                 const total_vlines = self.visualLinesForBufferLine(self.cursor.line);
                 if (sub + 1 < total_vlines) {
-                    // Move to start of next visual sub-line
+                    // Move down within wrapped line
                     const target = self.subLineStartCol(sub + 1);
                     const line_len = self.currentLineLen();
                     self.cursor.col = @min(target, line_len);
                     remaining -= 1;
                 } else {
-                    // Move to next buffer line
+                    // Move to next buffer line — use col_want to preserve column
                     const max_line = if (self.buf.lineCount() > 0) self.buf.lineCount() - 1 else 0;
                     if (self.cursor.line < max_line) {
                         self.cursor.line += 1;
-                        self.cursor.col = 0;
+                        const line_len = self.currentLineLen();
+                        self.cursor.col = @min(self.cursor.col_want, line_len);
                         remaining -= 1;
                     } else {
                         self.moveCursorToLineEnd();
@@ -686,7 +680,6 @@ pub const Editor = struct {
                     }
                 }
             }
-            self.cursor.col_want = self.cursor.col;
         } else {
             self.cursor.line += count;
             const max_line = if (self.buf.lineCount() > 0) self.buf.lineCount() - 1 else 0;

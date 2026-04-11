@@ -9,49 +9,51 @@ const term = @import("term.zig");
 pub const Color = term.Color;
 
 /// Theme colors for syntax highlighting and UI elements.
+/// Default: black background with restrained syntax colors.
 pub const Theme = struct {
-    bg: Color = .{ .rgb = .{ .r = 0x1a, .g = 0x1b, .b = 0x26 } },
-    fg: Color = .{ .rgb = .{ .r = 0xa9, .g = 0xb1, .b = 0xd6 } },
-    comment: Color = .{ .rgb = .{ .r = 0x3b, .g = 0x42, .b = 0x61 } },
-    keyword: Color = .{ .rgb = .{ .r = 0xbb, .g = 0x9a, .b = 0xf7 } },
-    string: Color = .{ .rgb = .{ .r = 0x9e, .g = 0xce, .b = 0x6a } },
-    number: Color = .{ .rgb = .{ .r = 0xa9, .g = 0xb1, .b = 0xd6 } },
+    bg: Color = .{ .rgb = .{ .r = 0x00, .g = 0x00, .b = 0x00 } },
+    fg: Color = .{ .rgb = .{ .r = 0xb0, .g = 0xb8, .b = 0xc8 } },
+    comment: Color = .{ .rgb = .{ .r = 0x44, .g = 0x4c, .b = 0x5e } },
+    keyword: Color = .{ .rgb = .{ .r = 0xc4, .g = 0xa0, .b = 0xf7 } },
+    string: Color = .{ .rgb = .{ .r = 0xa0, .g = 0xd0, .b = 0x6e } },
+    number: Color = .{ .rgb = .{ .r = 0xb0, .g = 0xb8, .b = 0xc8 } },
     typ: Color = .{ .rgb = .{ .r = 0x7d, .g = 0xcf, .b = 0xff } },
-    function: Color = .{ .rgb = .{ .r = 0xa9, .g = 0xb1, .b = 0xd6 } },
+    function: Color = .{ .rgb = .{ .r = 0xb0, .g = 0xb8, .b = 0xc8 } },
     operator: Color = .{ .rgb = .{ .r = 0x89, .g = 0xdd, .b = 0xff } },
     preprocessor: Color = .{ .rgb = .{ .r = 0xe0, .g = 0xaf, .b = 0x68 } },
-    line_number: Color = .{ .rgb = .{ .r = 0x2a, .g = 0x2e, .b = 0x3f } },
-    line_number_active: Color = .{ .rgb = .{ .r = 0x54, .g = 0x5c, .b = 0x7e } },
-    cursor_line_bg: Color = .{ .rgb = .{ .r = 0x1e, .g = 0x20, .b = 0x30 } },
-    status_bg: Color = .{ .rgb = .{ .r = 0x1a, .g = 0x1b, .b = 0x26 } },
-    status_fg: Color = .{ .rgb = .{ .r = 0x3b, .g = 0x42, .b = 0x61 } },
-    cursor: Color = .{ .rgb = .{ .r = 0xc0, .g = 0xca, .b = 0xf5 } },
-    selection: Color = .{ .rgb = .{ .r = 0x28, .g = 0x34, .b = 0x57 } },
-    trailing_ws: Color = .{ .rgb = .{ .r = 0x2a, .g = 0x1f, .b = 0x1f } },
-    indent_mismatch: Color = .{ .rgb = .{ .r = 0x2a, .g = 0x1f, .b = 0x1f } },
+    line_number: Color = .{ .rgb = .{ .r = 0x28, .g = 0x2c, .b = 0x36 } },
+    line_number_active: Color = .{ .rgb = .{ .r = 0x58, .g = 0x60, .b = 0x70 } },
+    cursor_line_bg: Color = .{ .rgb = .{ .r = 0x0a, .g = 0x0a, .b = 0x0e } },
+    status_bg: Color = .{ .rgb = .{ .r = 0x00, .g = 0x00, .b = 0x00 } },
+    status_fg: Color = .{ .rgb = .{ .r = 0x44, .g = 0x4c, .b = 0x5e } },
+    cursor: Color = .{ .rgb = .{ .r = 0xd0, .g = 0xd8, .b = 0xf0 } },
+    selection: Color = .{ .rgb = .{ .r = 0x1a, .g = 0x28, .b = 0x44 } },
+    trailing_ws: Color = .{ .rgb = .{ .r = 0x1a, .g = 0x10, .b = 0x10 } },
+    indent_mismatch: Color = .{ .rgb = .{ .r = 0x1a, .g = 0x10, .b = 0x10 } },
 };
 
-/// Paper (light) theme.
+/// Paper theme — Solarized Light.
 pub const paper_theme = Theme{
-    .bg = .{ .rgb = .{ .r = 0xfa, .g = 0xfa, .b = 0xfa } },
-    .fg = .{ .rgb = .{ .r = 0x4a, .g = 0x4a, .b = 0x4a } },
-    .comment = .{ .rgb = .{ .r = 0xc4, .g = 0xc4, .b = 0xc4 } },
-    .keyword = .{ .rgb = .{ .r = 0x7c, .g = 0x3a, .b = 0xed } },
-    .string = .{ .rgb = .{ .r = 0x16, .g = 0xa3, .b = 0x4a } },
-    .number = .{ .rgb = .{ .r = 0x4a, .g = 0x4a, .b = 0x4a } },
-    .typ = .{ .rgb = .{ .r = 0x4a, .g = 0x4a, .b = 0x4a } },
-    .function = .{ .rgb = .{ .r = 0x4a, .g = 0x4a, .b = 0x4a } },
-    .operator = .{ .rgb = .{ .r = 0x6b, .g = 0x72, .b = 0x80 } },
-    .preprocessor = .{ .rgb = .{ .r = 0xb4, .g = 0x53, .b = 0x09 } },
-    .line_number = .{ .rgb = .{ .r = 0xe0, .g = 0xe0, .b = 0xe0 } },
-    .line_number_active = .{ .rgb = .{ .r = 0x9c, .g = 0xa3, .b = 0xaf } },
-    .cursor_line_bg = .{ .rgb = .{ .r = 0xf5, .g = 0xf5, .b = 0xf5 } },
-    .status_bg = .{ .rgb = .{ .r = 0xfa, .g = 0xfa, .b = 0xfa } },
-    .status_fg = .{ .rgb = .{ .r = 0xc4, .g = 0xc4, .b = 0xc4 } },
-    .cursor = .{ .rgb = .{ .r = 0x4a, .g = 0x4a, .b = 0x4a } },
-    .selection = .{ .rgb = .{ .r = 0xe8, .g = 0xe0, .b = 0xff } },
-    .trailing_ws = .{ .rgb = .{ .r = 0xff, .g = 0xf0, .b = 0xf0 } },
-    .indent_mismatch = .{ .rgb = .{ .r = 0xff, .g = 0xf0, .b = 0xf0 } },
+    // Solarized base colors
+    .bg = .{ .rgb = .{ .r = 0xfd, .g = 0xf6, .b = 0xe3 } },           // base3
+    .fg = .{ .rgb = .{ .r = 0x65, .g = 0x7b, .b = 0x83 } },           // base00
+    .comment = .{ .rgb = .{ .r = 0x93, .g = 0xa1, .b = 0xa1 } },      // base1
+    .keyword = .{ .rgb = .{ .r = 0x6c, .g = 0x71, .b = 0xc4 } },      // violet
+    .string = .{ .rgb = .{ .r = 0x2a, .g = 0xa1, .b = 0x98 } },       // cyan
+    .number = .{ .rgb = .{ .r = 0xd3, .g = 0x36, .b = 0x82 } },       // magenta
+    .typ = .{ .rgb = .{ .r = 0xb5, .g = 0x89, .b = 0x00 } },          // yellow
+    .function = .{ .rgb = .{ .r = 0x26, .g = 0x8b, .b = 0xd2 } },     // blue
+    .operator = .{ .rgb = .{ .r = 0x65, .g = 0x7b, .b = 0x83 } },     // base00
+    .preprocessor = .{ .rgb = .{ .r = 0xcb, .g = 0x4b, .b = 0x16 } }, // orange
+    .line_number = .{ .rgb = .{ .r = 0xee, .g = 0xe8, .b = 0xd5 } },  // base2 (very faint)
+    .line_number_active = .{ .rgb = .{ .r = 0x93, .g = 0xa1, .b = 0xa1 } }, // base1
+    .cursor_line_bg = .{ .rgb = .{ .r = 0xee, .g = 0xe8, .b = 0xd5 } },    // base2
+    .status_bg = .{ .rgb = .{ .r = 0xfd, .g = 0xf6, .b = 0xe3 } },    // base3 (same as bg)
+    .status_fg = .{ .rgb = .{ .r = 0x93, .g = 0xa1, .b = 0xa1 } },    // base1
+    .cursor = .{ .rgb = .{ .r = 0x58, .g = 0x6e, .b = 0x75 } },       // base01
+    .selection = .{ .rgb = .{ .r = 0xee, .g = 0xe8, .b = 0xd5 } },    // base2
+    .trailing_ws = .{ .rgb = .{ .r = 0xf0, .g = 0xe0, .b = 0xd0 } },  // warm tint on cream
+    .indent_mismatch = .{ .rgb = .{ .r = 0xf0, .g = 0xe0, .b = 0xd0 } },
 };
 
 /// Print theme — used only for PDF output. White paper with ink-appropriate colors.
@@ -344,7 +346,8 @@ test "paper theme has light bg" {
     const c = paper_theme.bg;
     switch (c) {
         .rgb => |rgb| {
-            try std.testing.expectEqual(@as(u8, 0xfa), rgb.r);
+            // Solarized Light base3 = #fdf6e3
+            try std.testing.expectEqual(@as(u8, 0xfd), rgb.r);
         },
         else => return error.TestUnexpectedResult,
     }

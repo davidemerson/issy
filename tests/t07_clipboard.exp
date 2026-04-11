@@ -1,0 +1,59 @@
+#!/usr/bin/expect -f
+# t07_clipboard.exp -- selection and clipboard tests
+
+set timeout 8
+set issy [lindex $argv 0]
+set test_dir [lindex $argv 1]
+source "$test_dir/helpers.tcl"
+
+set tmpdir [exec mktemp -d]
+
+# --- G1: Select all + copy + paste doubles text ---
+set f "$tmpdir/g1.txt"
+spawn $issy --no-config
+sleep 0.8
+send "hello"
+sleep 0.2
+send "\x01"; # Ctrl+A (select all)
+sleep 0.2
+send "\x03"; # Ctrl+C (copy)
+sleep 0.2
+send "\x1b"; # Escape (clear selection)
+sleep 0.3
+send "\x1b\[F"; # End
+sleep 0.2
+send "\x16"; # Ctrl+V (paste)
+sleep 0.3
+send "\x13"
+sleep 0.5
+send "$f\r"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "hellohello" "G1_copy_paste"]
+
+# --- G2: Cut removes text ---
+set f "$tmpdir/g2.txt"
+spawn $issy --no-config
+sleep 0.8
+send "hello"
+sleep 0.2
+send "\x01"; # Ctrl+A (select all)
+sleep 0.2
+send "\x18"; # Ctrl+X (cut)
+sleep 0.2
+send "world"
+sleep 0.3
+send "\x13"
+sleep 0.5
+send "$f\r"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "world" "G2_cut"]
+
+# Cleanup
+exec rm -rf $tmpdir
+report_results "t07_clipboard"

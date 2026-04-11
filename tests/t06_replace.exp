@@ -1,0 +1,59 @@
+#!/usr/bin/expect -f
+# t06_replace.exp -- search and replace tests
+
+set timeout 8
+set issy [lindex $argv 0]
+set test_dir [lindex $argv 1]
+source "$test_dir/helpers.tcl"
+
+set tmpdir [exec mktemp -d]
+
+# --- F1: Replace all ---
+set f "$tmpdir/f1.txt"
+exec echo -n "foo bar foo baz foo" > $f
+spawn $issy --no-config $f
+sleep 0.8
+send "\x08"; # Ctrl+H (replace mode)
+sleep 0.3
+send "foo"
+sleep 0.1
+send "\t"; # Tab to switch to replacement field
+sleep 0.1
+send "qux"
+sleep 0.1
+send "\x01"; # Ctrl+A (replace all)
+sleep 0.3
+send "\x13"; # Ctrl+S
+sleep 0.3
+send "\x11"; # Ctrl+Q
+expect eof
+wait
+record_result [assert_file $f "qux bar qux baz qux" "F1_replace_all"]
+
+# --- F2: Replace one (Enter replaces current and finds next) ---
+set f "$tmpdir/f2.txt"
+exec echo -n "aa bb aa cc" > $f
+spawn $issy --no-config $f
+sleep 0.8
+send "\x08"; # Ctrl+H
+sleep 0.3
+send "aa"
+sleep 0.1
+send "\t"
+sleep 0.1
+send "ZZ"
+sleep 0.1
+send "\r"; # Replace first occurrence
+sleep 0.3
+send "\x1b"; # Escape to exit replace mode
+sleep 0.3
+send "\x13"; # Ctrl+S
+sleep 0.3
+send "\x11"; # Ctrl+Q
+expect eof
+wait
+record_result [assert_file $f "ZZ bb aa cc" "F2_replace_one"]
+
+# Cleanup
+exec rm -rf $tmpdir
+report_results "t06_replace"

@@ -1,0 +1,86 @@
+#!/usr/bin/expect -f
+# t05_search.exp -- search tests
+
+set timeout 8
+set issy [lindex $argv 0]
+set test_dir [lindex $argv 1]
+source "$test_dir/helpers.tcl"
+
+set tmpdir [exec mktemp -d]
+set fixtures "$test_dir/fixtures"
+
+# --- E1: Ctrl+F search finds text, insert marker at match ---
+set f "$tmpdir/e1.txt"
+exec echo -n "hello world here" > $f
+spawn $issy --no-config $f
+sleep 0.8
+send "\x06"; # Ctrl+F
+sleep 0.3
+send "world"
+sleep 0.2
+send "\r"; # Enter to confirm search
+sleep 0.2
+send "!"; # Insert marker at found position
+sleep 0.3
+send "\x13"; # Ctrl+S
+sleep 0.3
+send "\x11"; # Ctrl+Q
+expect eof
+wait
+# "world" starts at index 6, cursor should be at 6, marker inserts before 'w'
+record_result [assert_file $f "hello !world here" "E1_search_find"]
+
+# --- E2: Escape from search restores cursor ---
+set f "$tmpdir/e2.txt"
+exec echo -n "aaa bbb ccc" > $f
+spawn $issy --no-config $f
+sleep 0.8
+# Move cursor right 4 times to be at "bbb"
+send "\x1b\[C\x1b\[C\x1b\[C\x1b\[C"
+sleep 0.3
+send "\x06"; # Ctrl+F
+sleep 0.2
+send "ccc"; # Search for "ccc"
+sleep 0.2
+send "\x1b"; # Escape (should restore cursor to col 4)
+sleep 0.3
+send "!"; # Insert marker
+sleep 0.3
+send "\x13"; # Ctrl+S
+sleep 0.3
+send "\x11"; # Ctrl+Q
+expect eof
+wait
+record_result [assert_file $f "aaa !bbb ccc" "E2_search_escape_restore"]
+
+# --- E3: Ctrl+G find next ---
+# After incremental search for "aa" in "aa bb aa cc", cursor ends at second "aa" (pos 6)
+# Ctrl+G from there should wrap to first "aa" (pos 0)
+# Then Ctrl+G again should go back to second "aa" (pos 6)
+set f "$tmpdir/e3.txt"
+exec echo -n "aa bb aa cc" > $f
+spawn $issy --no-config $f
+sleep 0.8
+send "\x06"; # Ctrl+F
+sleep 0.2
+send "aa"
+sleep 0.3
+send "\r"; # Confirm search
+sleep 0.5
+# Cursor is at second "aa" (pos 6) after incremental search
+send "\x07"; # Ctrl+G - wraps to first "aa" (pos 0)
+sleep 0.5
+send "\x07"; # Ctrl+G again - goes to second "aa" (pos 6)
+sleep 0.5
+send "!"; # Insert marker at second "aa"
+sleep 0.3
+send "\x13"; # Ctrl+S
+sleep 0.3
+send "\x11"; # Ctrl+Q
+expect eof
+wait
+record_result [assert_file $f "aa bb !aa cc" "E3_find_next"]
+
+# Cleanup
+exec rm -rf $tmpdir
+report_results "t05_search"

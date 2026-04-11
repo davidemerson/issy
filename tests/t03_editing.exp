@@ -1,0 +1,229 @@
+#!/usr/bin/expect -f
+# t03_editing.exp -- core text editing tests
+
+set timeout 8
+set issy [lindex $argv 0]
+set test_dir [lindex $argv 1]
+source "$test_dir/helpers.tcl"
+
+set tmpdir [exec mktemp -d]
+
+# --- C1: Type ASCII text and save-as ---
+set f "$tmpdir/c1.txt"
+spawn $issy --no-config
+sleep 0.8
+send "Hello World"
+sleep 0.3
+send "\x13"; # Ctrl+S
+sleep 0.5
+send "$f\r"
+sleep 0.3
+send "\x11"; # Ctrl+Q
+expect eof
+wait
+record_result [assert_file $f "Hello World" "C1_type_ascii"]
+
+# --- C2: Fast typing (100 chars, zero delay) -- regression for dropped keystrokes ---
+set f "$tmpdir/c2.txt"
+set fast_text "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz0123456789abcd"
+spawn $issy --no-config
+sleep 0.8
+send "$fast_text"
+sleep 0.5
+send "\x13"
+sleep 0.5
+send "$f\r"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f $fast_text "C2_fast_typing"]
+
+# --- C3: Enter with auto-indent ---
+set f "$tmpdir/c3.txt"
+spawn $issy --no-config
+sleep 0.8
+send "    indented"
+sleep 0.2
+send "\r"
+sleep 0.2
+send "next"
+sleep 0.3
+send "\x13"
+sleep 0.5
+send "$f\r"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "    indented\n    next" "C3_auto_indent"]
+
+# --- C4: Tab inserts spaces ---
+set f "$tmpdir/c4.txt"
+spawn $issy --no-config
+sleep 0.8
+send "a"
+sleep 0.1
+send "\t"
+sleep 0.1
+send "b"
+sleep 0.3
+send "\x13"
+sleep 0.5
+send "$f\r"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "a   b" "C4_tab_spaces"]
+
+# --- C5: Backspace mid-line ---
+set f "$tmpdir/c5.txt"
+spawn $issy --no-config
+sleep 0.8
+send "abc"
+sleep 0.2
+send "\x1b\[D"; # Left
+sleep 0.2
+send "\x7f"; # Backspace
+sleep 0.3
+send "\x13"
+sleep 0.5
+send "$f\r"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "ac" "C5_backspace_mid"]
+
+# --- C6: Backspace at line start joins lines ---
+set f "$tmpdir/c6.txt"
+spawn $issy --no-config
+sleep 0.8
+send "ab"
+sleep 0.1
+send "\r"
+sleep 0.1
+send "cd"
+sleep 0.1
+send "\x1b\[H"; # Home
+sleep 0.2
+send "\x7f"; # Backspace
+sleep 0.3
+send "\x13"
+sleep 0.5
+send "$f\r"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "abcd" "C6_backspace_join"]
+
+# --- C7: Delete key ---
+set f "$tmpdir/c7.txt"
+spawn $issy --no-config
+sleep 0.8
+send "abc"
+sleep 0.2
+send "\x1b\[H"; # Home
+sleep 0.2
+send "\x1b\[3~"; # Delete
+sleep 0.3
+send "\x13"
+sleep 0.5
+send "$f\r"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "bc" "C7_delete"]
+
+# --- C8: Undo single char ---
+set f "$tmpdir/c8.txt"
+spawn $issy --no-config
+sleep 0.8
+send "abc"
+sleep 0.2
+send "\x1a"; # Ctrl+Z
+sleep 0.3
+send "\x13"
+sleep 0.5
+send "$f\r"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "ab" "C8_undo_single"]
+
+# --- C9: Undo multiple to empty ---
+set f "$tmpdir/c9.txt"
+spawn $issy --no-config
+sleep 0.8
+send "a"
+sleep 0.15
+send "b"
+sleep 0.15
+send "c"
+sleep 0.15
+send "\x1a"
+sleep 0.15
+send "\x1a"
+sleep 0.15
+send "\x1a"
+sleep 0.3
+send "\x13"
+sleep 0.5
+send "$f\r"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "" "C9_undo_empty"]
+
+# --- C10: Redo restores ---
+set f "$tmpdir/c10.txt"
+spawn $issy --no-config
+sleep 0.8
+send "abc"
+sleep 0.2
+send "\x1a"; # Ctrl+Z
+sleep 0.2
+send "\x19"; # Ctrl+Y
+sleep 0.3
+send "\x13"
+sleep 0.5
+send "$f\r"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "abc" "C10_redo"]
+
+# --- C11: Undo+redo round-trip ---
+set f "$tmpdir/c11.txt"
+spawn $issy --no-config
+sleep 0.8
+send "X"
+sleep 0.15
+send "Y"
+sleep 0.15
+send "\x1a"
+sleep 0.15
+send "\x1a"
+sleep 0.15
+send "\x19"
+sleep 0.15
+send "\x19"
+sleep 0.3
+send "\x13"
+sleep 0.5
+send "$f\r"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "XY" "C11_undo_redo_roundtrip"]
+
+# Cleanup
+exec rm -rf $tmpdir
+report_results "t03_editing"

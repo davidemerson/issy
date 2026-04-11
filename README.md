@@ -137,9 +137,9 @@ font_file = "/path/to/font.ttf"
 
 ## Themes
 
-**default** -- Dark, restrained. Background `#1a1b26`, text `#a9b1d6`. Keywords are violet, strings are soft green, comments are nearly invisible. Most syntax colors sit close to the foreground luminance. The cursor line is a barely perceptible band.
+**default** -- Black background, restrained. Keywords are violet, strings are soft green, comments are dim. Most syntax colors sit close to the foreground luminance. The cursor line is a barely perceptible band.
 
-**paper** -- Light, same philosophy. Background `#fafafa`, text `#4a4a4a`. Purple keywords, green strings, light gray comments.
+**paper** -- Solarized Light. Warm cream background (`#fdf6e3`), muted body text. Violet keywords, cyan strings, yellow types. Designed for readability in bright environments.
 
 Both themes follow the design principle: only 2-3 token types get real chromatic contrast. The eye parses structure through gentle luminance shifts, not a rainbow.
 
@@ -162,6 +162,22 @@ issy --font "Berkeley Mono.ttf" --print output.pdf source.py
 ```
 
 Recommended fonts: Berkeley Mono, Iosevka, JetBrains Mono, Commit Mono.
+
+## Testing
+
+Unit tests (gap buffer, Unicode, tokenizer, etc.):
+
+```sh
+zig build test
+```
+
+Integration tests (end-to-end via expect, requires `/usr/bin/expect`):
+
+```sh
+bash tests/run_tests.sh
+```
+
+The integration suite covers 38 tests across file operations, text editing, cursor movement, search/replace, clipboard, quit behavior, and edge cases. Each test launches the real binary in a PTY, sends keystrokes, and verifies outcomes by checking saved file contents.
 
 ## Architecture
 
