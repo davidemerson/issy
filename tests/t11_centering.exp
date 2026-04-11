@@ -17,6 +17,8 @@ send "hello"
 sleep 0.3
 send "\x13"
 sleep 0.5
+for {set i 0} {$i < 200} {incr i} { send "\x7f" }
+sleep 0.2
 send "$f\r"
 sleep 0.3
 send "\x11"

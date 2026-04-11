@@ -63,6 +63,9 @@ send "new content"
 sleep 0.3
 send "\x13"; # Ctrl+S (enters command mode for save-as)
 sleep 0.5
+# Clear the CWD-seeded prompt
+for {set i 0} {$i < 200} {incr i} { send "\x7f" }
+sleep 0.2
 send "$f\r"
 sleep 0.3
 send "\x11"; # Ctrl+Q

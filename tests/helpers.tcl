@@ -43,11 +43,14 @@ proc save_quit {} {
     wait
 }
 
-# Save-as: Ctrl+S opens prompt, type path, Enter, then quit
+# Save-as: Ctrl+S opens prompt, clear CWD, type path, Enter, then quit
 proc save_as_quit {path} {
     ctrl s
     sleep 0.5
-    # Type path one char at a time to avoid read buffer issues
+    # Clear the CWD-seeded prompt
+    for {set i 0} {$i < 200} {incr i} { send "\x7f" }
+    sleep 0.2
+    # Type path
     foreach c [split $path ""] {
         send "$c"
     }
