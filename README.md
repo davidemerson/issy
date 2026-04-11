@@ -4,6 +4,18 @@ A text editor that looks like a printed page, not a terminal application.
 
 Built in Zig with zero external dependencies. Single binary, cross-compiles to Linux, macOS, Windows, and OpenBSD. Gap buffer text storage, syntax highlighting for 16 languages, PDF export with TTF/OTF font embedding, multiple cursors, undo/redo, and incremental search.
 
+## Downloads
+
+Pre-built binaries from the latest commit on main:
+
+| Platform | Package | Binary |
+|----------|---------|--------|
+| Linux x64 | [.deb](https://github.com/davidemerson/issy/releases/latest/download/issy_0.1.0-1_amd64.deb) / [.rpm](https://github.com/davidemerson/issy/releases/latest/download/issy-0.1.0-1.x86_64.rpm) | [issy-linux-amd64](https://github.com/davidemerson/issy/releases/latest/download/issy-linux-amd64) |
+| Linux ARM64 | [.deb](https://github.com/davidemerson/issy/releases/latest/download/issy_0.1.0-1_arm64.deb) / [.rpm](https://github.com/davidemerson/issy/releases/latest/download/issy-0.1.0-1.aarch64.rpm) | [issy-linux-arm64](https://github.com/davidemerson/issy/releases/latest/download/issy-linux-arm64) |
+| macOS x64 | | [issy-macos-amd64](https://github.com/davidemerson/issy/releases/latest/download/issy-macos-amd64) |
+| macOS ARM64 | | [issy-macos-arm64](https://github.com/davidemerson/issy/releases/latest/download/issy-macos-arm64) |
+| OpenBSD x64 | | [issy-openbsd-amd64](https://github.com/davidemerson/issy/releases/latest/download/issy-openbsd-amd64) |
+
 ## Build
 
 Requires [Zig](https://ziglang.org/) 0.15+.
