@@ -6,15 +6,31 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  ZIG_VERSION: "0.15.2"
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: mlugg/setup-zig@v1
+      - name: Cache Zig
+        id: cache-zig
+        uses: actions/cache@v4
         with:
-          version: 0.15.2
+          path: ~/zig
+          key: zig-linux-x86_64-${{ env.ZIG_VERSION }}
+
+      - name: Install Zig
+        if: steps.cache-zig.outputs.cache-hit != 'true'
+        run: |
+          curl -L -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
+          mkdir -p ~/zig
+          tar xf zig.tar.xz -C ~/zig --strip-components=1
+
+      - name: Add Zig to PATH
+        run: echo "$HOME/zig" >> $GITHUB_PATH
 
       - name: Unit tests
         run: zig build test
@@ -24,7 +40,7 @@ jobs:
 
       - name: Integration tests
         run: |
-          sudo apt-get install -y expect
+          sudo apt-get install -y -qq expect
           bash tests/run_tests.sh
 
   release:
@@ -35,31 +51,43 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-
-      - uses: mlugg/setup-zig@v1
         with:
-          version: 0.15.2
+          fetch-depth: 0
+
+      - name: Cache Zig
+        id: cache-zig
+        uses: actions/cache@v4
+        with:
+          path: ~/zig
+          key: zig-linux-x86_64-${{ env.ZIG_VERSION }}
+
+      - name: Install Zig
+        if: steps.cache-zig.outputs.cache-hit != 'true'
+        run: |
+          curl -L -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
+          mkdir -p ~/zig
+          tar xf zig.tar.xz -C ~/zig --strip-components=1
+
+      - name: Add Zig to PATH
+        run: echo "$HOME/zig" >> $GITHUB_PATH
 
       - name: Build all targets
         run: |
           mkdir -p dist
 
-          targets="x86_64-linux-gnu aarch64-linux-gnu x86_64-macos aarch64-macos x86_64-openbsd"
-          for target in $targets; do
-            echo "Building $target..."
+          declare -A names
+          names[x86_64-linux-gnu]="issy-linux-amd64"
+          names[aarch64-linux-gnu]="issy-linux-arm64"
+          names[x86_64-macos]="issy-macos-amd64"
+          names[aarch64-macos]="issy-macos-arm64"
+          names[x86_64-openbsd]="issy-openbsd-amd64"
+
+          for target in x86_64-linux-gnu aarch64-linux-gnu x86_64-macos aarch64-macos x86_64-openbsd; do
+            echo "::group::Building $target"
             zig build -Dtarget=$target -Doptimize=ReleaseSafe
-
-            # Determine output name
-            case "$target" in
-              x86_64-linux-gnu)   name="issy-linux-amd64" ;;
-              aarch64-linux-gnu)  name="issy-linux-arm64" ;;
-              x86_64-macos)       name="issy-macos-amd64" ;;
-              aarch64-macos)      name="issy-macos-arm64" ;;
-              x86_64-openbsd)     name="issy-openbsd-amd64" ;;
-            esac
-
-            cp zig-out/bin/issy "dist/$name"
-            chmod +x "dist/$name"
+            cp zig-out/bin/issy "dist/${names[$target]}"
+            chmod +x "dist/${names[$target]}"
+            echo "::endgroup::"
           done
 
           ls -lh dist/
@@ -69,84 +97,55 @@ jobs:
           sudo gem install fpm --no-document
 
           VERSION="0.1.0"
-
-          # Compress man page
           gzip -k issy.1
 
-          # Linux amd64
-          fpm -s dir -t deb \
-            -n issy -v "$VERSION" \
-            -a amd64 \
-            --description "A minimal text editor" \
-            --license ISC \
-            --category editors \
-            --maintainer "David Emerson" \
+          # amd64
+          fpm -s dir -t deb -n issy -v "$VERSION" -a amd64 \
+            --description "A minimal text editor" --license ISC \
+            --category editors --maintainer "David Emerson" \
             --url "https://github.com/davidemerson/issy" \
             dist/issy-linux-amd64=/usr/bin/issy \
             issy.1.gz=/usr/share/man/man1/issy.1.gz
 
-          fpm -s dir -t rpm \
-            -n issy -v "$VERSION" \
-            -a x86_64 \
-            --description "A minimal text editor" \
-            --license ISC \
-            --category "Applications/Editors" \
-            --maintainer "David Emerson" \
+          fpm -s dir -t rpm -n issy -v "$VERSION" -a x86_64 \
+            --description "A minimal text editor" --license ISC \
+            --category "Applications/Editors" --maintainer "David Emerson" \
             --url "https://github.com/davidemerson/issy" \
             dist/issy-linux-amd64=/usr/bin/issy \
             issy.1.gz=/usr/share/man/man1/issy.1.gz
 
-          # Linux arm64
-          fpm -s dir -t deb \
-            -n issy -v "$VERSION" \
-            -a arm64 \
-            --description "A minimal text editor" \
-            --license ISC \
-            --category editors \
-            --maintainer "David Emerson" \
+          # arm64
+          fpm -s dir -t deb -n issy -v "$VERSION" -a arm64 \
+            --description "A minimal text editor" --license ISC \
+            --category editors --maintainer "David Emerson" \
             --url "https://github.com/davidemerson/issy" \
             dist/issy-linux-arm64=/usr/bin/issy \
             issy.1.gz=/usr/share/man/man1/issy.1.gz
 
-          fpm -s dir -t rpm \
-            -n issy -v "$VERSION" \
-            -a aarch64 \
-            --description "A minimal text editor" \
-            --license ISC \
-            --category "Applications/Editors" \
-            --maintainer "David Emerson" \
+          fpm -s dir -t rpm -n issy -v "$VERSION" -a aarch64 \
+            --description "A minimal text editor" --license ISC \
+            --category "Applications/Editors" --maintainer "David Emerson" \
             --url "https://github.com/davidemerson/issy" \
             dist/issy-linux-arm64=/usr/bin/issy \
             issy.1.gz=/usr/share/man/man1/issy.1.gz
 
-          # Move packages to dist/
-          mv *.deb dist/
-          mv *.rpm dist/
-
-          # Copy man page
+          mv *.deb *.rpm dist/
           cp issy.1 dist/issy.1
-
           ls -lh dist/
 
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Delete existing 'latest' release if it exists
-          gh release delete latest --yes 2>/dev/null || true
-          git tag -d latest 2>/dev/null || true
-          git push origin :refs/tags/latest 2>/dev/null || true
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
 
-          # Create new release
           gh release create latest \
             --title "Latest Build" \
-            --notes "Automated build from the latest commit on main.
-
-          Built from commit $(git rev-parse --short HEAD) on $(date -u +%Y-%m-%d).
+            --notes "Automated build from commit \`$(git rev-parse --short HEAD)\` on $(date -u +%Y-%m-%d).
 
           **Install:**
-          - Debian/Ubuntu: \`sudo dpkg -i issy_0.1.0_amd64.deb\`
+          - Debian/Ubuntu: \`sudo dpkg -i issy_0.1.0-1_amd64.deb\`
           - RHEL/Fedora: \`sudo rpm -i issy-0.1.0-1.x86_64.rpm\`
-          - macOS/OpenBSD: \`chmod +x issy-* && mv issy-* /usr/local/bin/issy\`" \
+          - macOS/OpenBSD: \`chmod +x issy-* && sudo mv issy-* /usr/local/bin/issy\`" \
             --latest \
             dist/*
