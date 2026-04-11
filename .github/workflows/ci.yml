@@ -149,6 +149,6 @@ jobs:
           **Install:**
           - Debian/Ubuntu: \`sudo dpkg -i issy_0.1.0-1_amd64.deb\`
           - RHEL/Fedora: \`sudo rpm -i issy-0.1.0-1.x86_64.rpm\`
-          - macOS/OpenBSD: \`chmod +x issy-* && sudo mv issy-* /usr/local/bin/issy\`" \
+          - macOS: \`xattr -d com.apple.quarantine issy-macos-arm64 && chmod +x issy-macos-arm64 && sudo mv issy-macos-arm64 /usr/local/bin/issy\`" \
             --latest \
             dist/*

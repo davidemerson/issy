@@ -1,0 +1,132 @@
+#!/usr/bin/expect -f
+# t14_pdf.exp -- PDF export tests
+
+set timeout 15
+set issy [lindex $argv 0]
+set test_dir [lindex $argv 1]
+source "$test_dir/helpers.tcl"
+
+set tmpdir [exec mktemp -d]
+
+# We need a font file. Check if one exists at a known location.
+set font_paths [list \
+    "/Users/david/bmv.ttf" \
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf" \
+    "/usr/share/fonts/TTF/DejaVuSansMono.ttf" \
+    "/System/Library/Fonts/Menlo.ttc" \
+]
+set font_file ""
+foreach fp $font_paths {
+    if {[file exists $fp]} {
+        set font_file $fp
+        break
+    }
+}
+
+if {$font_file eq ""} {
+    puts stderr "SKIP t14_pdf: no font file found"
+    puts stderr ""
+    puts stderr "=== t14_pdf: 0/0 skipped (no font) ==="
+    exit 0
+}
+
+# --- P1: PDF export produces valid multi-page PDF ---
+set input "$tmpdir/p1_input.txt"
+set output "$tmpdir/p1_output.pdf"
+
+# Create a file with enough lines to span multiple pages
+set fd [open $input w]
+for {set i 1} {$i <= 100} {incr i} {
+    puts $fd "Line $i: This is test content for PDF export verification."
+}
+close $fd
+
+# Run headless PDF export
+set result [exec $issy --no-config --font $font_file --print $output $input 2>&1]
+
+if {[file exists $output]} {
+    set fd [open $output r]
+    fconfigure $fd -translation binary
+    set data [read $fd]
+    close $fd
+
+    set ok 1
+
+    # Check PDF header
+    if {![string match "%PDF-1.4*" $data]} {
+        puts stderr "FAIL P1_pdf_export: missing PDF header"
+        set ok 0
+    }
+
+    # Check for page content (BT/ET text blocks)
+    if {[string first "BT" $data] == -1} {
+        puts stderr "FAIL P1_pdf_export: no text content (BT missing)"
+        set ok 0
+    }
+
+    # Check for Pages object with non-zero count
+    if {[regexp {/Count (\d+)} $data _ count]} {
+        if {$count < 1} {
+            puts stderr "FAIL P1_pdf_export: Pages /Count is 0"
+            set ok 0
+        }
+    } else {
+        puts stderr "FAIL P1_pdf_export: no /Count in Pages object"
+        set ok 0
+    }
+
+    # Check for valid xref
+    if {[string first "xref\n0 " $data] == -1} {
+        puts stderr "FAIL P1_pdf_export: malformed xref"
+        set ok 0
+    }
+
+    # Check for %%EOF
+    if {[string first "%%EOF" $data] == -1} {
+        puts stderr "FAIL P1_pdf_export: missing %%EOF"
+        set ok 0
+    }
+
+    # File should be reasonably sized (font + content)
+    set size [file size $output]
+    if {$size < 1000} {
+        puts stderr "FAIL P1_pdf_export: file too small ($size bytes)"
+        set ok 0
+    }
+
+    # Check there's no duplicate obj 2 (the old Pages placeholder bug)
+    # Search for "\n2 0 obj\n" to avoid matching "12 0 obj" etc.
+    set count2 0
+    set idx 0
+    while {[set idx [string first "\n2 0 obj\n" $data $idx]] != -1} {
+        incr count2
+        incr idx
+    }
+    if {$count2 > 1} {
+        puts stderr "FAIL P1_pdf_export: duplicate obj 2 ($count2 occurrences)"
+        set ok 0
+    }
+
+    if {$ok} {
+        puts stderr "PASS P1_pdf_export"
+    }
+    record_result $ok
+} else {
+    puts stderr "FAIL P1_pdf_export: output file not created"
+    record_result 0
+}
+
+# --- P2: PDF export with no font gives error, not crash ---
+set output2 "$tmpdir/p2_output.pdf"
+set rc [catch {exec $issy --no-config --print $output2 $input 2>&1} msg]
+if {$rc != 0} {
+    puts stderr "PASS P2_no_font_error"
+    record_result 1
+} else {
+    puts stderr "FAIL P2_no_font_error: should have failed without --font"
+    record_result 0
+}
+
+# Cleanup
+exec rm -rf $tmpdir
+report_results "t14_pdf"

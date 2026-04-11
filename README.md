@@ -14,7 +14,14 @@ Pre-built binaries from the latest commit on main:
 | Linux ARM64 | [.deb](https://github.com/davidemerson/issy/releases/latest/download/issy_0.1.0-1_arm64.deb) / [.rpm](https://github.com/davidemerson/issy/releases/latest/download/issy-0.1.0-1.aarch64.rpm) | [issy-linux-arm64](https://github.com/davidemerson/issy/releases/latest/download/issy-linux-arm64) |
 | macOS x64 | | [issy-macos-amd64](https://github.com/davidemerson/issy/releases/latest/download/issy-macos-amd64) |
 | macOS ARM64 | | [issy-macos-arm64](https://github.com/davidemerson/issy/releases/latest/download/issy-macos-arm64) |
-| OpenBSD x64 | | [issy-openbsd-amd64](https://github.com/davidemerson/issy/releases/latest/download/issy-openbsd-amd64) |
+| OpenBSD x64 | | [build from source](#build) |
+
+**macOS note:** After downloading, remove the quarantine attribute before running:
+```sh
+xattr -d com.apple.quarantine issy-macos-arm64
+chmod +x issy-macos-arm64
+sudo mv issy-macos-arm64 /usr/local/bin/issy
+```
 
 ## Build
 

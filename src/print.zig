@@ -62,6 +62,17 @@ pub fn toPdf(ed: *editor_mod.Editor, output_path: []const u8) !void {
     var pdf = PdfWriter.init(ed.allocator);
     defer pdf.deinit();
 
+    // Sanitize font name for PDF Name objects (no spaces allowed)
+    var pdf_font_name: [256]u8 = undefined;
+    const raw_name = fnt.familyName();
+    var name_len: usize = 0;
+    for (raw_name) |c| {
+        if (name_len >= 256) break;
+        pdf_font_name[name_len] = if (c == ' ') '-' else c;
+        name_len += 1;
+    }
+    const font_name = pdf_font_name[0..name_len];
+
     // Header
     pdf.writeRaw("%PDF-1.4\n%\xc3\xa4\xc3\xbc\xc3\xb6\xc3\x9f\n");
 
@@ -70,18 +81,16 @@ pub fn toPdf(ed: *editor_mod.Editor, output_path: []const u8) !void {
     pdf.writeRaw("<< /Type /Catalog /Pages 2 0 R >>\n");
     pdf.endObj();
 
-    // Reserve obj 2 for Pages (written after we know page count)
-    // Obj 2 placeholder
-    _ = pdf.beginObj();
-    pdf.writeRaw("<< /Type /Pages /Kids [] /Count 0 >>\n");
-    pdf.endObj();
-    const pages_obj_offset_idx: usize = 1; // index into offsets array
+    // Reserve obj 2 for Pages — written at the end once we know the page list.
+    // Just increment the counter and add a placeholder offset.
+    pdf.obj_count += 1;
+    pdf.offsets.append(pdf.allocator, 0) catch {}; // will be overwritten
 
     // Obj 3: FontDescriptor
     _ = pdf.beginObj();
     const scale = @as(f32, 1000.0) / @as(f32, @floatFromInt(fnt.units_per_em));
     pdf.writeRaw("<< /Type /FontDescriptor\n");
-    pdf.writeFmt("/FontName /{s}\n", .{fnt.familyName()});
+    pdf.writeFmt("/FontName /{s}\n", .{font_name});
     pdf.writeRaw("/Flags 37\n");
     pdf.writeFmt("/FontBBox [{d} {d} {d} {d}]\n", .{
         @as(i32, @intFromFloat(@as(f32, @floatFromInt(fnt.x_min)) * scale)),
@@ -121,7 +130,7 @@ pub fn toPdf(ed: *editor_mod.Editor, output_path: []const u8) !void {
     } else {
         pdf.writeRaw("/Subtype /CIDFontType2\n");
     }
-    pdf.writeFmt("/BaseFont /{s}\n", .{fnt.familyName()});
+    pdf.writeFmt("/BaseFont /{s}\n", .{font_name});
     pdf.writeRaw("/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >>\n");
     pdf.writeRaw("/FontDescriptor 3 0 R\n");
     // Default width
@@ -156,7 +165,7 @@ pub fn toPdf(ed: *editor_mod.Editor, output_path: []const u8) !void {
     // Obj 7: Type0 font
     _ = pdf.beginObj();
     pdf.writeRaw("<< /Type /Font /Subtype /Type0\n");
-    pdf.writeFmt("/BaseFont /{s}\n", .{fnt.familyName()});
+    pdf.writeFmt("/BaseFont /{s}\n", .{font_name});
     pdf.writeRaw("/Encoding /Identity-H\n");
     pdf.writeRaw("/DescendantFonts [5 0 R]\n");
     pdf.writeRaw("/ToUnicode 6 0 R\n");
@@ -285,18 +294,13 @@ pub fn toPdf(ed: *editor_mod.Editor, output_path: []const u8) !void {
         page_obj_ids.append(ed.allocator, page_obj) catch {};
     }
 
-    // Rewrite Pages object (obj 2)
-    const pages_offset = pdf.out.items.len;
+    // Write Pages object (obj 2) — now that we know the page list
+    pdf.offsets.items[1] = pdf.out.items.len; // obj 2 is at offsets index 1
     pdf.writeFmt("2 0 obj\n<< /Type /Pages /Kids [", .{});
     for (page_obj_ids.items) |pid| {
         pdf.writeFmt("{d} 0 R ", .{pid});
     }
     pdf.writeFmt("] /Count {d} >>\nendobj\n", .{page_obj_ids.items.len});
-
-    // Update the offset for obj 2
-    if (pages_obj_offset_idx < pdf.offsets.items.len) {
-        pdf.offsets.items[pages_obj_offset_idx] = pages_offset;
-    }
 
     // xref table
     const xref_offset = pdf.out.items.len;
