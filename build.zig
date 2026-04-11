@@ -13,9 +13,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Link libc on POSIX targets for termios.
+    // Link libc on targets where Zig ships a bundled libc.
+    // OpenBSD/FreeBSD/NetBSD are excluded: Zig can't provide libc for them when
+    // cross-compiling, and std.posix works without it.
     const os_tag = target.result.os.tag;
-    if (os_tag == .linux or os_tag == .macos or os_tag == .openbsd or os_tag == .freebsd or os_tag == .netbsd) {
+    if (os_tag == .linux or os_tag == .macos) {
         exe.linkLibC();
     }
 
@@ -43,7 +45,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         const cross_os = ct.os_tag orelse .linux;
-        if (cross_os == .linux or cross_os == .macos or cross_os == .openbsd or cross_os == .freebsd or cross_os == .netbsd) {
+        if (cross_os == .linux or cross_os == .macos) {
             cross_exe.linkLibC();
         }
         const cross_install = b.addInstallArtifact(cross_exe, .{});
