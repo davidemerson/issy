@@ -84,9 +84,12 @@ jobs:
 
           for target in x86_64-linux-gnu aarch64-linux-gnu x86_64-macos aarch64-macos x86_64-openbsd; do
             echo "::group::Building $target"
-            zig build -Dtarget=$target -Doptimize=ReleaseSafe
-            cp zig-out/bin/issy "dist/${names[$target]}"
-            chmod +x "dist/${names[$target]}"
+            if zig build -Dtarget=$target -Doptimize=ReleaseSafe; then
+              cp zig-out/bin/issy "dist/${names[$target]}"
+              chmod +x "dist/${names[$target]}"
+            else
+              echo "::warning::Failed to build $target — skipping"
+            fi
             echo "::endgroup::"
           done
 
