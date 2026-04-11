@@ -1,0 +1,11 @@
+# Zig build artifacts
+issy/zig-cache/
+issy/.zig-cache/
+issy/zig-out/
+
+# Font files (large binaries)
+*.ttf
+*.otf
+
+# OS files
+.DS_Store

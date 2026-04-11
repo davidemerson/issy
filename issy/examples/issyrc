@@ -1,0 +1,96 @@
+# issy configuration
+#
+# Place this file at ~/.issyrc (POSIX) or %APPDATA%\issy\config (Windows).
+# Lines starting with # are comments. Unknown keys are ignored.
+
+# ── Editing ──
+
+# Number of spaces per tab stop
+# tab_width = 4
+
+# Insert spaces instead of tab characters
+# expand_tabs = true
+
+# Copy leading whitespace when pressing Enter
+# auto_indent = true
+
+# Automatically insert matching bracket/quote pairs
+# auto_close_brackets = false
+
+# Scan file on open to detect tabs vs spaces (overrides tab_width/expand_tabs per file)
+# auto_detect_indent = true
+
+# Minimum lines between cursor and screen edge before scrolling
+# scroll_margin = 5
+
+# ── Display ──
+
+# Show line numbers in the gutter
+# line_numbers = true
+
+# Spaces before line numbers
+# left_padding = 1
+
+# Spaces between line numbers and code
+# gutter_padding = 2
+
+# Soft-wrap long lines at the right margin. Continuation lines are indented.
+# word_wrap = true
+
+# Soft right margin — code stops here, rest is empty background. 0 = fill terminal.
+# right_margin = 100
+
+# Subtle full-width highlight on the current line
+# cursor_line_bg = true
+
+# Terminal cursor shape: bar, block, or underline
+# cursor_style = bar
+
+# Faintly highlight trailing spaces/tabs on non-empty lines
+# trailing_whitespace = true
+
+# Faintly highlight leading indent that doesn't match the detected file style
+# indent_mismatch = true
+
+# ── PDF / Print ──
+
+# Path to a TTF or OTF font file. Required for Ctrl+P and --print.
+# font_file = "/Library/Fonts/Berkeley Mono Variable.ttf"
+
+# Font size in points
+# font_size = 10.0
+
+# Page margins in points (72 points = 1 inch)
+# print_margin_top = 72.0
+# print_margin_bottom = 72.0
+# print_margin_left = 108.0
+# print_margin_right = 72.0
+
+# ── Theme ──
+#
+# Uncomment one of the following to switch themes:
+#   [theme.default]    — dark, restrained (this is the default)
+#   [theme.paper]      — light, restrained
+#
+# You can also override individual colors after the section header.
+# Colors use #rrggbb hex format.
+
+# [theme.paper]
+
+# Override individual colors:
+# bg = "#1a1b26"
+# fg = "#a9b1d6"
+# keyword = "#bb9af7"
+# string_color = "#9ece6a"
+# comment = "#3b4261"
+# number_color = "#a9b1d6"
+# type_color = "#7dcfff"
+# function_color = "#a9b1d6"
+# operator_color = "#89ddff"
+# preprocessor_color = "#e0af68"
+# line_number_color = "#2a2e3f"
+# line_number_active = "#545c7e"
+# cursor_line_color = "#1e2030"
+# selection_color = "#283457"
+# trailing_ws_color = "#2a1f1f"
+# indent_mismatch_color = "#2a1f1f"

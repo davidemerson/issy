@@ -1,0 +1,129 @@
+.TH ISSY 1 "2026" "issy 0.1.0" "User Commands"
+.SH NAME
+issy \- a minimal text editor
+.SH SYNOPSIS
+.B issy
+.RI [ options ] " " [ file\fR[:\fIline\fR]]
+.SH DESCRIPTION
+.B issy
+is a tiny, fast, cross-platform text editor written in Zig. It looks like a printed page, not a terminal application. Zero external dependencies.
+.SH OPTIONS
+.TP
+.B \-\-version
+Print version and exit.
+.TP
+.B \-\-help
+Print usage and exit.
+.TP
+.BI \-\-config " file"
+Use the specified configuration file.
+.TP
+.BI \-\-theme " name"
+Override theme (default, paper).
+.TP
+.BI \-\-font " path"
+TTF/OTF font file for PDF output.
+.TP
+.B \-\-no\-config
+Skip loading the configuration file.
+.TP
+.BI \-\-print " output.pdf"
+Export the file to PDF and exit without opening the TUI.
+.SH KEYBINDINGS
+.TP
+.B Ctrl+S
+Save file.
+.TP
+.B Ctrl+Q
+Quit (prompts if unsaved changes; press again to discard).
+.TP
+.B Ctrl+W
+Same as Ctrl+Q.
+.TP
+.B Ctrl+F
+Incremental search. Type to search, Enter to confirm, Escape to cancel.
+.TP
+.B Ctrl+G
+Find next match.
+.TP
+.B Ctrl+H
+Search and replace. Tab switches between fields. Enter replaces current and advances. Ctrl+A replaces all.
+.TP
+.B Ctrl+Z
+Undo.
+.TP
+.B Ctrl+Y
+Redo.
+.TP
+.B Ctrl+C
+Copy selection.
+.TP
+.B Ctrl+X
+Cut selection.
+.TP
+.B Ctrl+V
+Paste.
+.TP
+.B Ctrl+A
+Select all.
+.TP
+.B Ctrl+D
+Add cursor at next occurrence of word under cursor.
+.TP
+.B Ctrl+O
+Open file (prompts for path).
+.TP
+.B Ctrl+N
+New empty buffer.
+.TP
+.B Ctrl+P
+Export to PDF (requires font_file in config).
+.TP
+.B Ctrl+R
+Reload file from disk (when file has changed externally).
+.TP
+.B Escape
+Clear multi-cursors and selection.
+.TP
+.B Mouse scroll
+Scroll viewport without moving cursor.
+.TP
+.B Mouse click
+Position cursor at click location.
+.SH CONFIGURATION
+Configuration is read from
+.I ~/.issyrc
+on POSIX or
+.I %APPDATA%\\issy\\config
+on Windows. Format is line-oriented:
+.PP
+.nf
+# comment
+key = value
+key = "value with spaces"
+[theme.name]
+color_key = "#rrggbb"
+.fi
+.PP
+Keys: tab_width (default 4), expand_tabs (true), line_numbers (true), word_wrap (false), auto_indent (true), auto_close_brackets (false), auto_detect_indent (true), trailing_whitespace (true), indent_mismatch (true), scroll_margin (5), gutter_padding (2), left_padding (1), right_margin (100), cursor_line_bg (true), cursor_style (bar|block|underline), font_file, font_size (10.0), print_margin_top (72), print_margin_bottom (72), print_margin_left (108), print_margin_right (72).
+.SH THEMES
+.B default
+\- Dark, restrained. Most syntax colors near fg luminance. Keywords violet, strings green, comments nearly invisible.
+.PP
+.B paper
+\- Light, restrained. Same philosophy on white background.
+.PP
+Design philosophy: restraint. Only 2\-3 token types get real contrast. The eye parses structure through gentle luminance shifts.
+.SH PRINTING
+Requires
+.B font_file
+set in config to a TTF/OTF font path. PDF output uses a separate print theme with colors tuned for ink on white paper. Supports syntax highlighting, line numbers, headers, and page breaks.
+.SH FILES
+.TP
+.I ~/.issyrc
+User configuration (POSIX).
+.TP
+.I %APPDATA%\\issy\\config
+User configuration (Windows).
+.SH AUTHOR
+David Emerson
