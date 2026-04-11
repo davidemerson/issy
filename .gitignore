@@ -1,7 +1,7 @@
 # Zig build artifacts
-issy/zig-cache/
-issy/.zig-cache/
-issy/zig-out/
+zig-cache/
+.zig-cache/
+zig-out/
 
 # Font files (large binaries)
 *.ttf

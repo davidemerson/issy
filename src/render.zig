@@ -475,30 +475,22 @@ pub const Renderer = struct {
             };
             term.moveCursor(if (self.rows > 0) self.rows - 1 else 0, cursor_col);
         } else if (ed.config.word_wrap) {
-            // Compute cursor screen position accounting for wrapping
-            const wrap_w = ed.wrapWidth();
-            const cont_w = if (wrap_w > 2) wrap_w - 2 else 1;
-
             // Count visual rows from scroll_top to cursor line
             var vis_row: u16 = 0;
             var line = ed.scroll_top;
             while (line < ed.cursor.line) : (line += 1) {
-                vis_row += @intCast(@min(ed.visualLinesForBufferLine(line), self.rows));
+                vis_row +|= @intCast(@min(ed.visualLinesForBufferLine(line), self.rows));
             }
-
-            // Add sub-line offset within cursor's buffer line
-            var cur_col = ed.cursor.col;
-            if (cur_col <= wrap_w) {
-                // On first visual sub-line
-                term.moveCursor(vis_row, code_start + @as(u16, @intCast(@min(cur_col, std.math.maxInt(u16)))));
-            } else {
-                // On a continuation sub-line
-                cur_col -= wrap_w;
-                const sub_line = 1 + cur_col / cont_w;
-                const col_in_sub = cur_col % cont_w;
-                vis_row += @intCast(@min(sub_line, self.rows));
-                term.moveCursor(vis_row, code_start + 2 + @as(u16, @intCast(@min(col_in_sub, std.math.maxInt(u16)))));
-            }
+            // Add cursor's sub-line within its wrapped line
+            const sub = ed.cursorVisualSubLine();
+            vis_row +|= @intCast(@min(sub, self.rows));
+            // Column within sub-line
+            const col_in_sub = ed.cursorColInSubLine();
+            const indent: u16 = if (sub > 0) 2 else 0;
+            term.moveCursor(
+                @min(vis_row, self.rows -| 1),
+                code_start + indent + @as(u16, @intCast(@min(col_in_sub, std.math.maxInt(u16)))),
+            );
         } else {
             const cursor_row: u16 = if (ed.cursor.line >= ed.scroll_top)
                 @intCast(@min(ed.cursor.line - ed.scroll_top, self.rows - 1))

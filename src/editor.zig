@@ -86,6 +86,7 @@ pub const Editor = struct {
     detected_tab_width: ?u8 = null,
 
     confirm_action: enum { none, quit } = .none,
+    command_action: enum { open, save_as } = .open,
 
     pub fn init(config: *config_mod.Config, allocator: Allocator) Editor {
         return .{
@@ -425,6 +426,7 @@ pub const Editor = struct {
             },
             'o' => {
                 self.mode = .command;
+                self.command_action = .open;
                 self.prompt_len = 0;
                 return .redraw;
             },
@@ -502,10 +504,30 @@ pub const Editor = struct {
                 return .redraw;
             },
             .enter => {
-                const cmd = self.prompt_buf[0..self.prompt_len];
-                self.openFile(cmd) catch {
-                    self.setStatusMessage("Failed to open file.");
-                };
+                const path = self.prompt_buf[0..self.prompt_len];
+                switch (self.command_action) {
+                    .open => {
+                        self.openFile(path) catch {
+                            self.setStatusMessage("Failed to open file.");
+                        };
+                    },
+                    .save_as => {
+                        // Set filename and save
+                        if (path.len > 0 and path.len <= self.filename.len) {
+                            @memcpy(self.filename[0..path.len], path);
+                            self.filename_len = path.len;
+                            self.language = syntax_mod.detect(path);
+                            self.buf.save(path) catch {
+                                self.setStatusMessage("Save failed!");
+                                self.mode = .normal;
+                                return .redraw;
+                            };
+                            self.modified = false;
+                            self.updateMtime();
+                            self.setStatusMessage("Saved.");
+                        }
+                    },
+                }
                 self.mode = .normal;
                 return .redraw;
             },
@@ -592,28 +614,34 @@ pub const Editor = struct {
 
     // ── Cursor movement ──
 
+    /// Compute the starting buffer column of the Nth visual sub-line (0-indexed).
+    fn subLineStartCol(self: *Editor, sub: usize) usize {
+        if (sub == 0) return 0;
+        const w = self.wrapWidth();
+        const cont_w = if (w > 2) w - 2 else 1;
+        return w + (sub - 1) * cont_w;
+    }
+
     fn moveCursorUp(self: *Editor, count: u16) void {
         if (self.config.word_wrap) {
             var remaining: usize = count;
             while (remaining > 0) {
                 const sub = self.cursorVisualSubLine();
                 if (sub > 0) {
-                    // Move up within the same wrapped line
-                    const w = self.wrapWidth();
-                    const cont_w = if (w > 2) w - 2 else 1;
-                    self.cursor.col -|= cont_w;
+                    // Move up to start of previous visual sub-line
+                    self.cursor.col = self.subLineStartCol(sub - 1);
                     remaining -= 1;
                 } else if (self.cursor.line > 0) {
                     // Move to previous buffer line, last visual sub-line
                     self.cursor.line -= 1;
                     const prev_vlines = self.visualLinesForBufferLine(self.cursor.line);
                     if (prev_vlines > 1) {
-                        // Position at start of last visual sub-line
-                        const w = self.wrapWidth();
-                        const cont_w = if (w > 2) w - 2 else 1;
-                        self.cursor.col = w + (prev_vlines - 2) * cont_w;
+                        self.cursor.col = self.subLineStartCol(prev_vlines - 1);
+                    } else {
+                        self.cursor.col = 0;
                     }
-                    self.clampCursorCol();
+                    const line_len = self.currentLineLen();
+                    self.cursor.col = @min(self.cursor.col, line_len);
                     remaining -= 1;
                 } else {
                     self.cursor.col = 0;
@@ -640,11 +668,10 @@ pub const Editor = struct {
                 const sub = self.cursorVisualSubLine();
                 const total_vlines = self.visualLinesForBufferLine(self.cursor.line);
                 if (sub + 1 < total_vlines) {
-                    // Move down within the same wrapped line
-                    const w = self.wrapWidth();
-                    const cont_w = if (w > 2) w - 2 else 1;
-                    self.cursor.col += cont_w;
-                    self.clampCursorCol();
+                    // Move to start of next visual sub-line
+                    const target = self.subLineStartCol(sub + 1);
+                    const line_len = self.currentLineLen();
+                    self.cursor.col = @min(target, line_len);
                     remaining -= 1;
                 } else {
                     // Move to next buffer line
@@ -652,7 +679,6 @@ pub const Editor = struct {
                     if (self.cursor.line < max_line) {
                         self.cursor.line += 1;
                         self.cursor.col = 0;
-                        self.clampCursorCol();
                         remaining -= 1;
                     } else {
                         self.moveCursorToLineEnd();
@@ -763,14 +789,17 @@ pub const Editor = struct {
         return line_info.len;
     }
 
-    /// The number of columns available for code (accounts for gutter).
+    /// The number of columns available for code (accounts for gutter AND terminal width).
+    /// This must match the renderer's actual code_end - code_start calculation.
     pub fn wrapWidth(self: *const Editor) usize {
         const gw = @as(*Editor, @constCast(self)).gutterWidth();
         const rm = self.config.right_margin;
-        if (rm > 0 and rm > gw) {
-            return rm - gw;
-        }
-        if (self.visible_cols > gw) return @as(usize, self.visible_cols - gw);
+        // Match renderer: code_end = min(right_margin + gutter_width, visible_cols)
+        const code_end: usize = if (rm > 0)
+            @min(@as(usize, rm) + gw, self.visible_cols)
+        else
+            self.visible_cols;
+        if (code_end > gw) return code_end - gw;
         return 1;
     }
 
@@ -784,15 +813,9 @@ pub const Editor = struct {
         const w = self.wrapWidth();
         if (w == 0) return 1;
         if (line_len <= w) return 1;
-        // Continuation lines get 2 chars indent, so less room
         const cont_w = if (w > 2) w - 2 else 1;
-        var remaining = line_len -| w;
-        var rows: usize = 1;
-        while (remaining > 0) {
-            rows += 1;
-            remaining -|= cont_w;
-        }
-        return rows;
+        // First row fits w chars, each continuation fits cont_w chars
+        return 1 + ((line_len - w) + cont_w - 1) / cont_w;
     }
 
     /// Which visual sub-line (0-based) the cursor is on within a wrapped line.
@@ -800,9 +823,19 @@ pub const Editor = struct {
         if (!self.config.word_wrap) return 0;
         const w = self.wrapWidth();
         if (w == 0) return 0;
-        if (self.cursor.col <= w) return 0;
+        if (self.cursor.col < w) return 0;
         const cont_w = if (w > 2) w - 2 else 1;
         return 1 + (self.cursor.col - w) / cont_w;
+    }
+
+    /// Get the screen column offset within the cursor's visual sub-line.
+    pub fn cursorColInSubLine(self: *Editor) usize {
+        if (!self.config.word_wrap) return self.cursor.col;
+        const w = self.wrapWidth();
+        if (w == 0) return self.cursor.col;
+        if (self.cursor.col < w) return self.cursor.col;
+        const cont_w = if (w > 2) w - 2 else 1;
+        return (self.cursor.col - w) % cont_w;
     }
 
     fn ensureCursorVisible(self: *Editor) void {
@@ -1391,8 +1424,8 @@ pub const Editor = struct {
     fn save(self: *Editor) void {
         if (self.filename_len == 0) {
             self.mode = .command;
+            self.command_action = .save_as;
             self.prompt_len = 0;
-            self.setStatusMessage("Save as:");
             return;
         }
 
