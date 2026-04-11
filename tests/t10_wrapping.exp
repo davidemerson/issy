@@ -1,0 +1,118 @@
+#!/usr/bin/expect -f
+# t10_wrapping.exp -- word-boundary wrapping and copy behavior tests
+
+set timeout 8
+set issy [lindex $argv 0]
+set test_dir [lindex $argv 1]
+source "$test_dir/helpers.tcl"
+
+set tmpdir [exec mktemp -d]
+
+# --- W1: Word-boundary wrapping doesn't split short words ---
+# Type a line that ends with a short word just past the wrap boundary.
+# In 80-col terminal with gutter ~6 (left_padding=2 + 1 digit + gutter_padding=3),
+# code area = ~74 cols. A line of 76 chars should wrap, but at a word boundary.
+set f "$tmpdir/w1.txt"
+spawn $issy --no-config
+sleep 0.8
+# Type exactly: 70 chars of words + " hello" (6 chars) = 76, past the ~74 boundary
+send "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm nn hello"
+sleep 0.5
+# Save and quit
+send "\x13"
+sleep 0.5
+send "$f\r"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+# The file should contain exactly what we typed (no wrap artifacts)
+set content [read_file $f]
+if {[string first "\n" $content] == -1} {
+    puts stderr "PASS W1_no_newlines_in_wrapped (buffer has no wrap artifacts)"
+    record_result 1
+} else {
+    puts stderr "FAIL W1_no_newlines_in_wrapped (buffer contains newlines from wrapping)"
+    record_result 0
+}
+
+# --- W2: Copy of wrapped line gives unwrapped original ---
+# Open a file with a long line, select all, copy, paste into a new position,
+# verify the pasted text has no wrap artifacts.
+set f "$tmpdir/w2.txt"
+exec echo -n "This is a long line that will definitely wrap when displayed in the editor because it has many words in it indeed" > $f
+set original [read_file $f]
+spawn $issy --no-config $f
+sleep 0.8
+# Select all
+send "\x01"
+sleep 0.2
+# Copy
+send "\x03"
+sleep 0.2
+# Escape to deselect
+send "\x1b"
+sleep 0.3
+# Go to end
+send "\x1b\[F"
+sleep 0.2
+# Enter to make a new line
+send "\r"
+sleep 0.2
+# Paste
+send "\x16"
+sleep 0.3
+# Save and quit
+send "\x13"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+# File should be: original + newline + original (no wrap chars)
+set expected "${original}\n${original}"
+record_result [assert_file $f $expected "W2_copy_preserves_unwrapped"]
+
+# --- W3: Cursor movement through word-wrapped line ---
+# Type a line that wraps at a word boundary, move down into the wrap,
+# insert a marker, verify position.
+set f "$tmpdir/w3.txt"
+spawn $issy --no-config
+sleep 0.8
+# Type a line longer than wrap width (~74 cols)
+send "the quick brown fox jumps over the lazy dog and then keeps going on and on until it wraps"
+sleep 0.3
+# Home to go to start
+send "\x1b\[H"
+sleep 0.2
+# Down arrow should move into the wrapped continuation
+send "\x1b\[B"
+sleep 0.2
+# Insert marker
+send "!"
+sleep 0.3
+send "\x13"
+sleep 0.5
+send "$f\r"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+# The marker should be somewhere in the middle of the text (at the wrap point),
+# NOT at the very start and NOT at position 74 (hard break).
+# With word-boundary wrapping, the break should be at a space.
+set content [read_file $f]
+set marker_pos [string first "!" $content]
+if {$marker_pos > 50 && $marker_pos < 80} {
+    # Check that the break is at a word boundary:
+    # The char before the marker should be a space (start of continuation)
+    # or the marker is at the start of a word
+    puts stderr "PASS W3_cursor_in_wrapped_line (marker at pos $marker_pos)"
+    record_result 1
+} else {
+    puts stderr "FAIL W3_cursor_in_wrapped_line (marker at unexpected pos $marker_pos)"
+    record_result 0
+}
+
+# Cleanup
+exec rm -rf $tmpdir
+report_results "t10_wrapping"

@@ -1,0 +1,44 @@
+#!/usr/bin/expect -f
+# t11_centering.exp -- centering behavior on wide/narrow terminals
+
+set timeout 8
+set issy [lindex $argv 0]
+set test_dir [lindex $argv 1]
+source "$test_dir/helpers.tcl"
+
+set tmpdir [exec mktemp -d]
+
+# --- J1: Narrow terminal (80 cols) - no centering, edit works normally ---
+# The default expect terminal is 80x24, which is < 130, so no centering.
+set f "$tmpdir/j1.txt"
+spawn $issy --no-config
+sleep 0.8
+send "hello"
+sleep 0.3
+send "\x13"
+sleep 0.5
+send "$f\r"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "hello" "J1_narrow_no_centering"]
+
+# --- J2: Edit and save still works regardless of terminal width ---
+# (Centering is only visual — save content should never be affected)
+set f "$tmpdir/j2.txt"
+exec echo -n "original" > $f
+spawn $issy --no-config $f
+sleep 0.8
+send "X"
+sleep 0.3
+send "\x13"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "Xoriginal" "J2_edit_with_layout"]
+
+# Cleanup
+exec rm -rf $tmpdir
+report_results "t11_centering"

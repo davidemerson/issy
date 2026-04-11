@@ -36,8 +36,8 @@ Blank lines and lines starting with `#` are ignored. Unknown keys are silently s
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `gutter_padding` | integer | `2` | Spaces between line numbers and code |
-| `left_padding` | integer | `1` | Spaces before line numbers |
+| `gutter_padding` | integer | `3` | Spaces between line numbers and code |
+| `left_padding` | integer | `2` | Spaces before line numbers |
 | `right_margin` | integer | `100` | Soft right margin -- code stops here, rest is empty background. `0` fills the terminal width. |
 | `cursor_line_bg` | bool | `true` | Subtle full-width highlight on the current line |
 | `cursor_style` | string | `bar` | Terminal cursor shape: `bar`, `block`, or `underline` |
@@ -102,8 +102,8 @@ function_color = "#b0b8c8"
 operator_color = "#89ddff"
 preprocessor_color = "#e0af68"
 line_number_color = "#282c36"
-line_number_active = "#586070"
-cursor_line_color = "#0a0a0e"
+line_number_active = "#505868"
+cursor_line_color = "#0d0d14"
 selection_color = "#1a2844"
 trailing_ws_color = "#1a1010"
 indent_mismatch_color = "#1a1010"

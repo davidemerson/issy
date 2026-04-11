@@ -22,10 +22,11 @@ pub const Theme = struct {
     operator: Color = .{ .rgb = .{ .r = 0x89, .g = 0xdd, .b = 0xff } },
     preprocessor: Color = .{ .rgb = .{ .r = 0xe0, .g = 0xaf, .b = 0x68 } },
     line_number: Color = .{ .rgb = .{ .r = 0x28, .g = 0x2c, .b = 0x36 } },
-    line_number_active: Color = .{ .rgb = .{ .r = 0x58, .g = 0x60, .b = 0x70 } },
-    cursor_line_bg: Color = .{ .rgb = .{ .r = 0x0a, .g = 0x0a, .b = 0x0e } },
+    line_number_active: Color = .{ .rgb = .{ .r = 0x50, .g = 0x58, .b = 0x68 } },
+    cursor_line_bg: Color = .{ .rgb = .{ .r = 0x0d, .g = 0x0d, .b = 0x14 } },
     status_bg: Color = .{ .rgb = .{ .r = 0x00, .g = 0x00, .b = 0x00 } },
-    status_fg: Color = .{ .rgb = .{ .r = 0x44, .g = 0x4c, .b = 0x5e } },
+    status_fg: Color = .{ .rgb = .{ .r = 0x55, .g = 0x5c, .b = 0x6e } },
+    wrap_indicator: Color = .{ .rgb = .{ .r = 0x28, .g = 0x2c, .b = 0x36 } },
     cursor: Color = .{ .rgb = .{ .r = 0xd0, .g = 0xd8, .b = 0xf0 } },
     selection: Color = .{ .rgb = .{ .r = 0x1a, .g = 0x28, .b = 0x44 } },
     trailing_ws: Color = .{ .rgb = .{ .r = 0x1a, .g = 0x10, .b = 0x10 } },
@@ -53,6 +54,7 @@ pub const paper_theme = Theme{
     .cursor = .{ .rgb = .{ .r = 0x58, .g = 0x6e, .b = 0x75 } },       // base01
     .selection = .{ .rgb = .{ .r = 0xee, .g = 0xe8, .b = 0xd5 } },    // base2
     .trailing_ws = .{ .rgb = .{ .r = 0xf0, .g = 0xe0, .b = 0xd0 } },  // warm tint on cream
+    .wrap_indicator = .{ .rgb = .{ .r = 0xee, .g = 0xe8, .b = 0xd5 } }, // base2
     .indent_mismatch = .{ .rgb = .{ .r = 0xf0, .g = 0xe0, .b = 0xd0 } },
 };
 
@@ -97,8 +99,8 @@ pub const Config = struct {
     scroll_margin: u8 = 5,
 
     // Visual design
-    gutter_padding: u8 = 2,
-    left_padding: u8 = 1,
+    gutter_padding: u8 = 3,
+    left_padding: u8 = 2,
     right_margin: u16 = 100,
     cursor_line_bg: bool = true,
     cursor_style: term.CursorShape = .bar,

@@ -614,12 +614,87 @@ pub const Editor = struct {
 
     // ── Cursor movement ──
 
-    /// Compute the starting buffer column of the Nth visual sub-line (0-indexed).
+    /// Compute wrap break points for a buffer line. Returns the number of
+    /// visual sub-lines. breaks[i] is the starting buffer column of sub-line i.
+    /// breaks[0] is always 0. Uses typesetting priorities: prefer breaking at
+    /// spaces, then after punctuation/operators, then hard-break.
+    pub const MAX_WRAP_BREAKS = 256;
+
+    pub fn computeWrapBreaks(self: *Editor, line: usize, breaks: *[MAX_WRAP_BREAKS]usize) usize {
+        breaks[0] = 0;
+        if (!self.config.word_wrap) return 1;
+
+        const info = self.buf.getLine(line) orelse return 1;
+        const line_len = info.len;
+        const w = self.wrapWidth();
+        if (w == 0 or line_len <= w) return 1;
+
+        var line_tmp: [8192]u8 = undefined;
+        const data = self.buf.contiguousSlice(info.start, @min(line_len, 8192), &line_tmp);
+        const cont_w = if (w > 2) w - 2 else 1;
+
+        var count: usize = 1;
+        var pos: usize = 0;
+        var first = true;
+
+        while (pos < data.len and count < MAX_WRAP_BREAKS) {
+            const avail = if (first) w else cont_w;
+            first = false;
+
+            if (pos + avail >= data.len) break; // rest fits
+
+            // Find the best break point within the available width
+            const limit = pos + avail;
+            var break_at = limit; // hard break fallback
+
+            // Look backwards for a good break point (don't search more than 40% back)
+            const min_scan = pos + avail * 3 / 5;
+            var best_space: ?usize = null;
+            var best_punct: ?usize = null;
+
+            var scan = limit;
+            while (scan > min_scan) {
+                scan -= 1;
+                const ch = data[scan];
+                if (ch == ' ' or ch == '\t') {
+                    best_space = scan + 1; // break after the space
+                    break;
+                }
+                if (best_punct == null and isBreakAfter(ch)) {
+                    best_punct = scan + 1; // break after the punctuation
+                }
+            }
+
+            if (best_space) |bp| {
+                break_at = bp;
+            } else if (best_punct) |bp| {
+                break_at = bp;
+            }
+            // else: hard break at limit
+
+            breaks[count] = break_at;
+            count += 1;
+            pos = break_at;
+        }
+
+        return count;
+    }
+
+    fn isBreakAfter(ch: u8) bool {
+        return switch (ch) {
+            ',', ';', ')', ']', '}', '.', ':', '-', '/', '\\', '|', '&', '+', '=', '>' => true,
+            else => false,
+        };
+    }
+
+    /// Compute the starting buffer column of the Nth visual sub-line.
     fn subLineStartCol(self: *Editor, sub: usize) usize {
         if (sub == 0) return 0;
-        const w = self.wrapWidth();
-        const cont_w = if (w > 2) w - 2 else 1;
-        return w + (sub - 1) * cont_w;
+        var breaks: [MAX_WRAP_BREAKS]usize = undefined;
+        const count = self.computeWrapBreaks(self.cursor.line, &breaks);
+        if (sub < count) return breaks[sub];
+        // Past the end — return line length
+        return self.currentLineLen();
     }
 
     fn moveCursorUp(self: *Editor, count: u16) void {
@@ -748,10 +823,12 @@ pub const Editor = struct {
         const max_line = if (self.buf.lineCount() > 0) self.buf.lineCount() - 1 else 0;
         self.cursor.line = @min(target_line, max_line);
 
-        // Account for gutter — use usize arithmetic to avoid u16 overflow
+        // Account for centering offset and gutter
+        const c_offset = self.centerOffset();
         const gutter_width = self.gutterWidth();
-        if (col >= gutter_width) {
-            self.cursor.col = @as(usize, col - gutter_width) + self.scroll_left;
+        const total_offset = c_offset + gutter_width;
+        if (col >= total_offset) {
+            self.cursor.col = @as(usize, col - total_offset) + self.scroll_left;
         } else {
             self.cursor.col = 0;
         }
@@ -760,6 +837,19 @@ pub const Editor = struct {
         if (self.cursor.col > line_len) self.cursor.col = line_len;
         self.cursor.col_want = self.cursor.col;
         self.updateBracketMatch();
+    }
+
+    /// Compute the horizontal centering offset for wide terminals.
+    pub fn centerOffset(self: *const Editor) u16 {
+        const gw = @as(*Editor, @constCast(self)).gutterWidth();
+        const rm = self.config.right_margin;
+        const active_width: u16 = if (rm > 0)
+            @intCast(@min(@as(u32, rm) + gw, self.visible_cols))
+        else
+            self.visible_cols;
+        if (self.visible_cols > 130 and active_width < self.visible_cols)
+            return (self.visible_cols - active_width) / 2;
+        return 0;
     }
 
     pub fn gutterWidth(self: *const Editor) u16 {
@@ -799,36 +889,33 @@ pub const Editor = struct {
     /// How many visual (screen) rows a buffer line occupies when wrapped.
     pub fn visualLinesForBufferLine(self: *Editor, line: usize) usize {
         if (!self.config.word_wrap) return 1;
-        const line_len = blk: {
-            const info = self.buf.getLine(line) orelse break :blk 0;
-            break :blk info.len;
-        };
-        const w = self.wrapWidth();
-        if (w == 0) return 1;
-        if (line_len <= w) return 1;
-        const cont_w = if (w > 2) w - 2 else 1;
-        // First row fits w chars, each continuation fits cont_w chars
-        return 1 + ((line_len - w) + cont_w - 1) / cont_w;
+        var breaks: [MAX_WRAP_BREAKS]usize = undefined;
+        return self.computeWrapBreaks(line, &breaks);
     }
 
     /// Which visual sub-line (0-based) the cursor is on within a wrapped line.
     pub fn cursorVisualSubLine(self: *Editor) usize {
         if (!self.config.word_wrap) return 0;
-        const w = self.wrapWidth();
-        if (w == 0) return 0;
-        if (self.cursor.col < w) return 0;
-        const cont_w = if (w > 2) w - 2 else 1;
-        return 1 + (self.cursor.col - w) / cont_w;
+        var breaks: [MAX_WRAP_BREAKS]usize = undefined;
+        const count = self.computeWrapBreaks(self.cursor.line, &breaks);
+        // Find which sub-line contains cursor.col
+        var sub: usize = 0;
+        while (sub + 1 < count and breaks[sub + 1] <= self.cursor.col) {
+            sub += 1;
+        }
+        return sub;
     }
 
     /// Get the screen column offset within the cursor's visual sub-line.
     pub fn cursorColInSubLine(self: *Editor) usize {
         if (!self.config.word_wrap) return self.cursor.col;
-        const w = self.wrapWidth();
-        if (w == 0) return self.cursor.col;
-        if (self.cursor.col < w) return self.cursor.col;
-        const cont_w = if (w > 2) w - 2 else 1;
-        return (self.cursor.col - w) % cont_w;
+        var breaks: [MAX_WRAP_BREAKS]usize = undefined;
+        const count = self.computeWrapBreaks(self.cursor.line, &breaks);
+        var sub: usize = 0;
+        while (sub + 1 < count and breaks[sub + 1] <= self.cursor.col) {
+            sub += 1;
+        }
+        return self.cursor.col - breaks[sub];
     }
 
     fn ensureCursorVisible(self: *Editor) void {

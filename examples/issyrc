@@ -29,10 +29,10 @@
 # line_numbers = true
 
 # Spaces before line numbers
-# left_padding = 1
+# left_padding = 2
 
 # Spaces between line numbers and code
-# gutter_padding = 2
+# gutter_padding = 3
 
 # Soft-wrap long lines at the right margin. Continuation lines are indented.
 # word_wrap = true
@@ -89,8 +89,8 @@
 # operator_color = "#89ddff"
 # preprocessor_color = "#e0af68"
 # line_number_color = "#282c36"
-# line_number_active = "#586070"
-# cursor_line_color = "#0a0a0e"
+# line_number_active = "#505868"
+# cursor_line_color = "#0d0d14"
 # selection_color = "#1a2844"
 # trailing_ws_color = "#1a1010"
 # indent_mismatch_color = "#1a1010"

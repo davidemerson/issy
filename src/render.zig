@@ -90,8 +90,19 @@ pub const Renderer = struct {
         // 2. Compute layout
         const left_pad = ed.config.left_padding;
         const gutter_width = ed.gutterWidth();
-        const code_start: u16 = gutter_width;
         const right_margin = ed.config.right_margin;
+
+        // Centering: if terminal is wider than 130 cols, center the active area
+        const active_width: u16 = if (right_margin > 0)
+            @intCast(@min(@as(u32, right_margin) + gutter_width, self.cols))
+        else
+            self.cols;
+        const center_offset: u16 = if (self.cols > 130 and active_width < self.cols)
+            (self.cols - active_width) / 2
+        else
+            0;
+
+        const code_start: u16 = gutter_width + center_offset;
         const code_end: u16 = if (right_margin > 0)
             @intCast(@min(@as(u32, right_margin) + code_start, self.cols))
         else
@@ -100,7 +111,6 @@ pub const Renderer = struct {
         const status_row = if (self.rows > 0) self.rows - 1 else 0;
         const content_rows: u16 = if (self.rows > 1) self.rows - 1 else 1;
         const wrap_enabled = ed.config.word_wrap;
-        const wrap_width: usize = if (code_end > code_start) @as(usize, code_end - code_start) else 1;
         const cont_indent: u16 = if (wrap_enabled) 2 else 0;
 
         // Track syntax state
@@ -126,20 +136,27 @@ pub const Renderer = struct {
                 tokens = syntax_mod.tokenizeLine(lang, line_data, &syn_state, &token_buf);
             }
 
-            // Determine wrap segments for this line
+            // Compute wrap break points for this line
             const is_cursor_line = (file_line == ed.cursor.line);
+            var wrap_breaks: [editor_mod.Editor.MAX_WRAP_BREAKS]usize = undefined;
+            const wrap_break_count = ed.computeWrapBreaks(file_line, &wrap_breaks);
 
             // Render the line across one or more screen rows
             var byte_idx: usize = 0;
-            var buf_col: usize = 0; // column in the buffer (character index)
+            var buf_col: usize = 0;
             var visual_sub_line: usize = 0;
 
             while (screen_row < content_rows) {
                 const is_first_visual = (visual_sub_line == 0);
                 const this_indent: u16 = if (is_first_visual) 0 else cont_indent;
-                const avail_cols: usize = if (wrap_width > this_indent) wrap_width - this_indent else 1;
 
-                // Cursor line highlight (full width) — all visual sub-lines of the cursor line
+                // Determine how many buffer columns this sub-line spans
+                const sub_end_col: usize = if (visual_sub_line + 1 < wrap_break_count)
+                    wrap_breaks[visual_sub_line + 1]
+                else
+                    line_data.len; // rest of line
+
+                // Cursor line highlight (full width)
                 if (ed.config.cursor_line_bg and is_cursor_line) {
                     var c: u16 = 0;
                     while (c < self.cols) : (c += 1) {
@@ -147,7 +164,7 @@ pub const Renderer = struct {
                     }
                 }
 
-                // Line numbers — only on first visual sub-line
+                // Line numbers on first visual sub-line, wrap indicator on continuations
                 if (is_first_visual and ed.config.line_numbers) {
                     const line_num = file_line + 1;
                     var num_buf: [16]u8 = undefined;
@@ -156,7 +173,7 @@ pub const Renderer = struct {
 
                     const digits = gutter_width - ed.config.left_padding - ed.config.gutter_padding;
                     if (num_str.len <= digits) {
-                        const start_col = left_pad + digits - @as(u16, @intCast(num_str.len));
+                        const start_col = center_offset + left_pad + digits - @as(u16, @intCast(num_str.len));
                         for (num_str, 0..) |ch, i| {
                             const scol = start_col + @as(u16, @intCast(i));
                             if (scol < self.cols) {
@@ -166,14 +183,21 @@ pub const Renderer = struct {
                             }
                         }
                     }
+                } else if (!is_first_visual and wrap_enabled) {
+                    // Continuation line: show ↔ indicator in the gutter
+                    const indicator_col = code_start -| 2; // just before the code area
+                    if (indicator_col < self.cols) {
+                        const cell = self.cellAt(screen_row, indicator_col);
+                        cell.char = 0x2194; // ↔
+                        cell.fg = theme.wrap_indicator;
+                    }
                 }
 
                 // Render characters for this visual sub-line
                 var col: u16 = code_start + this_indent;
-                var chars_on_row: usize = 0;
                 const row_start_buf_col = buf_col;
 
-                while (byte_idx < line_data.len and chars_on_row < avail_cols) {
+                while (byte_idx < line_data.len and buf_col < sub_end_col) {
                     const ch = line_data[byte_idx];
                     if (ch == '\n') break;
 
@@ -193,10 +217,9 @@ pub const Renderer = struct {
                         const tw = ed.effectiveTabWidth();
                         const spaces = tw - (buf_col % tw);
                         var s: usize = 0;
-                        while (s < spaces and chars_on_row < avail_cols and col < code_end) : (s += 1) {
+                        while (s < spaces and col < code_end) : (s += 1) {
                             self.cellAt(screen_row, col).char = ' ';
                             col += 1;
-                            chars_on_row += 1;
                         }
                         buf_col += spaces;
                     } else if (ch >= 0x20 and ch < 0x7f) {
@@ -206,7 +229,6 @@ pub const Renderer = struct {
                             cell.fg = tokenColor(tokens, byte_idx, theme);
                             col += 1;
                         }
-                        chars_on_row += 1;
                         buf_col += 1;
                     } else {
                         if (col < code_end) {
@@ -215,7 +237,6 @@ pub const Renderer = struct {
                             cell.fg = tokenColor(tokens, byte_idx, theme);
                             col += 1;
                         }
-                        chars_on_row += 1;
                         buf_col += 1;
                     }
 
@@ -274,21 +295,21 @@ pub const Renderer = struct {
         }
 
         // 5. Status bar
-        self.renderStatusBar(ed, status_row, theme);
+        self.renderStatusBar(ed, status_row, theme, center_offset, code_end);
 
         // 6. Prompts
         if (ed.mode != .normal) {
-            self.renderPrompt(ed, status_row, theme);
+            self.renderPrompt(ed, status_row, theme, center_offset);
         }
 
         // 7. Diff and flush
-        try self.flushDiff(ed, code_start);
+        try self.flushDiff(ed, code_start, center_offset);
     }
 
-    fn renderStatusBar(self: *Renderer, ed: *const editor_mod.Editor, row: u16, theme: *const config_mod.Theme) void {
-        // Left: filename
+    fn renderStatusBar(self: *Renderer, ed: *const editor_mod.Editor, row: u16, theme: *const config_mod.Theme, center_offset: u16, code_end: u16) void {
+        // Left: filename (aligned with code area)
         const fname = ed.getFilename();
-        var col: u16 = 0;
+        var col: u16 = center_offset;
         for (fname) |ch| {
             if (col >= self.cols) break;
             const cell = self.cellAt(row, col);
@@ -314,13 +335,17 @@ pub const Renderer = struct {
             ed.cursor.col + 1,
         }) catch "";
 
-        if (pos_str.len < self.cols) {
-            const start = self.cols - @as(u16, @intCast(pos_str.len));
+        // Right-align line:col at the code_end boundary
+        const right_edge = code_end;
+        if (pos_str.len < right_edge) {
+            const start = right_edge - @as(u16, @intCast(pos_str.len));
             for (pos_str, 0..) |ch, i| {
                 const c = start + @as(u16, @intCast(i));
-                const cell = self.cellAt(row, c);
-                cell.char = ch;
-                cell.fg = theme.status_fg;
+                if (c < self.cols) {
+                    const cell = self.cellAt(row, c);
+                    cell.char = ch;
+                    cell.fg = theme.status_fg;
+                }
             }
         }
 
@@ -330,7 +355,7 @@ pub const Renderer = struct {
             const msg_start = col + 2;
             var mc: u16 = msg_start;
             for (msg) |ch| {
-                if (mc >= self.cols -| @as(u16, @intCast(pos_str.len)) -| 1) break;
+                if (mc >= right_edge -| @as(u16, @intCast(pos_str.len)) -| 1) break;
                 self.cellAt(row, mc).char = ch;
                 self.cellAt(row, mc).fg = theme.status_fg;
                 mc += 1;
@@ -338,7 +363,7 @@ pub const Renderer = struct {
         }
     }
 
-    fn renderPrompt(self: *Renderer, ed: *const editor_mod.Editor, row: u16, theme: *const config_mod.Theme) void {
+    fn renderPrompt(self: *Renderer, ed: *const editor_mod.Editor, row: u16, theme: *const config_mod.Theme, center_offset: u16) void {
         // Clear the status row
         var c: u16 = 0;
         while (c < self.cols) : (c += 1) {
@@ -351,7 +376,7 @@ pub const Renderer = struct {
         switch (ed.mode) {
             .search => {
                 const text = ed.getPromptText();
-                var col: u16 = 0;
+                var col: u16 = center_offset;
                 for (text) |ch| {
                     if (col >= self.cols) break;
                     self.cellAt(row, col).char = ch;
@@ -362,7 +387,7 @@ pub const Renderer = struct {
             .replace => {
                 const search_text = ed.search_pattern[0..ed.search_len];
                 const repl_text = ed.getReplaceText();
-                var col: u16 = 0;
+                var col: u16 = center_offset;
 
                 // Search text
                 const search_color = if (ed.replace_phase == .search) theme.fg else theme.status_fg;
@@ -391,7 +416,7 @@ pub const Renderer = struct {
             },
             .command => {
                 const text = ed.getPromptText();
-                var col: u16 = 0;
+                var col: u16 = center_offset;
                 for (text) |ch| {
                     if (col >= self.cols) break;
                     self.cellAt(row, col).char = ch;
@@ -401,7 +426,7 @@ pub const Renderer = struct {
             },
             .confirm => {
                 const text = ed.getPromptText();
-                var col: u16 = 0;
+                var col: u16 = center_offset;
                 for (text) |ch| {
                     if (col >= self.cols) break;
                     self.cellAt(row, col).char = ch;
@@ -413,7 +438,7 @@ pub const Renderer = struct {
         }
     }
 
-    fn flushDiff(self: *Renderer, ed: *editor_mod.Editor, code_start: u16) !void {
+    fn flushDiff(self: *Renderer, ed: *editor_mod.Editor, code_start: u16, center_offset: u16) !void {
         term.hideCursor();
 
         var last_fg: Color = .default;
@@ -461,7 +486,7 @@ pub const Renderer = struct {
         term.resetStyle();
 
         if (ed.mode == .search or ed.mode == .command or ed.mode == .replace) {
-            const cursor_col: u16 = switch (ed.mode) {
+            const prompt_col: u16 = switch (ed.mode) {
                 .search => @intCast(@min(ed.search_len, self.cols - 1)),
                 .command => @intCast(@min(ed.prompt_len, self.cols - 1)),
                 .replace => blk: {
@@ -473,7 +498,7 @@ pub const Renderer = struct {
                 },
                 else => 0,
             };
-            term.moveCursor(if (self.rows > 0) self.rows - 1 else 0, cursor_col);
+            term.moveCursor(if (self.rows > 0) self.rows - 1 else 0, center_offset + prompt_col);
         } else if (ed.config.word_wrap) {
             // Count visual rows from scroll_top to cursor line
             var vis_row: u16 = 0;
