@@ -298,8 +298,13 @@ pub const Renderer = struct {
         self.renderStatusBar(ed, status_row, theme, center_offset, code_end);
 
         // 6. Prompts
-        if (ed.mode != .normal) {
+        if (ed.mode != .normal and ed.mode != .help) {
             self.renderPrompt(ed, status_row, theme, center_offset);
+        }
+
+        // 6b. Help overlay
+        if (ed.mode == .help) {
+            self.renderHelpOverlay(theme);
         }
 
         // 7. Diff and flush
@@ -415,13 +420,60 @@ pub const Renderer = struct {
                 }
             },
             .command => {
-                const text = ed.getPromptText();
-                var col: u16 = center_offset;
+                // Draw completion matches above the prompt line
+                if (ed.completion_match_count > 1) {
+                    // Find the prefix portion (directory + typed prefix) to align filenames
+                    const prompt = ed.prompt_buf[0..ed.prompt_len];
+                    const last_slash = std.mem.lastIndexOfScalar(u8, prompt, '/');
+                    const dir_display_len: u16 = if (last_slash) |s| @intCast(@min(s + 1, std.math.maxInt(u16))) else 0;
+
+                    var mi: usize = 0;
+                    while (mi < ed.completion_match_count) : (mi += 1) {
+                        const match_row = row -| @as(u16, @intCast(ed.completion_match_count - mi));
+                        if (match_row >= row) continue; // overflow
+
+                        // Clear the row
+                        var cc: u16 = 0;
+                        while (cc < self.cols) : (cc += 1) {
+                            const cl = self.cellAt(match_row, cc);
+                            cl.char = ' ';
+                            cl.fg = theme.bg;
+                            cl.bg = theme.bg;
+                        }
+
+                        // Draw the match filename right-aligned to the prompt's slash position
+                        const match_name = ed.completion_matches[mi][0..ed.completion_match_lens[mi]];
+                        const name_start = center_offset + dir_display_len;
+                        var mc: u16 = name_start;
+                        for (match_name) |mch| {
+                            if (mc >= self.cols) break;
+                            const cl = self.cellAt(match_row, mc);
+                            cl.char = mch;
+                            cl.fg = theme.comment; // dim
+                            mc += 1;
+                        }
+                    }
+                }
+
+                // Draw the prompt text
+                const text = ed.prompt_buf[0..ed.prompt_len];
+                var col_c: u16 = center_offset;
                 for (text) |ch| {
-                    if (col >= self.cols) break;
-                    self.cellAt(row, col).char = ch;
-                    self.cellAt(row, col).fg = theme.fg;
-                    col += 1;
+                    if (col_c >= self.cols) break;
+                    self.cellAt(row, col_c).char = ch;
+                    self.cellAt(row, col_c).fg = theme.fg;
+                    col_c += 1;
+                }
+
+                // Draw the completion hint (grayed out)
+                if (ed.completion_hint_len > 0) {
+                    const hint = ed.completion_hint[0..ed.completion_hint_len];
+                    for (hint) |ch| {
+                        if (col_c >= self.cols) break;
+                        self.cellAt(row, col_c).char = ch;
+                        self.cellAt(row, col_c).fg = theme.comment;
+                        col_c += 1;
+                    }
                 }
             },
             .confirm => {
@@ -434,7 +486,75 @@ pub const Renderer = struct {
                     col += 1;
                 }
             },
-            .normal => {},
+            .normal, .help => {},
+        }
+    }
+
+    fn renderHelpOverlay(self: *Renderer, theme: *const config_mod.Theme) void {
+        const lines = [_][]const u8{
+            "          Keybindings",
+            "",
+            "  Ctrl+S   Save          Ctrl+O   Open file",
+            "  Ctrl+Q   Quit          Ctrl+N   New buffer",
+            "  Ctrl+W   Quit          Ctrl+R   Reload",
+            "",
+            "  Ctrl+Z   Undo          Ctrl+F   Search",
+            "  Ctrl+Y   Redo          Ctrl+G   Find next",
+            "  Ctrl+C   Copy          Ctrl+H   Replace",
+            "  Ctrl+X   Cut           Ctrl+D   Multi-cursor",
+            "  Ctrl+V   Paste         Ctrl+P   Print to PDF",
+            "  Ctrl+A   Select all    Escape   Clear/cancel",
+            "",
+            "  Ctrl+/   This help     F1       This help",
+            "",
+            "       Press any key to dismiss",
+        };
+
+        const box_w: u16 = 49;
+        const box_h: u16 = @intCast(lines.len + 2); // +2 for top/bottom border
+        const start_row: u16 = if (self.rows > box_h) (self.rows - box_h) / 2 else 0;
+        const start_col: u16 = if (self.cols > box_w) (self.cols - box_w) / 2 else 0;
+
+        const box_bg = theme.cursor_line_bg;
+        const dim_fg = theme.comment;
+        const bright_fg = theme.fg;
+
+        var row: u16 = start_row;
+        while (row < start_row + box_h and row < self.rows) : (row += 1) {
+            var col: u16 = start_col;
+            while (col < start_col + box_w and col < self.cols) : (col += 1) {
+                const cell = self.cellAt(row, col);
+                cell.bg = box_bg;
+
+                const line_idx = row -| start_row;
+                const col_idx = col -| start_col;
+
+                // Top/bottom border
+                if (line_idx == 0 or line_idx == box_h - 1) {
+                    cell.char = ' ';
+                    cell.fg = dim_fg;
+                } else {
+                    const text_line_idx = line_idx - 1;
+                    if (text_line_idx < lines.len) {
+                        const text = lines[text_line_idx];
+                        if (col_idx < text.len) {
+                            cell.char = text[col_idx];
+                            // Title and dismiss line are bright, keys are bright, descriptions dim
+                            if (text_line_idx == 0 or text_line_idx == lines.len - 1) {
+                                cell.fg = bright_fg;
+                            } else {
+                                cell.fg = bright_fg;
+                            }
+                        } else {
+                            cell.char = ' ';
+                            cell.fg = dim_fg;
+                        }
+                    } else {
+                        cell.char = ' ';
+                        cell.fg = dim_fg;
+                    }
+                }
+            }
         }
     }
 
@@ -484,6 +604,13 @@ pub const Renderer = struct {
 
         // Position hardware cursor
         term.resetStyle();
+
+        if (ed.mode == .help) {
+            // Hide cursor during help overlay
+            term.hideCursor();
+            try term.flush();
+            return;
+        }
 
         if (ed.mode == .search or ed.mode == .command or ed.mode == .replace) {
             const prompt_col: u16 = switch (ed.mode) {

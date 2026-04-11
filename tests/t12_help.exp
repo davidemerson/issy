@@ -1,0 +1,64 @@
+#!/usr/bin/expect -f
+# t12_help.exp -- help overlay tests
+
+set timeout 8
+set issy [lindex $argv 0]
+set test_dir [lindex $argv 1]
+source "$test_dir/helpers.tcl"
+
+set tmpdir [exec mktemp -d]
+
+# --- K1: Help overlay shows and dismisses, editing still works ---
+set f "$tmpdir/k1.txt"
+spawn $issy --no-config
+sleep 0.8
+
+# Type some text
+send "before"
+sleep 0.2
+
+# Open help with Ctrl+/ (0x1f)
+send "\x1f"
+sleep 0.5
+
+# Dismiss with any key (space)
+send " "
+sleep 0.3
+
+# Type more text — should be in normal mode now
+send "after"
+sleep 0.3
+
+# Save and quit
+send "\x13"
+sleep 0.5
+send "$f\r"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+# The space that dismissed the help should NOT be inserted (it was consumed by help mode)
+record_result [assert_file $f "beforeafter" "K1_help_dismiss_no_insert"]
+
+# --- K2: Help overlay doesn't corrupt buffer ---
+set f "$tmpdir/k2.txt"
+exec echo -n "original" > $f
+spawn $issy --no-config $f
+sleep 0.8
+# Open help
+send "\x1f"
+sleep 0.3
+# Dismiss
+send "\x1b"
+sleep 0.3
+# Save and quit
+send "\x13"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "original" "K2_help_no_corruption"]
+
+# Cleanup
+exec rm -rf $tmpdir
+report_results "t12_help"

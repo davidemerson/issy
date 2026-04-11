@@ -13,7 +13,7 @@ const config_mod = @import("config.zig");
 const term = @import("term.zig");
 const unicode = @import("unicode.zig");
 
-pub const Mode = enum { normal, search, command, confirm, replace };
+pub const Mode = enum { normal, search, command, confirm, replace, help };
 pub const Action = enum { none, quit, force_quit, redraw, prompt };
 
 pub const Cursor = struct {
@@ -87,6 +87,13 @@ pub const Editor = struct {
 
     confirm_action: enum { none, quit } = .none,
     command_action: enum { open, save_as } = .open,
+
+    // Tab completion state
+    completion_hint: [512]u8 = undefined, // grayed-out suffix for unique completion
+    completion_hint_len: usize = 0,
+    completion_matches: [16][256]u8 = undefined, // up to 16 visible matches (filenames only)
+    completion_match_lens: [16]usize = .{0} ** 16,
+    completion_match_count: usize = 0,
 
     pub fn init(config: *config_mod.Config, allocator: Allocator) Editor {
         return .{
@@ -256,6 +263,11 @@ pub const Editor = struct {
             .command => return self.handleCommandKey(key),
             .confirm => return self.handleConfirmKey(key),
             .replace => return self.handleReplaceKey(key),
+            .help => {
+                // Any key dismisses the help overlay
+                self.mode = .normal;
+                return .redraw;
+            },
         }
     }
 
@@ -347,6 +359,10 @@ pub const Editor = struct {
                 self.sel_active = false;
                 return .redraw;
             },
+            .help, .f1 => {
+                self.mode = .help;
+                return .redraw;
+            },
             else => return .none,
         }
     }
@@ -427,7 +443,16 @@ pub const Editor = struct {
             'o' => {
                 self.mode = .command;
                 self.command_action = .open;
+                // Seed prompt with CWD
                 self.prompt_len = 0;
+                if (std.fs.cwd().realpath(".", self.prompt_buf[0..])) |resolved| {
+                    self.prompt_len = resolved.len;
+                    if (self.prompt_len < 255) {
+                        self.prompt_buf[self.prompt_len] = '/';
+                        self.prompt_len += 1;
+                    }
+                } else |_| {}
+                self.updateCompletions();
                 return .redraw;
             },
             'r' => {
@@ -497,10 +522,16 @@ pub const Editor = struct {
                     @memcpy(self.prompt_buf[self.prompt_len..][0..copy_len], enc_buf[0..copy_len]);
                     self.prompt_len += copy_len;
                 }
+                self.updateCompletions();
                 return .redraw;
             },
             .backspace => {
                 if (self.prompt_len > 0) self.prompt_len -= 1;
+                self.updateCompletions();
+                return .redraw;
+            },
+            .tab => {
+                self.applyTabCompletion();
                 return .redraw;
             },
             .enter => {
@@ -529,10 +560,14 @@ pub const Editor = struct {
                     },
                 }
                 self.mode = .normal;
+                self.completion_match_count = 0;
+                self.completion_hint_len = 0;
                 return .redraw;
             },
             .escape => {
                 self.mode = .normal;
+                self.completion_match_count = 0;
+                self.completion_hint_len = 0;
                 return .redraw;
             },
             else => return .none,
@@ -1506,6 +1541,14 @@ pub const Editor = struct {
             self.mode = .command;
             self.command_action = .save_as;
             self.prompt_len = 0;
+            if (std.fs.cwd().realpath(".", self.prompt_buf[0..])) |resolved| {
+                self.prompt_len = resolved.len;
+                if (self.prompt_len < 255) {
+                    self.prompt_buf[self.prompt_len] = '/';
+                    self.prompt_len += 1;
+                }
+            } else |_| {}
+            self.updateCompletions();
             return;
         }
 
@@ -1517,6 +1560,112 @@ pub const Editor = struct {
         self.updateMtime();
         self.file_changed_on_disk = false;
         self.setStatusMessage("Saved.");
+    }
+
+    // ── Tab completion ──
+
+    fn updateCompletions(self: *Editor) void {
+        self.completion_hint_len = 0;
+        self.completion_match_count = 0;
+
+        const path = self.prompt_buf[0..self.prompt_len];
+        if (path.len == 0) return;
+
+        // Split into directory and prefix
+        const last_slash = std.mem.lastIndexOfScalar(u8, path, '/');
+        const dir_path = if (last_slash) |s| path[0 .. s + 1] else "./";
+        const prefix = if (last_slash) |s| path[s + 1 ..] else path;
+
+        // Open directory
+        var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir_slice = if (dir_path.len <= dir_buf.len)
+            dir_buf[0..dir_path.len]
+        else
+            return;
+        @memcpy(dir_slice, dir_path);
+
+        var dir = std.fs.cwd().openDir(dir_slice, .{ .iterate = true }) catch return;
+        defer dir.close();
+
+        var iter = dir.iterate();
+        var match_count: usize = 0;
+        var common_prefix_len: ?usize = null;
+        var first_match: [256]u8 = undefined;
+        var first_match_len: usize = 0;
+
+        while (iter.next() catch null) |entry| {
+            const name = entry.name;
+            if (prefix.len > 0 and !std.mem.startsWith(u8, name, prefix)) continue;
+            if (name[0] == '.' and (prefix.len == 0 or prefix[0] != '.')) continue; // hide dotfiles unless typing dot
+
+            // Track this match
+            if (match_count < 16) {
+                const store_len = @min(name.len, 256);
+                @memcpy(self.completion_matches[match_count][0..store_len], name[0..store_len]);
+                // Append / for directories
+                if (entry.kind == .directory and store_len < 255) {
+                    self.completion_matches[match_count][store_len] = '/';
+                    self.completion_match_lens[match_count] = store_len + 1;
+                } else {
+                    self.completion_match_lens[match_count] = store_len;
+                }
+            }
+
+            // Track common prefix among all matches
+            if (match_count == 0) {
+                first_match_len = @min(name.len, 256);
+                @memcpy(first_match[0..first_match_len], name[0..first_match_len]);
+                common_prefix_len = first_match_len;
+                // Add / suffix for single directory match
+                if (entry.kind == .directory and first_match_len < 255) {
+                    first_match[first_match_len] = '/';
+                    first_match_len += 1;
+                    common_prefix_len = first_match_len;
+                }
+            } else {
+                // Narrow common prefix
+                const cp = common_prefix_len.?;
+                var i: usize = prefix.len;
+                while (i < cp and i < name.len) : (i += 1) {
+                    if (i >= first_match_len or first_match[i] != name[i]) break;
+                }
+                common_prefix_len = i;
+            }
+
+            match_count += 1;
+        }
+
+        self.completion_match_count = @min(match_count, 16);
+
+        // If exactly one match, show the full hint grayed out
+        if (match_count == 1 and first_match_len > prefix.len) {
+            const hint = first_match[prefix.len..first_match_len];
+            const hint_len = @min(hint.len, 512);
+            @memcpy(self.completion_hint[0..hint_len], hint[0..hint_len]);
+            self.completion_hint_len = hint_len;
+        } else if (match_count > 1) {
+            // Show common prefix extension as hint
+            const cp = common_prefix_len orelse prefix.len;
+            if (cp > prefix.len) {
+                const hint = first_match[prefix.len..cp];
+                const hint_len = @min(hint.len, 512);
+                @memcpy(self.completion_hint[0..hint_len], hint[0..hint_len]);
+                self.completion_hint_len = hint_len;
+            }
+        }
+    }
+
+    fn applyTabCompletion(self: *Editor) void {
+        if (self.completion_hint_len == 0) return;
+
+        // Append the hint to the prompt
+        const space = 256 - self.prompt_len;
+        const copy_len = @min(self.completion_hint_len, space);
+        @memcpy(self.prompt_buf[self.prompt_len..][0..copy_len], self.completion_hint[0..copy_len]);
+        self.prompt_len += copy_len;
+
+        // Re-scan for new completions
+        self.updateCompletions();
     }
 
     fn newBuffer(self: *Editor) void {
@@ -1561,7 +1710,7 @@ pub const Editor = struct {
                 return self.search_pattern[0..self.search_len];
             },
             .confirm => return self.status_msg[0..self.status_msg_len],
-            .normal => return "",
+            .normal, .help => return "",
         }
     }
 

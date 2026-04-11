@@ -1,0 +1,118 @@
+#!/usr/bin/expect -f
+# t13_completion.exp -- tab completion tests for file open/save-as
+
+set timeout 8
+set issy [lindex $argv 0]
+set test_dir [lindex $argv 1]
+source "$test_dir/helpers.tcl"
+
+set tmpdir [exec mktemp -d]
+
+# Create test files for completion
+exec echo -n "alpha" > "$tmpdir/apple.txt"
+exec echo -n "beta" > "$tmpdir/apricot.txt"
+exec echo -n "gamma" > "$tmpdir/banana.txt"
+exec mkdir -p "$tmpdir/subdir"
+exec echo -n "delta" > "$tmpdir/subdir/deep.txt"
+
+# --- L1: Unique tab completion opens file ---
+spawn $issy --no-config
+sleep 0.8
+send "\x0f"
+sleep 0.3
+# Clear prompt
+for {set i 0} {$i < 200} {incr i} { send "\x7f" }
+sleep 0.2
+send "$tmpdir/b"
+sleep 0.2
+send "\t"
+sleep 0.2
+send "\r"
+sleep 0.5
+# File opened — insert marker, save, quit
+send "!"
+sleep 0.3
+send "\x13"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file "$tmpdir/banana.txt" "!gamma" "L1_unique_tab_complete"]
+
+# --- L2: Ambiguous tab completes common prefix ---
+set f "$tmpdir/l2_marker.txt"
+spawn $issy --no-config
+sleep 0.8
+send "\x0f"
+sleep 0.3
+for {set i 0} {$i < 200} {incr i} { send "\x7f" }
+sleep 0.2
+# "ap" matches apple.txt and apricot.txt — common prefix is "ap"
+# Tab should extend to common prefix (maybe "ap" -> no further since both start with "ap")
+# Type "app" then tab to get apple.txt
+send "$tmpdir/app"
+sleep 0.2
+send "\t"
+sleep 0.2
+send "\r"
+sleep 0.5
+send "!"
+sleep 0.3
+send "\x13"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file "$tmpdir/apple.txt" "!alpha" "L2_disambiguated_tab"]
+
+# --- L3: Directory completion appends slash ---
+spawn $issy --no-config
+sleep 0.8
+send "\x0f"
+sleep 0.3
+for {set i 0} {$i < 200} {incr i} { send "\x7f" }
+sleep 0.2
+# "sub" uniquely matches "subdir/"
+send "$tmpdir/sub"
+sleep 0.2
+send "\t"
+sleep 0.2
+# Now should have "$tmpdir/subdir/" — type "d" then tab for deep.txt
+send "d"
+sleep 0.2
+send "\t"
+sleep 0.2
+send "\r"
+sleep 0.5
+send "!"
+sleep 0.3
+send "\x13"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file "$tmpdir/subdir/deep.txt" "!delta" "L3_dir_completion"]
+
+# --- L4: Save-as with tab completion ---
+set f "$tmpdir/newfile_via_saveas.txt"
+spawn $issy --no-config
+sleep 0.8
+send "content"
+sleep 0.3
+send "\x13"
+sleep 0.3
+# Clear the CWD prompt
+for {set i 0} {$i < 200} {incr i} { send "\x7f" }
+sleep 0.2
+send "$f"
+sleep 0.2
+send "\r"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "content" "L4_save_as_with_path"]
+
+# Cleanup
+exec rm -rf $tmpdir
+report_results "t13_completion"

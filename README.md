@@ -118,6 +118,13 @@ issy --font /path/to/font.ttf --print output.pdf source.c
 
 All editing operations (typing, backspace, delete, paste) apply to every cursor simultaneously.
 
+### Help
+
+| Key | Action |
+|-----|--------|
+| Ctrl+/ | Show keybindings overlay (any key to dismiss) |
+| F1 | Same as Ctrl+/ |
+
 ## Configuration
 
 Create `~/.issyrc` (POSIX) or `%APPDATA%\issy\config` (Windows). See [CONFIGURATION.md](CONFIGURATION.md) for the full reference, or copy [examples/issyrc](examples/issyrc) as a starting point.

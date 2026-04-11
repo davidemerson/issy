@@ -42,6 +42,8 @@ pub const Key = union(enum) {
     scroll_down,
     mouse_click: struct { row: u16, col: u16 },
     ctrl: u8,
+    f1,
+    help, // Ctrl+/ or Ctrl+Shift+?
     unknown,
     none,
 };
@@ -229,6 +231,12 @@ fn readKeyPosix() !Key {
         return .backspace;
     }
 
+    // Ctrl+/ (0x1f) = help overlay
+    if (b == 0x1f) {
+        readBufConsume(1);
+        return .help;
+    }
+
     // Other ctrl keys
     if (b < 0x20 and b != 0x1b) {
         readBufConsume(1);
@@ -273,7 +281,9 @@ fn readKeyPosix() !Key {
 fn escapeLen(buf: []const u8) usize {
     // Determine how many bytes the escape sequence consumed
     if (buf.len < 2) return 1;
-    // Only consume the next byte if it starts a real escape sequence (CSI)
+    // ESC O P/Q/R/S = F1-F4 (SS3 sequences) — consume 3 bytes
+    if (buf[1] == 'O' and buf.len >= 3) return 3;
+    // Only consume the next byte if it starts a CSI sequence
     // Otherwise treat ESC as standalone — don't eat the following character
     if (buf[1] != '[') return 1;
 
@@ -307,6 +317,15 @@ fn decodeUtf8(bytes: []const u8) u21 {
 
 fn parseEscape(buf: []const u8) Key {
     if (buf.len < 2) return .escape;
+
+    // SS3 sequences: ESC O P = F1, etc.
+    if (buf[1] == 'O' and buf.len >= 3) {
+        return switch (buf[2]) {
+            'P' => .f1,
+            else => .unknown,
+        };
+    }
+
     if (buf[1] != '[') return .escape;
     if (buf.len < 3) return .escape;
 
@@ -337,6 +356,9 @@ fn parseExtended(buf: []const u8) Key {
 
     // ESC [ 3 ~ = delete
     if (buf[2] == '3' and buf[3] == '~') return .delete;
+
+    // ESC [ 1 1 ~ = F1
+    if (buf[2] == '1' and buf.len >= 5 and buf[3] == '1' and buf[4] == '~') return .f1;
 
     // ESC [ 1 ; 5 C = ctrl+right, ESC [ 1 ; 5 D = ctrl+left
     if (buf[2] == '1' and buf.len >= 6 and buf[3] == ';' and buf[4] == '5') {
