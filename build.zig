@@ -58,6 +58,22 @@ pub fn build(b: *std.Build) void {
         cross_step.dependOn(&cross_install.step);
     }
 
+    // Keygen step — builds and runs tools/keygen.zig. Used once per repo
+    // to bootstrap the auto-update signing key. Prints a PEM private key
+    // and a Zig public-key array literal to stdout; the private key is
+    // never persisted to disk by the tool.
+    const keygen_exe = b.addExecutable(.{
+        .name = "issy-keygen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/keygen.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_keygen = b.addRunArtifact(keygen_exe);
+    const keygen_step = b.step("keygen", "Generate Ed25519 signing keypair for auto-update");
+    keygen_step.dependOn(&run_keygen.step);
+
     // Test step — run all tests across all source files.
     const source_files: []const []const u8 = &.{
         "src/unicode.zig",
@@ -70,6 +86,7 @@ pub fn build(b: *std.Build) void {
         "src/font.zig",
         "src/print.zig",
         "src/update.zig",
+        "src/update_key.zig",
         "src/main.zig",
     };
 

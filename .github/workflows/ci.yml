@@ -96,7 +96,31 @@ jobs:
           # Full 40-char commit SHA — consumed by the in-editor update checker.
           git rev-parse HEAD > dist/commit.txt
 
+          # Sha256 manifest over the prebuilt binaries. The auto-update
+          # path fetches this, verifies its Ed25519 signature, and then
+          # hashes the downloaded binary against it.
+          (cd dist && sha256sum issy-* > sha256sums.txt)
+
           ls -lh dist/
+
+      - name: Sign sha256sums.txt
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          if [ -z "${UPDATE_SIGNING_KEY:-}" ]; then
+            echo "::warning::UPDATE_SIGNING_KEY secret is not set — auto-update"\
+                 " signature will be missing from this release. Run" \
+                 " 'zig build keygen' locally and add the printed PEM as" \
+                 " repo Settings → Secrets and variables → Actions →" \
+                 " UPDATE_SIGNING_KEY."
+            exit 0
+          fi
+          tmp=$(mktemp --suffix=.pem)
+          trap 'rm -f "$tmp"' EXIT
+          printf '%s\n' "$UPDATE_SIGNING_KEY" > "$tmp"
+          openssl pkeyutl -sign -inkey "$tmp" -rawin \
+            -in dist/sha256sums.txt -out dist/sha256sums.txt.sig
+          echo "Signed sha256sums.txt ($(stat -c%s dist/sha256sums.txt.sig) bytes)"
 
       - name: Package .deb and .rpm
         run: |
