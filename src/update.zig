@@ -418,8 +418,10 @@ test "verifyManifestSignature accepts valid sig and rejects tampered one" {
     try std.testing.expectError(error.SignatureVerificationFailed, sig.verify(tampered, kp.public_key));
 }
 
-test "update_key placeholder is not configured" {
-    // On a fresh checkout the committed public_key is all zeros and must
-    // report as not-configured so the runtime refuses to auto-apply.
-    try std.testing.expect(!update_key.isConfigured());
+test "update_key is bootstrapped" {
+    // This repo has a real Ed25519 public key committed in src/update_key.zig.
+    // If this test fails, the key has been zeroed out — auto-update will
+    // silently refuse to stage any binary until it's regenerated via
+    // `zig build keygen`.
+    try std.testing.expect(update_key.isConfigured());
 }
