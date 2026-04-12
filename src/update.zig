@@ -318,32 +318,34 @@ fn findAssetHash(manifest: []const u8, asset_name: []const u8) ?[]const u8 {
 
 /// Issues an HTTP GET request and returns the response body as an
 /// allocator-owned slice, or null on any failure (non-200, oversize,
-/// network error). Caller frees.
+/// network error, alloc failure). Caller frees.
+///
+/// The fetch is bounded by `max_size`: the response is streamed into a
+/// fixed-size buffer, and if the server sends more than `max_size` bytes
+/// the underlying Writer returns WriteFailed and we bail.
 fn httpGet(
     client: *std.http.Client,
     allocator: std.mem.Allocator,
     url: []const u8,
     max_size: usize,
 ) ?[]u8 {
-    var body: std.ArrayList(u8) = .{};
-    errdefer body.deinit(allocator);
+    const scratch = allocator.alloc(u8, max_size) catch return null;
+    defer allocator.free(scratch);
+
+    var writer = std.Io.Writer.fixed(scratch);
 
     const result = client.fetch(.{
         .location = .{ .url = url },
         .method = .GET,
-        .response_storage = .{ .dynamic = &body },
-        .max_append_size = max_size,
-    }) catch {
-        body.deinit(allocator);
-        return null;
-    };
+        .response_writer = &writer,
+    }) catch return null;
 
-    if (result.status != .ok) {
-        body.deinit(allocator);
-        return null;
-    }
+    if (result.status != .ok) return null;
 
-    return body.toOwnedSlice(allocator) catch null;
+    const written = writer.end;
+    const out = allocator.alloc(u8, written) catch return null;
+    @memcpy(out, scratch[0..written]);
+    return out;
 }
 
 /// Atomic file write: create a `.tmp` sibling, write, rename.
