@@ -10,6 +10,8 @@ const term = @import("term.zig");
 const editor_mod = @import("editor.zig");
 const render_mod = @import("render.zig");
 const print_mod = @import("print.zig");
+const update_mod = @import("update.zig");
+const build_info = @import("build_info.zig");
 
 const Args = struct {
     file: ?[]const u8 = null,
@@ -59,7 +61,13 @@ pub fn main() !void {
 
     if (args.show_version) {
         const stdout = std.fs.File.stdout();
-        try stdout.writeAll("issy 0.1.0\n");
+        var buf: [128]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "issy {s} ({s} {s})\n", .{
+            build_info.version,
+            build_info.commit_sha[0..@min(7, build_info.commit_sha.len)],
+            @tagName(build_info.build_type),
+        }) catch "issy\n";
+        try stdout.writeAll(line);
         return;
     }
 
@@ -147,6 +155,15 @@ pub fn main() !void {
 
     ed.visible_rows = size.rows;
     ed.visible_cols = size.cols;
+
+    // Auto-update check. Reads cached ~/.cache/issy/commit.txt (if any) to set
+    // the initial status, then forks a detached worker to refresh the cache
+    // for next run. Never blocks on the network.
+    var update_state = update_mod.UpdateState{};
+    update_mod.startupCheck(&update_state, allocator, &cfg);
+    if (update_state.status == .available and cfg.notify_updates) {
+        ed.setStatusMessage(update_state.getMessage());
+    }
 
     // Main loop
     var last_stat_check: i64 = 0;

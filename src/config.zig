@@ -109,6 +109,10 @@ pub const Config = struct {
     theme_name: [64]u8 = initThemeName("default"),
     theme_name_len: usize = 7,
 
+    // Auto-update
+    notify_updates: bool = true,   // show status-bar notice when a newer build exists
+    autoupdate: bool = false,      // opt-in: download and apply updates in-session (Phase 2+)
+
     // Font / print
     font_file: [512]u8 = std.mem.zeroes([512]u8),
     font_file_len: usize = 0,
@@ -232,6 +236,10 @@ fn parseConfigKey(cfg: *Config, key: []const u8, val: []const u8) void {
         if (std.mem.eql(u8, val, "bar")) cfg.cursor_style = .bar
         else if (std.mem.eql(u8, val, "block")) cfg.cursor_style = .block
         else if (std.mem.eql(u8, val, "underline")) cfg.cursor_style = .underline;
+    } else if (std.mem.eql(u8, key, "notify_updates")) {
+        cfg.notify_updates = parseBool(val);
+    } else if (std.mem.eql(u8, key, "autoupdate")) {
+        cfg.autoupdate = parseBool(val);
     } else if (std.mem.eql(u8, key, "font_file")) {
         if (val.len <= 512) {
             @memcpy(cfg.font_file[0..val.len], val);

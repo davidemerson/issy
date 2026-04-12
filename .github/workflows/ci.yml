@@ -93,6 +93,9 @@ jobs:
             echo "::endgroup::"
           done
 
+          # Full 40-char commit SHA — consumed by the in-editor update checker.
+          git rev-parse HEAD > dist/commit.txt
+
           ls -lh dist/
 
       - name: Package .deb and .rpm
