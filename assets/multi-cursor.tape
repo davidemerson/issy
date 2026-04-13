@@ -10,6 +10,7 @@
 Output assets/multi-cursor.gif
 
 Set Shell "bash"
+Set FontFamily "Berkeley Mono Variable NNIX"
 Set FontSize 16
 Set Width 900
 Set Height 520

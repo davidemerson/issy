@@ -13,6 +13,7 @@
 Output assets/.syntax-highlight-tmp.gif
 
 Set Shell "bash"
+Set FontFamily "Berkeley Mono Variable NNIX"
 Set FontSize 14
 Set Width 1100
 Set Height 700
