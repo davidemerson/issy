@@ -193,11 +193,23 @@ pub const Renderer = struct {
                     }
                 }
 
-                // Render characters for this visual sub-line
+                // Render characters for this visual sub-line.
+                //
+                // The termination check compares `byte_idx` against
+                // `sub_end_col` because both are byte offsets: sub_end_col
+                // comes from editor.computeWrapBreaks (byte positions)
+                // or from line_data.len. Do NOT use buf_col here —
+                // that's a visual column and on tab-bearing lines it
+                // runs ahead of byte_idx, causing the loop to exit
+                // early. When that happened the outer sub-line loop
+                // kept advancing visual_sub_line without drawing
+                // anything, at_line_end stayed false, and the whole
+                // screen filled with empty wrap-continuation rows for
+                // a single buffer line.
                 var col: u16 = code_start + this_indent;
                 const row_start_buf_col = buf_col;
 
-                while (byte_idx < line_data.len and buf_col < sub_end_col) {
+                while (byte_idx < line_data.len and byte_idx < sub_end_col) {
                     const ch = line_data[byte_idx];
                     if (ch == '\n') break;
 

@@ -1997,6 +1997,45 @@ test "editor undo/redo" {
     try std.testing.expectEqual(@as(usize, 1), ed.buf.logicalLen());
 }
 
+test "tab-bearing short line reports single visual row" {
+    // Regression for a render bug where a file containing tab characters
+    // on short lines would render line 0 as an infinite cascade of wrap
+    // continuations, hiding every subsequent line. Root cause: render.zig
+    // terminated its char loop on `buf_col < sub_end_col` where buf_col
+    // is a visual column and sub_end_col is a byte offset — tabs advance
+    // buf_col faster than byte_idx, so buf_col reached sub_end_col early
+    // and the loop exited before reaching end-of-line, which flipped
+    // at_line_end to false and stranded the outer sub-line loop.
+    //
+    // This test pins the invariant at the wrap-computation layer: a
+    // short line that fits in wrap width must report exactly one
+    // visual row regardless of embedded tabs.
+
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    const sample = "COMMENT =\ttiny text editor\nGH =\tdave\nfin\n";
+    try ed.buf.insert(0, sample);
+
+    // Buffer parsed at least three content lines (plus a possible
+    // trailing empty line from the final '\n').
+    try std.testing.expect(ed.buf.lineCount() >= 3);
+
+    // Line 0 is ~26 bytes. With any sane wrap width (visible_cols wide
+    // terminal, default right_margin=100), it fits in one visual row.
+    ed.visible_cols = 120;
+    ed.visible_rows = 10;
+
+    var breaks: [Editor.MAX_WRAP_BREAKS]usize = undefined;
+    try std.testing.expectEqual(@as(usize, 1), ed.computeWrapBreaks(0, &breaks));
+    try std.testing.expectEqual(@as(usize, 1), ed.visualLinesForBufferLine(0));
+
+    // Line 1 and line 2 likewise are short tab-bearing / plain lines.
+    try std.testing.expectEqual(@as(usize, 1), ed.visualLinesForBufferLine(1));
+    try std.testing.expectEqual(@as(usize, 1), ed.visualLinesForBufferLine(2));
+}
+
 test "multi-cursor insert types at every cursor" {
     var cfg = config_mod.Config.init();
     var ed = Editor.init(&cfg, std.testing.allocator);
