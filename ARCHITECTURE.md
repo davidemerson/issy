@@ -87,7 +87,7 @@ A state machine tokenizer with no allocations in the hot path.
 
 - **State**: Carries `normal`, `comment_multi`, or `string` across lines.
 - **Token types**: `keyword1`, `keyword2`, `comment`, `string`, `number`, `typ`, `function`, `operator`, `preprocessor`, `normal`.
-- **Languages**: 16 definitions with keyword lists, comment syntax, string delimiters, and preprocessor prefixes. Detection is by file extension (or exact filename for Makefile).
+- **Languages**: 17 definitions with keyword lists, comment syntax, string delimiters, and preprocessor prefixes. Detection is by file extension (or exact filename for Makefile). TeX/LaTeX uses a `command_prefix` field to tokenize `\command` sequences as single keyword tokens instead of relying on keyword lists.
 - **Output**: Writes tokens into a caller-provided fixed-size buffer. No heap allocation.
 
 ### config.zig -- Configuration

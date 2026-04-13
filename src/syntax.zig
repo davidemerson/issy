@@ -42,6 +42,12 @@ pub const Language = struct {
     string_delimiters: []const u8,
     has_char_literals: bool,
     preprocessor_prefix: ?u8,
+    /// Optional leading character that introduces a "command" token
+    /// (`\` in TeX/LaTeX). When set, a run of `<prefix><letter>+` is
+    /// tokenized as a single keyword1, regardless of the keyword list.
+    /// A bare prefix with no following letter falls through to the
+    /// operator/skip path.
+    command_prefix: ?u8 = null,
 };
 
 /// Detect the language for a file based on its name/extension.
@@ -160,6 +166,23 @@ pub fn tokenizeLine(lang: *const Language, line: []const u8, state: *State, resu
             }
         }
 
+        // Command prefix (e.g. `\` in TeX). A run of `<prefix><letter>+`
+        // becomes a single keyword1 token covering both the prefix and
+        // the name. A bare prefix with no letter following falls through
+        // to the generic operator/skip path below.
+        if (lang.command_prefix) |cp| {
+            if (line[i] == cp and i + 1 < line.len and isAlpha(line[i + 1])) {
+                const start = i;
+                i += 1;
+                while (i < line.len and isAlpha(line[i])) : (i += 1) {}
+                if (count < result_buf.len) {
+                    result_buf[count] = .{ .start = start, .end = i, .token_type = .keyword1 };
+                    count += 1;
+                }
+                continue;
+            }
+        }
+
         // String
         if (isStringDelimiter(lang, line[i])) {
             const delim = line[i];
@@ -254,6 +277,10 @@ fn isStringDelimiter(lang: *const Language, c: u8) bool {
 
 fn isDigit(c: u8) bool {
     return c >= '0' and c <= '9';
+}
+
+fn isAlpha(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z');
 }
 
 fn isHexDigit(c: u8) bool {
@@ -677,6 +704,19 @@ pub const languages = [_]Language{
         .has_char_literals = false,
         .preprocessor_prefix = null,
     },
+    .{
+        .name = "TeX",
+        .extensions = &.{ ".tex", ".ltx", ".sty", ".cls", ".bib", ".dtx" },
+        .keywords1 = &empty_keywords, // commands are recognized via command_prefix
+        .keywords2 = &empty_keywords,
+        .single_line_comment = "%",
+        .multi_comment_start = null,
+        .multi_comment_end = null,
+        .string_delimiters = "",
+        .has_char_literals = false,
+        .preprocessor_prefix = null,
+        .command_prefix = '\\',
+    },
 };
 
 // ── Tests ──
@@ -757,6 +797,64 @@ test "tokenize string with escape" {
         }
     }
     try std.testing.expect(found_string);
+}
+
+test "detect TeX by extension" {
+    try std.testing.expectEqualSlices(u8, "TeX", detect("paper.tex").?.name);
+    try std.testing.expectEqualSlices(u8, "TeX", detect("style.sty").?.name);
+    try std.testing.expectEqualSlices(u8, "TeX", detect("refs.bib").?.name);
+    try std.testing.expectEqualSlices(u8, "TeX", detect("class.cls").?.name);
+    try std.testing.expectEqualSlices(u8, "TeX", detect("macros.dtx").?.name);
+}
+
+test "tokenize TeX command" {
+    const lang = detect("paper.tex").?;
+    var state: State = .normal;
+    var buf: [64]Token = undefined;
+
+    const tokens = tokenizeLine(lang, "\\section{Introduction}", &state, &buf);
+    // First token should be \section as keyword1
+    try std.testing.expect(tokens.len >= 1);
+    try std.testing.expectEqual(TokenType.keyword1, tokens[0].token_type);
+    try std.testing.expectEqual(@as(usize, 0), tokens[0].start);
+    try std.testing.expectEqual(@as(usize, 8), tokens[0].end); // "\section"
+}
+
+test "tokenize TeX comment" {
+    const lang = detect("paper.tex").?;
+    var state: State = .normal;
+    var buf: [64]Token = undefined;
+
+    const tokens = tokenizeLine(lang, "Hello world % this is a comment", &state, &buf);
+    // Last token should be the comment from % onward
+    try std.testing.expect(tokens.len >= 1);
+    const last = tokens[tokens.len - 1];
+    try std.testing.expectEqual(TokenType.comment, last.token_type);
+}
+
+test "tokenize TeX bare backslash is not a command" {
+    const lang = detect("paper.tex").?;
+    var state: State = .normal;
+    var buf: [64]Token = undefined;
+
+    // `\\` (line break) should not be emitted as a command — the second
+    // character is not a letter, so the command path doesn't fire.
+    const tokens = tokenizeLine(lang, "line\\\\", &state, &buf);
+    // Just make sure we didn't emit a keyword1 token by mistake.
+    for (tokens) |t| {
+        try std.testing.expect(t.token_type != .keyword1);
+    }
+}
+
+test "tokenize TeX begin environment" {
+    const lang = detect("paper.tex").?;
+    var state: State = .normal;
+    var buf: [64]Token = undefined;
+
+    const tokens = tokenizeLine(lang, "\\begin{equation}", &state, &buf);
+    // \begin → keyword1, equation → identifier/normal
+    try std.testing.expect(tokens.len >= 1);
+    try std.testing.expectEqual(TokenType.keyword1, tokens[0].token_type);
 }
 
 test "tokenize number formats" {

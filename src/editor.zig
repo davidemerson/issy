@@ -29,6 +29,11 @@ const UndoEntry = struct {
     pos: usize,
     deleted: ?[]u8,
     inserted_len: usize,
+    /// Group identifier. 0 = standalone entry, non-zero = part of a group
+    /// (all entries in a group share the same id). undo/redo process
+    /// every entry with the same id as one atomic unit, which is how a
+    /// multi-cursor insert or delete becomes a single undo step.
+    group_id: u32 = 0,
 };
 
 pub const LineCol = struct { line: usize, col: usize };
@@ -79,6 +84,10 @@ pub const Editor = struct {
 
     undo_stack: std.ArrayList(UndoEntry),
     redo_stack: std.ArrayList(UndoEntry),
+    /// Monotonic counter. `nextUndoGroupId()` increments and returns it;
+    /// each call yields a fresh id so every multi-cursor tick gets its
+    /// own group that undo/redo can process atomically.
+    undo_group_counter: u32 = 0,
 
     clipboard: ?[]u8 = null,
 
@@ -1021,14 +1030,22 @@ pub const Editor = struct {
     fn insertCodepoint(self: *Editor, cp: u21) void {
         var enc: [4]u8 = undefined;
         const len = unicode.encode(cp, &enc);
-        const pos = self.cursorBytePos();
 
-        self.pushUndo(pos, null, len);
-        self.buf.insert(pos, enc[0..len]) catch return;
-        self.cursor.col += 1;
-        self.cursor.col_want = self.cursor.col;
-        self.modified = true;
-        self.ensureCursorVisible();
+        if (self.cursors.items.len == 0) {
+            // Fast path: single cursor. Keep the original behavior bit-for-bit
+            // so there's no behavioral drift for the common case.
+            const pos = self.cursorBytePos();
+            self.pushUndo(pos, null, len);
+            self.buf.insert(pos, enc[0..len]) catch return;
+            self.cursor.col += 1;
+            self.cursor.col_want = self.cursor.col;
+            self.modified = true;
+            self.ensureCursorVisible();
+            self.updateBracketMatch();
+            return;
+        }
+
+        self.multiCursorInsert(enc[0..len]);
         self.updateBracketMatch();
     }
 
@@ -1094,48 +1111,59 @@ pub const Editor = struct {
             self.deleteSelection();
             return;
         }
-        if (self.cursor.col == 0 and self.cursor.line == 0) return;
 
-        if (self.cursor.col == 0) {
-            // Join with previous line
-            self.cursor.line -= 1;
-            self.moveCursorToLineEnd();
+        if (self.cursors.items.len == 0) {
+            // Fast path: single cursor.
+            if (self.cursor.col == 0 and self.cursor.line == 0) return;
+
+            if (self.cursor.col == 0) {
+                // Join with previous line
+                self.cursor.line -= 1;
+                self.moveCursorToLineEnd();
+                const pos = self.cursorBytePos();
+                var del: [1]u8 = undefined;
+                del[0] = '\n';
+                const saved = self.allocator.dupe(u8, &del) catch return;
+                self.pushUndo(pos, saved, 0);
+                self.buf.delete(pos, 1);
+            } else {
+                self.cursor.col -= 1;
+                const pos = self.cursorBytePos();
+                var tmp: [1]u8 = undefined;
+                const ch = self.buf.contiguousSlice(pos, 1, &tmp);
+                const saved = self.allocator.dupe(u8, ch) catch return;
+                self.pushUndo(pos, saved, 0);
+                self.buf.delete(pos, 1);
+            }
+            self.cursor.col_want = self.cursor.col;
+            self.modified = true;
+            self.ensureCursorVisible();
+            self.updateBracketMatch();
+            return;
+        }
+
+        self.multiCursorDelete(.backward);
+        self.updateBracketMatch();
+    }
+
+    fn doDelete(self: *Editor) void {
+        if (self.cursors.items.len == 0) {
             const pos = self.cursorBytePos();
-            var del: [1]u8 = undefined;
-            del[0] = '\n';
-            const saved = self.allocator.dupe(u8, &del) catch return;
-            self.pushUndo(pos, saved, 0);
-            self.buf.delete(pos, 1);
-        } else {
-            self.cursor.col -= 1;
-            const pos = self.cursorBytePos();
+            const total_len = self.buf.logicalLen();
+            if (pos >= total_len) return;
+
             var tmp: [1]u8 = undefined;
             const ch = self.buf.contiguousSlice(pos, 1, &tmp);
             const saved = self.allocator.dupe(u8, ch) catch return;
             self.pushUndo(pos, saved, 0);
             self.buf.delete(pos, 1);
+
+            self.modified = true;
+            self.updateBracketMatch();
+            return;
         }
-        self.cursor.col_want = self.cursor.col;
-        self.modified = true;
-        self.ensureCursorVisible();
-        self.updateBracketMatch();
-    }
 
-    fn doDelete(self: *Editor) void {
-        const pos = self.cursorBytePos();
-        const total_len = self.buf.logicalLen();
-        if (pos >= total_len) return;
-
-        var tmp: [1]u8 = undefined;
-        const ch = self.buf.contiguousSlice(pos, 1, &tmp);
-        const saved = self.allocator.dupe(u8, ch) catch return;
-        self.pushUndo(pos, saved, 0);
-        self.buf.delete(pos, 1);
-
-        if (ch[0] == '\n') {
-            // Lines merged, col stays
-        }
-        self.modified = true;
+        self.multiCursorDelete(.forward);
         self.updateBracketMatch();
     }
 
@@ -1198,11 +1226,21 @@ pub const Editor = struct {
 
     // ── Undo/Redo ──
 
+    fn nextUndoGroupId(self: *Editor) u32 {
+        self.undo_group_counter += 1;
+        return self.undo_group_counter;
+    }
+
     fn pushUndo(self: *Editor, pos: usize, deleted: ?[]u8, inserted_len: usize) void {
+        self.pushUndoGrouped(pos, deleted, inserted_len, 0);
+    }
+
+    fn pushUndoGrouped(self: *Editor, pos: usize, deleted: ?[]u8, inserted_len: usize, group_id: u32) void {
         self.undo_stack.append(self.allocator, .{
             .pos = pos,
             .deleted = deleted,
             .inserted_len = inserted_len,
+            .group_id = group_id,
         }) catch {};
 
         // Clear redo stack
@@ -1212,15 +1250,11 @@ pub const Editor = struct {
         self.redo_stack.clearRetainingCapacity();
     }
 
-    fn undo(self: *Editor) void {
-        if (self.undo_stack.items.len == 0) return;
-        const entry = self.undo_stack.pop() orelse return;
-
-        // Build the inverse redo entry as a single combined operation
+    fn applyUndoEntry(self: *Editor, entry: UndoEntry) UndoEntry {
+        // Invert a single entry and return the matching redo entry.
         var redo_deleted: ?[]u8 = null;
         var redo_inserted_len: usize = 0;
 
-        // First: undo the insertion (delete what was inserted)
         if (entry.inserted_len > 0) {
             if (entry.inserted_len <= 4096) {
                 var tmp: [4096]u8 = undefined;
@@ -1230,57 +1264,68 @@ pub const Editor = struct {
             self.buf.delete(entry.pos, entry.inserted_len);
         }
 
-        // Second: undo the deletion (re-insert what was deleted)
         if (entry.deleted) |del| {
             self.buf.insert(entry.pos, del) catch {};
             redo_inserted_len = del.len;
             self.allocator.free(del);
         }
 
-        // Push a single combined redo entry
-        self.redo_stack.append(self.allocator, .{
+        return .{
             .pos = entry.pos,
             .deleted = redo_deleted,
             .inserted_len = redo_inserted_len,
-        }) catch {};
+            .group_id = entry.group_id,
+        };
+    }
+
+    fn undo(self: *Editor) void {
+        if (self.undo_stack.items.len == 0) return;
+
+        const top = self.undo_stack.items[self.undo_stack.items.len - 1];
+        const group_id = top.group_id;
+
+        // For ungrouped entries, process a single step. For grouped
+        // entries, pop every entry carrying the same group_id in one
+        // atomic unit so a multi-cursor tick undoes as a whole.
+        var last_pos: usize = top.pos;
+        while (self.undo_stack.items.len > 0) {
+            const entry = self.undo_stack.items[self.undo_stack.items.len - 1];
+            if (entry.group_id != group_id) break;
+            _ = self.undo_stack.pop();
+            const redo_entry = self.applyUndoEntry(entry);
+            self.redo_stack.append(self.allocator, redo_entry) catch {};
+            last_pos = entry.pos;
+            if (group_id == 0) break; // ungrouped: single step
+        }
 
         self.modified = true;
-        self.repositionCursorToBytePos(entry.pos);
+        // After a group undo, clear the multi-cursor set and put the
+        // primary at the smallest restored position. This keeps the
+        // post-undo state clean and predictable.
+        self.cursors.clearRetainingCapacity();
+        self.repositionCursorToBytePos(last_pos);
     }
 
     fn redo(self: *Editor) void {
         if (self.redo_stack.items.len == 0) return;
-        const entry = self.redo_stack.pop() orelse return;
 
-        var undo_deleted: ?[]u8 = null;
-        var undo_inserted_len: usize = 0;
+        const top = self.redo_stack.items[self.redo_stack.items.len - 1];
+        const group_id = top.group_id;
 
-        // First: undo the re-insertion (delete what was re-inserted)
-        if (entry.inserted_len > 0) {
-            if (entry.inserted_len <= 4096) {
-                var tmp: [4096]u8 = undefined;
-                const data = self.buf.contiguousSlice(entry.pos, entry.inserted_len, &tmp);
-                undo_deleted = self.allocator.dupe(u8, data) catch null;
-            }
-            self.buf.delete(entry.pos, entry.inserted_len);
+        var last_pos: usize = top.pos;
+        while (self.redo_stack.items.len > 0) {
+            const entry = self.redo_stack.items[self.redo_stack.items.len - 1];
+            if (entry.group_id != group_id) break;
+            _ = self.redo_stack.pop();
+            const undo_entry = self.applyUndoEntry(entry);
+            self.undo_stack.append(self.allocator, undo_entry) catch {};
+            last_pos = entry.pos;
+            if (group_id == 0) break;
         }
-
-        // Second: re-apply the original insertion
-        if (entry.deleted) |del| {
-            self.buf.insert(entry.pos, del) catch {};
-            undo_inserted_len = del.len;
-            self.allocator.free(del);
-        }
-
-        // Push a single combined undo entry
-        self.undo_stack.append(self.allocator, .{
-            .pos = entry.pos,
-            .deleted = undo_deleted,
-            .inserted_len = undo_inserted_len,
-        }) catch {};
 
         self.modified = true;
-        self.repositionCursorToBytePos(entry.pos);
+        self.cursors.clearRetainingCapacity();
+        self.repositionCursorToBytePos(last_pos);
     }
 
     fn repositionCursorToBytePos(self: *Editor, pos: usize) void {
@@ -1495,15 +1540,162 @@ pub const Editor = struct {
 
     // ── Multi-cursor ──
 
+    /// Maximum cursor count across the primary + secondaries. Beyond
+    /// this the extras are quietly dropped during multi-cursor edits.
+    const MAX_CURSORS: usize = 64;
+
+    /// Collect all active cursor byte positions into `out`, sorted
+    /// descending and deduplicated. Returns the count written.
+    fn collectCursorPositionsDesc(self: *Editor, out: *[MAX_CURSORS]usize) usize {
+        var n: usize = 0;
+        out[n] = self.cursorBytePos();
+        n += 1;
+        for (self.cursors.items) |c| {
+            if (n >= MAX_CURSORS) break;
+            out[n] = self.lineColToBytePos(c.line, c.col);
+            n += 1;
+        }
+        std.mem.sort(usize, out[0..n], {}, std.sort.desc(usize));
+        // Dedupe consecutive (they're adjacent after sort).
+        var write: usize = 0;
+        var read: usize = 0;
+        while (read < n) : (read += 1) {
+            if (write == 0 or out[write - 1] != out[read]) {
+                out[write] = out[read];
+                write += 1;
+            }
+        }
+        return write;
+    }
+
+    /// Assign a set of byte positions back to the cursor set. The
+    /// smallest position becomes the primary, the rest become
+    /// secondaries. Positions are assumed to be valid byte offsets.
+    fn assignCursorPositions(self: *Editor, positions: []usize) void {
+        if (positions.len == 0) return;
+        std.mem.sort(usize, positions, {}, std.sort.asc(usize));
+
+        const primary_lc = self.bytePosToLineCol(positions[0]);
+        self.cursor.line = primary_lc.line;
+        self.cursor.col = primary_lc.col;
+        self.cursor.col_want = self.cursor.col;
+
+        self.cursors.clearRetainingCapacity();
+        for (positions[1..]) |p| {
+            const lc = self.bytePosToLineCol(p);
+            self.cursors.append(self.allocator, .{
+                .line = lc.line,
+                .col = lc.col,
+                .col_want = lc.col,
+            }) catch {};
+        }
+    }
+
+    /// Insert `bytes` at every active cursor position. Edits are
+    /// applied from highest byte offset to lowest so earlier positions
+    /// stay valid throughout. All resulting undo entries share one
+    /// group_id so Ctrl+Z reverts the whole tick as a single unit.
+    fn multiCursorInsert(self: *Editor, bytes: []const u8) void {
+        var positions: [MAX_CURSORS]usize = undefined;
+        const n = self.collectCursorPositionsDesc(&positions);
+        if (n == 0 or bytes.len == 0) return;
+
+        const group_id = self.nextUndoGroupId();
+
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const pos = positions[i];
+            self.pushUndoGrouped(pos, null, bytes.len, group_id);
+            self.buf.insert(pos, bytes) catch {
+                // On failure, leave positions as-is and bail early — the
+                // buffer may be in a partial state but further edits
+                // would just compound the problem.
+                return;
+            };
+            // Every previously-processed cursor (at higher positions)
+            // shifts by +bytes.len because we just inserted earlier in
+            // the buffer.
+            for (0..i) |j| positions[j] += bytes.len;
+            // This cursor ends up after the text it just inserted.
+            positions[i] = pos + bytes.len;
+        }
+
+        self.assignCursorPositions(positions[0..n]);
+        self.modified = true;
+        self.ensureCursorVisible();
+    }
+
+    const DeleteDir = enum { forward, backward };
+
+    /// Delete one byte at every active cursor. `.backward` is Backspace
+    /// semantics (delete the byte BEFORE the cursor); `.forward` is
+    /// Delete semantics (delete the byte AT the cursor).
+    fn multiCursorDelete(self: *Editor, dir: DeleteDir) void {
+        var positions: [MAX_CURSORS]usize = undefined;
+        const n = self.collectCursorPositionsDesc(&positions);
+        if (n == 0) return;
+
+        const group_id = self.nextUndoGroupId();
+
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const cursor_pos = positions[i];
+            // Compute the byte position to delete and what the cursor's
+            // new position becomes after the delete.
+            var delete_pos: usize = undefined;
+            var new_cursor_pos: usize = undefined;
+            switch (dir) {
+                .backward => {
+                    // Skip cursors at the start of the buffer — nothing
+                    // to delete behind them.
+                    if (cursor_pos == 0) {
+                        positions[i] = 0;
+                        continue;
+                    }
+                    delete_pos = cursor_pos - 1;
+                    new_cursor_pos = delete_pos;
+                },
+                .forward => {
+                    if (cursor_pos >= self.buf.logicalLen()) {
+                        // Nothing to delete at the end of the buffer.
+                        continue;
+                    }
+                    delete_pos = cursor_pos;
+                    new_cursor_pos = cursor_pos;
+                },
+            }
+
+            var tmp: [1]u8 = undefined;
+            const ch = self.buf.contiguousSlice(delete_pos, 1, &tmp);
+            const saved = self.allocator.dupe(u8, ch) catch continue;
+            self.pushUndoGrouped(delete_pos, saved, 0, group_id);
+            self.buf.delete(delete_pos, 1);
+
+            // Update all previously-processed positions (indices < i,
+            // positions > delete_pos by construction of desc sort): they
+            // each shift left by 1 because we removed a byte earlier in
+            // the buffer.
+            for (0..i) |j| {
+                if (positions[j] > 0) positions[j] -= 1;
+            }
+            positions[i] = new_cursor_pos;
+        }
+
+        self.assignCursorPositions(positions[0..n]);
+        self.modified = true;
+        self.ensureCursorVisible();
+    }
+
     fn addCursorAtNextOccurrence(self: *Editor) void {
-        // Get word under cursor
+        // Get word under primary cursor. The word serves as the search
+        // needle for every Ctrl+D press; each press finds the next
+        // occurrence after the furthest-already-added cursor.
         const line_info = self.buf.getLine(self.cursor.line) orelse return;
         var line_tmp: [4096]u8 = undefined;
         const line_data = self.buf.contiguousSlice(line_info.start, @min(line_info.len, 4096), &line_tmp);
 
         const col = @min(self.cursor.col, line_data.len);
 
-        // Find word boundaries
         var start = col;
         while (start > 0 and isWordChar(line_data[start - 1])) start -= 1;
         var end = col;
@@ -1512,8 +1704,18 @@ pub const Editor = struct {
         if (start == end) return;
         const word = line_data[start..end];
 
-        // Find next occurrence
-        const search_start = line_info.start + end;
+        // Start the search after the end of the word at whichever
+        // cursor is furthest into the buffer. That's the primary's
+        // word-end when there are no secondaries yet, or the end of
+        // the last-added secondary's word on subsequent presses. This
+        // is what makes repeat Ctrl+D cycle through the file instead
+        // of pinning on the same next match.
+        var search_start = line_info.start + end;
+        for (self.cursors.items) |c| {
+            const cursor_end = self.lineColToBytePos(c.line, c.col) + word.len;
+            if (cursor_end > search_start) search_start = cursor_end;
+        }
+
         var pos = search_start;
         while (pos + word.len <= self.buf.logicalLen()) : (pos += 1) {
             var tmp: [256]u8 = undefined;
@@ -1780,6 +1982,84 @@ test "editor undo/redo" {
     // Redo
     _ = ed.handleKey(.{ .ctrl = 'y' });
     try std.testing.expectEqual(@as(usize, 1), ed.buf.logicalLen());
+}
+
+test "multi-cursor insert types at every cursor" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // Seed buffer: "aa aa aa"
+    for ("aa aa aa") |c| _ = ed.handleKey(.{ .char = c });
+
+    // Move cursor to the start of the first "aa".
+    ed.cursor.line = 0;
+    ed.cursor.col = 0;
+
+    // Ctrl+D twice adds cursors at the next two "aa" occurrences.
+    _ = ed.handleKey(.{ .ctrl = 'd' });
+    _ = ed.handleKey(.{ .ctrl = 'd' });
+    try std.testing.expectEqual(@as(usize, 2), ed.cursors.items.len);
+
+    // Type "X" — should insert at all three cursor positions.
+    _ = ed.handleKey(.{ .char = 'X' });
+
+    var tmp: [32]u8 = undefined;
+    const got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
+    try std.testing.expectEqualStrings("Xaa Xaa Xaa", got);
+}
+
+test "multi-cursor delete removes at every cursor" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // Seed buffer: "xa xa xa"
+    for ("xa xa xa") |c| _ = ed.handleKey(.{ .char = c });
+
+    ed.cursor.line = 0;
+    ed.cursor.col = 0;
+
+    _ = ed.handleKey(.{ .ctrl = 'd' });
+    _ = ed.handleKey(.{ .ctrl = 'd' });
+    try std.testing.expectEqual(@as(usize, 2), ed.cursors.items.len);
+
+    // Forward-delete removes the "x" at each cursor position.
+    _ = ed.handleKey(.delete);
+
+    var tmp: [32]u8 = undefined;
+    const got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
+    try std.testing.expectEqualStrings("a a a", got);
+}
+
+test "multi-cursor edit is a single undo group" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // Seed buffer: "aa aa"
+    for ("aa aa") |c| _ = ed.handleKey(.{ .char = c });
+
+    ed.cursor.line = 0;
+    ed.cursor.col = 0;
+    _ = ed.handleKey(.{ .ctrl = 'd' });
+
+    // Type "Z" at both cursors.
+    _ = ed.handleKey(.{ .char = 'Z' });
+
+    var tmp: [32]u8 = undefined;
+    var got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
+    try std.testing.expectEqualStrings("Zaa Zaa", got);
+
+    // One Ctrl+Z undoes the whole multi-cursor tick.
+    _ = ed.handleKey(.{ .ctrl = 'z' });
+    got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
+    try std.testing.expectEqualStrings("aa aa", got);
+
+    // Ctrl+Y re-applies the whole group.
+    _ = ed.handleKey(.{ .ctrl = 'y' });
+    got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
+    try std.testing.expectEqualStrings("Zaa Zaa", got);
 }
 
 test "editor search mode" {

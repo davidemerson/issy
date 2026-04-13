@@ -2,7 +2,21 @@
 
 A text editor that looks like a printed page, not a terminal application.
 
-Built in Zig with zero external dependencies. Single binary, cross-compiles to Linux, macOS, Windows, and OpenBSD. Gap buffer text storage, syntax highlighting for 16 languages, PDF export with TTF/OTF font embedding, multiple cursors, undo/redo, and incremental search.
+Built in Zig with zero external dependencies. Single binary, cross-compiles to Linux, macOS, Windows, and OpenBSD. Gap buffer text storage, syntax highlighting for 17 languages (including TeX/LaTeX), PDF export with TTF/OTF font embedding, multiple cursors, undo/redo, and incremental search.
+
+![Syntax highlighting in editor.zig](assets/syntax-highlight.png)
+
+### Multiple cursors
+
+`Ctrl+D` selects the word under the cursor and adds a cursor at the next occurrence. Press it again to keep adding. Every subsequent edit — typing, backspace, delete, paste — applies to all cursors simultaneously, and `Ctrl+Z` undoes the whole multi-cursor tick as one step.
+
+![Multi-cursor rename demo](assets/multi-cursor.gif)
+
+### Path completion
+
+`Ctrl+O` opens the file prompt seeded with the current directory. Type a partial directory or filename and press `Tab` to auto-complete against what's on disk.
+
+![Path completion in the open-file prompt](assets/path-completion.gif)
 
 ## Install
 
@@ -192,7 +206,7 @@ See [DESIGN.md](DESIGN.md) for the full visual design philosophy.
 
 ## Syntax Highlighting
 
-C, C++, Zig, Python, JavaScript, TypeScript, Rust, Go, Shell, HTML, CSS, JSON, YAML, TOML, Makefile, Markdown.
+C, C++, Zig, Python, JavaScript, TypeScript, Rust, Go, Shell, HTML, CSS, JSON, YAML, TOML, Makefile, Markdown, TeX/LaTeX.
 
 Language is detected by file extension.
 
