@@ -953,7 +953,7 @@ pub const Editor = struct {
         return self.cursor.col - breaks[sub];
     }
 
-    fn ensureCursorVisible(self: *Editor) void {
+    pub fn ensureCursorVisible(self: *Editor) void {
         const margin: usize = self.config.scroll_margin;
 
         if (self.config.word_wrap) {

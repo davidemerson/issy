@@ -19,9 +19,11 @@ const Args = struct {
     theme: ?[]const u8 = null,
     font: ?[]const u8 = null,
     print_output: ?[]const u8 = null,
+    resume_path: ?[]const u8 = null,
     no_config: bool = false,
     show_version: bool = false,
     show_help: bool = false,
+    rollback: bool = false,
 };
 
 fn parseArgs() Args {
@@ -44,6 +46,10 @@ fn parseArgs() Args {
             args_result.font = args_iter.next();
         } else if (std.mem.eql(u8, arg, "--print")) {
             args_result.print_output = args_iter.next();
+        } else if (std.mem.eql(u8, arg, "--resume")) {
+            args_result.resume_path = args_iter.next();
+        } else if (std.mem.eql(u8, arg, "--rollback")) {
+            args_result.rollback = true;
         } else if (arg[0] != '-') {
             args_result.file = arg;
         }
@@ -58,6 +64,19 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const args = parseArgs();
+
+    if (args.rollback) {
+        const stdout = std.fs.File.stdout();
+        update_mod.rollback(allocator) catch |e| {
+            const stderr = std.fs.File.stderr();
+            var msg_buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "issy --rollback failed: {s}\n", .{@errorName(e)}) catch "issy --rollback failed\n";
+            stderr.writeAll(msg) catch {};
+            std.process.exit(1);
+        };
+        try stdout.writeAll("issy: rolled back to previous version\n");
+        return;
+    }
 
     if (args.show_version) {
         const stdout = std.fs.File.stdout();
@@ -86,6 +105,7 @@ pub fn main() !void {
             \\  --font F     TTF/OTF font for PDF output
             \\  --no-config  Skip loading config file
             \\  --print F    Export to PDF and exit
+            \\  --rollback   Swap in the previous binary (if any) and exit
             \\
             \\Keybindings:
             \\  Ctrl+S save  Ctrl+Q quit  Ctrl+F search  Ctrl+H replace
@@ -125,6 +145,13 @@ pub fn main() !void {
         ed.openFile(f) catch |e| {
             ed.setStatusMessage(@errorName(e));
         };
+    }
+
+    // If we were re-exec'd by the auto-update path, restore the cursor
+    // position from the resume file. Safe no-op if the file is stale,
+    // missing, or mtime doesn't match.
+    if (args.resume_path) |rp| {
+        update_mod.tryResume(&ed, rp);
     }
 
     // Print mode: generate PDF and exit
@@ -167,6 +194,7 @@ pub fn main() !void {
 
     // Main loop
     var last_stat_check: i64 = 0;
+    var idle_ms: u64 = 0;
     while (true) {
         // Check for resize
         const new_size = term.getSize();
@@ -181,7 +209,28 @@ pub fn main() !void {
 
         // Read input
         const key = try term.readKey();
-        if (key == .none) continue;
+        if (key == .none) {
+            // term.readKey has a ~100ms timeout; each .none return is
+            // roughly one quiet tick. Use this as our idle accumulator,
+            // and attempt an auto-apply when all gates are satisfied.
+            idle_ms += 100;
+            if (update_mod.canAutoApply(&update_state, &ed, &cfg, idle_ms, update_mod.min_idle_ms_default)) {
+                // apply either succeeds (noreturn, process is replaced) or
+                // returns an error — in which case we keep running and
+                // show the error in the status bar.
+                update_mod.apply(allocator, &ed) catch |e| {
+                    var buf: [128]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&buf, "auto-update failed: {s}", .{@errorName(e)}) catch "auto-update failed";
+                    ed.setStatusMessage(msg);
+                    // Back off: don't retry until more idle time accrues.
+                    idle_ms = 0;
+                };
+            }
+            continue;
+        }
+
+        // Real keystroke — reset idle counter.
+        idle_ms = 0;
 
         // File change detection (throttled to 1/sec)
         const now = std.time.milliTimestamp();
