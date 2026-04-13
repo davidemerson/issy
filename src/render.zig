@@ -255,13 +255,19 @@ pub const Renderer = struct {
                     byte_idx += 1;
                 }
 
-                // Bracket match highlight
+                // Bracket match highlight. bp.col is a byte offset but
+                // row_start_buf_col / buf_col are visual columns (tab
+                // expansion runs buf_col ahead of byte_idx), so convert
+                // through byteColToVisualCol before comparing.
                 if (ed.matching_bracket_pos) |bp| {
-                    if (bp.line == file_line and bp.col >= row_start_buf_col and bp.col < buf_col) {
-                        const offset = bp.col - row_start_buf_col;
-                        const bracket_screen_col = code_start + this_indent + @as(u16, @intCast(@min(offset, std.math.maxInt(u16))));
-                        if (bracket_screen_col < code_end) {
-                            self.cellAt(screen_row, bracket_screen_col).bg = theme.selection;
+                    if (bp.line == file_line) {
+                        const bp_visual = ed.byteColToVisualCol(file_line, bp.col);
+                        if (bp_visual >= row_start_buf_col and bp_visual < buf_col) {
+                            const offset = bp_visual - row_start_buf_col;
+                            const bracket_screen_col = code_start + this_indent + @as(u16, @intCast(@min(offset, std.math.maxInt(u16))));
+                            if (bracket_screen_col < code_end) {
+                                self.cellAt(screen_row, bracket_screen_col).bg = theme.selection;
+                            }
                         }
                     }
                 }
@@ -282,16 +288,21 @@ pub const Renderer = struct {
                     }
                 }
 
-                // Multi-cursor rendering
+                // Multi-cursor rendering. Same tab-expansion caveat as
+                // the bracket-match block above: cursor.col is a byte
+                // offset, the buf_col window is visual.
                 for (ed.cursors.items) |cursor| {
-                    if (cursor.line == file_line and cursor.col >= row_start_buf_col and cursor.col < buf_col) {
-                        const offset = cursor.col - row_start_buf_col;
-                        const mc_col = code_start + this_indent + @as(u16, @intCast(@min(offset, std.math.maxInt(u16))));
-                        if (mc_col < self.cols) {
-                            const cell = self.cellAt(screen_row, mc_col);
-                            const tmp_fg = cell.fg;
-                            cell.fg = cell.bg;
-                            cell.bg = tmp_fg;
+                    if (cursor.line == file_line) {
+                        const cursor_visual = ed.byteColToVisualCol(file_line, cursor.col);
+                        if (cursor_visual >= row_start_buf_col and cursor_visual < buf_col) {
+                            const offset = cursor_visual - row_start_buf_col;
+                            const mc_col = code_start + this_indent + @as(u16, @intCast(@min(offset, std.math.maxInt(u16))));
+                            if (mc_col < self.cols) {
+                                const cell = self.cellAt(screen_row, mc_col);
+                                const tmp_fg = cell.fg;
+                                cell.fg = cell.bg;
+                                cell.bg = tmp_fg;
+                            }
                         }
                     }
                 }
@@ -648,8 +659,9 @@ pub const Renderer = struct {
             // Add cursor's sub-line within its wrapped line
             const sub = ed.cursorVisualSubLine();
             vis_row +|= @intCast(@min(sub, self.rows));
-            // Column within sub-line
-            const col_in_sub = ed.cursorColInSubLine();
+            // Column within sub-line — must be in visual cols, not byte
+            // cols, or the cursor drifts on tab-bearing lines.
+            const col_in_sub = ed.cursorVisualColInSubLine();
             const indent: u16 = if (sub > 0) 2 else 0;
             term.moveCursor(
                 @min(vis_row, self.rows -| 1),
@@ -660,7 +672,8 @@ pub const Renderer = struct {
                 @intCast(@min(ed.cursor.line - ed.scroll_top, self.rows - 1))
             else
                 0;
-            const cursor_col = code_start + @as(u16, @intCast(@min(ed.cursor.col, std.math.maxInt(u16)))) -| @as(u16, @intCast(@min(ed.scroll_left, std.math.maxInt(u16))));
+            const cursor_visual = ed.byteColToVisualCol(ed.cursor.line, ed.cursor.col);
+            const cursor_col = code_start + @as(u16, @intCast(@min(cursor_visual, std.math.maxInt(u16)))) -| @as(u16, @intCast(@min(ed.scroll_left, std.math.maxInt(u16))));
             term.moveCursor(cursor_row, cursor_col);
         }
 

@@ -975,6 +975,49 @@ pub const Editor = struct {
         return self.cursor.col - breaks[sub];
     }
 
+    /// Convert a byte-offset column within `line` to the visual column
+    /// it renders at (tabs expanded to the next tab stop). cursor.col
+    /// and wrap_breaks[] are byte offsets; the renderer draws characters
+    /// at visual columns. On lines without tabs the two are the same,
+    /// but any tab introduces drift — on the MAINTAINER line in a
+    /// Makefile, for instance, the byte column of "David" is 13 but
+    /// its visual column is 16 because the tab between "=" and "David"
+    /// expands to the next tab stop.
+    pub fn byteColToVisualCol(self: *Editor, line: usize, byte_col: usize) usize {
+        const info = self.buf.getLine(line) orelse return byte_col;
+        var tmp: [8192]u8 = undefined;
+        const data = self.buf.contiguousSlice(info.start, @min(info.len, 8192), &tmp);
+        const tw = self.effectiveTabWidth();
+        var visual: usize = 0;
+        var i: usize = 0;
+        const limit = @min(byte_col, data.len);
+        while (i < limit) : (i += 1) {
+            if (data[i] == '\t') {
+                visual += tw - (visual % tw);
+            } else {
+                visual += 1;
+            }
+        }
+        return visual;
+    }
+
+    /// Visual-column version of `cursorColInSubLine`. Accounts for tab
+    /// expansion in both the sub-line start and the cursor position so
+    /// the hardware cursor lands on the correct glyph on tab-bearing
+    /// lines.
+    pub fn cursorVisualColInSubLine(self: *Editor) usize {
+        const cursor_visual = self.byteColToVisualCol(self.cursor.line, self.cursor.col);
+        if (!self.config.word_wrap) return cursor_visual;
+        var breaks: [MAX_WRAP_BREAKS]usize = undefined;
+        const count = self.computeWrapBreaks(self.cursor.line, &breaks);
+        var sub: usize = 0;
+        while (sub + 1 < count and breaks[sub + 1] <= self.cursor.col) {
+            sub += 1;
+        }
+        const sub_start_visual = self.byteColToVisualCol(self.cursor.line, breaks[sub]);
+        return cursor_visual - sub_start_visual;
+    }
+
     pub fn ensureCursorVisible(self: *Editor) void {
         const margin: usize = self.config.scroll_margin;
 
@@ -1995,6 +2038,46 @@ test "editor undo/redo" {
     // Redo
     _ = ed.handleKey(.{ .ctrl = 'y' });
     try std.testing.expectEqual(@as(usize, 1), ed.buf.logicalLen());
+}
+
+test "byteColToVisualCol expands tabs to tab stops" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // Same shape as the MAINTAINER line in packaging/openbsd/issy/Makefile:
+    // "MAINTAINER =\tDavid Emerson <REPLACE...>"
+    try ed.buf.insert(0, "MAINTAINER =\tDavid\n");
+
+    // Bytes 0..11 are "MAINTAINER =" (12 chars), no tabs before, so
+    // visual == byte for that whole range.
+    try std.testing.expectEqual(@as(usize, 0), ed.byteColToVisualCol(0, 0));
+    try std.testing.expectEqual(@as(usize, 10), ed.byteColToVisualCol(0, 10));
+    try std.testing.expectEqual(@as(usize, 12), ed.byteColToVisualCol(0, 12));
+
+    // Byte 12 is the tab. With tab_width=4, visual col BEFORE the tab
+    // is 12 (which is a tab stop), so the tab advances visual to 16.
+    // Byte 13 is 'D' — it renders at visual col 16.
+    try std.testing.expectEqual(@as(usize, 16), ed.byteColToVisualCol(0, 13));
+
+    // Byte 14 is 'a' — visual col 17.
+    try std.testing.expectEqual(@as(usize, 17), ed.byteColToVisualCol(0, 14));
+
+    // Byte 17 is 'd' (last of "David") — visual col 20.
+    try std.testing.expectEqual(@as(usize, 20), ed.byteColToVisualCol(0, 17));
+}
+
+test "byteColToVisualCol with leading tab" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "\thello\n");
+
+    // Byte 0 is the tab, at visual col 0. The tab advances visual to 4.
+    try std.testing.expectEqual(@as(usize, 0), ed.byteColToVisualCol(0, 0));
+    try std.testing.expectEqual(@as(usize, 4), ed.byteColToVisualCol(0, 1));
+    try std.testing.expectEqual(@as(usize, 5), ed.byteColToVisualCol(0, 2));
 }
 
 test "tab-bearing short line reports single visual row" {
