@@ -14,7 +14,7 @@ const term = @import("term.zig");
 const unicode = @import("unicode.zig");
 
 pub const Mode = enum { normal, search, command, confirm, replace, help };
-pub const Action = enum { none, quit, force_quit, redraw, prompt };
+pub const Action = enum { none, quit, force_quit, redraw, prompt, export_pdf };
 
 pub const Cursor = struct {
     line: usize = 0,
@@ -481,6 +481,19 @@ pub const Editor = struct {
                 // Multi-cursor: select word under cursor, then add next occurrence
                 self.addCursorAtNextOccurrence();
                 return .redraw;
+            },
+            'p' => {
+                // Export current buffer to PDF. Guard here so the main
+                // loop only ever sees the action when it can succeed.
+                if (self.filename_len == 0) {
+                    self.setStatusMessage("Save file first to enable PDF export.");
+                    return .redraw;
+                }
+                if (self.config.font_file_len == 0) {
+                    self.setStatusMessage("Set font_file in ~/.issyrc to enable PDF export.");
+                    return .redraw;
+                }
+                return .export_pdf;
             },
             else => return .none,
         }

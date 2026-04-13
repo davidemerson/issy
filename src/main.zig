@@ -242,6 +242,27 @@ pub fn main() !void {
         // Handle key
         switch (ed.handleKey(key)) {
             .quit, .force_quit => break,
+            .export_pdf => {
+                // Editor guarantees filename + font_file are populated
+                // before it returns this action. Write to
+                // "<filename>.pdf" alongside the source; failures land
+                // as a status-bar message rather than a crash.
+                const filename = ed.getFilename();
+                var out_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const out_path = std.fmt.bufPrint(&out_buf, "{s}.pdf", .{filename}) catch {
+                    ed.setStatusMessage("PDF export: path too long");
+                    continue;
+                };
+                print_mod.toPdf(&ed, out_path) catch |e| {
+                    var msg_buf: [192]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&msg_buf, "PDF export failed: {s}", .{@errorName(e)}) catch "PDF export failed";
+                    ed.setStatusMessage(msg);
+                    continue;
+                };
+                var msg_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
+                const msg = std.fmt.bufPrint(&msg_buf, "Wrote {s}", .{out_path}) catch "Wrote PDF";
+                ed.setStatusMessage(msg);
+            },
             else => {},
         }
     }
