@@ -19,11 +19,14 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Link libc on targets where Zig ships a bundled libc.
-    // OpenBSD/FreeBSD/NetBSD are excluded: Zig can't provide libc for them when
-    // cross-compiling, and std.posix works without it.
+    // Link libc on every POSIX target where it's required or idiomatic.
+    // Modern OpenBSD kills processes that issue raw syscalls outside of
+    // libc, so native OpenBSD builds must link libc — the cross-compile
+    // from Linux/macOS to OpenBSD has never worked anyway (Zig doesn't
+    // ship OpenBSD libc headers), and CI's openbsd target already has
+    // "best-effort, tolerate failure" semantics in .github/workflows/ci.yml.
     const os_tag = target.result.os.tag;
-    if (os_tag == .linux or os_tag == .macos) {
+    if (os_tag == .linux or os_tag == .macos or os_tag == .openbsd) {
         exe.linkLibC();
     }
 
