@@ -4,13 +4,31 @@ A text editor that looks like a printed page, not a terminal application.
 
 Built in Zig with zero external dependencies. Single binary, cross-compiles to Linux, macOS, Windows, and OpenBSD. Gap buffer text storage, syntax highlighting for 17 languages (including TeX/LaTeX), PDF export with TTF/OTF font embedding, multiple cursors, undo/redo, and incremental search.
 
-![Syntax highlighting in editor.zig](assets/syntax-highlight.png)
+### Two themes: default (dark) and paper (Solarized Light)
+
+Pick the one that matches your environment. Both follow the same design principle — only a couple of token types get real chromatic contrast so the eye parses structure through gentle luminance shifts instead of a rainbow.
+
+| Default | Paper |
+|---|---|
+| ![Default dark theme](assets/syntax-highlight.png) | ![Paper (Solarized Light) theme](assets/syntax-highlight-paper.png) |
+
+### Print to PDF with embedded fonts
+
+`Ctrl+P` (or `--print` on the command line) renders the current buffer to a real PDF 1.4 file with TTF/OTF font embedding, a separate ink-on-paper print theme, headers, and automatic page breaks. No external dependencies, no temporary PostScript — the PDF writer is hand-rolled in Zig.
+
+![Printed PDF export of editor.zig in Berkeley Mono](assets/pdf-export.png)
 
 ### Multiple cursors
 
 `Ctrl+D` selects the word under the cursor and adds a cursor at the next occurrence. Press it again to keep adding. Every subsequent edit — typing, backspace, delete, paste — applies to all cursors simultaneously, and `Ctrl+Z` undoes the whole multi-cursor tick as one step.
 
 ![Multi-cursor rename demo](assets/multi-cursor.gif)
+
+### Incremental search
+
+`Ctrl+F` enters search mode; each keystroke re-runs the search and jumps the cursor to the first live match. `Ctrl+G` walks to the next match, `Escape` cancels and returns the cursor to where it started.
+
+![Incremental search demo](assets/incremental-search.gif)
 
 ### Path completion
 

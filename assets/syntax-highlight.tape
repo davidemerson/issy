@@ -6,11 +6,11 @@
 #
 # Rebuild with:
 #   vhs assets/syntax-highlight.tape
-#   ffmpeg -y -v error -sseof -1 -i /tmp/issy-syntax-highlight.gif \
+#   ffmpeg -y -v error -sseof -1 -i assets/.syntax-highlight-tmp.gif \
 #       -frames:v 1 assets/syntax-highlight.png
-#   rm /tmp/issy-syntax-highlight.gif
+#   rm assets/.syntax-highlight-tmp.gif
 
-Output /tmp/issy-syntax-highlight.gif
+Output assets/.syntax-highlight-tmp.gif
 
 Set Shell "bash"
 Set FontSize 14
