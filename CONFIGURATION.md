@@ -42,6 +42,25 @@ Blank lines and lines starting with `#` are ignored. Unknown keys are silently s
 | `cursor_line_bg` | bool | `true` | Subtle full-width highlight on the current line |
 | `cursor_style` | string | `bar` | Terminal cursor shape: `bar`, `block`, or `underline` |
 
+## Auto-update
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `notify_updates` | bool | `true` | On startup, check whether a newer release exists and show `update available: <sha>` in the status bar. Set to `false` to disable the check (and the background network fetch that refreshes its cache) entirely. |
+| `autoupdate` | bool | `false` | Opt into automatic download, signature verification, and in-session apply. When on, the editor downloads the signed `sha256sums.txt` manifest from the latest release, verifies it against the Ed25519 public key committed to `src/update_key.zig`, downloads the matching platform binary, hashes it, stages it at `~/.cache/issy/issy.staged`, and — when the buffer is clean and the editor has been idle for 60 seconds — atomic-renames it into place and re-execs. |
+
+Both keys are no-ops for `dev` builds (any working tree that wasn't built from a clean CI checkout). Both are also no-ops if the editor binary itself is not writable by the running user — this is the common case for distro-packaged installs at `/usr/bin/issy`, where auto-apply silently stays in notify-only mode.
+
+The complete cache layout (all under `~/.cache/issy/`):
+
+- `commit.txt` — latest-release commit SHA
+- `sha256sums.txt` / `sha256sums.txt.sig` — signed manifest + signature
+- `issy.staged` — verified replacement binary, waiting to be applied
+- `issy.prev` — pre-apply snapshot for `issy --rollback`
+- `resume.<ts>.txt` — one-shot cursor snapshot used by the new instance to restore position after re-exec
+
+See the [Auto-update section of README.md](README.md#auto-update) for the full flow, including the bootstrap procedure for forks that want to sign their own releases.
+
 ## PDF / Print Settings
 
 | Key | Type | Default | Description |

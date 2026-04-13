@@ -16,6 +16,12 @@ src/
   unicode.zig     UTF-8 encode/decode utilities
   font.zig        TTF/OTF parser for PDF embedding
   print.zig       PDF 1.4 generation
+  update.zig      Auto-update: fetch, verify, stage, apply
+  update_key.zig  Committed Ed25519 public key (signing trust root)
+  build_info.zig  Generated at configure time: version + commit SHA + build type
+
+tools/
+  keygen.zig      One-shot Ed25519 keypair generator (zig build keygen)
 ```
 
 ## Data Flow
@@ -112,6 +118,31 @@ Hand-rolled PDF 1.4 writer.
 
 Low-level functions: `decode`, `encode`, `utf8Len`, `countCodepoints`, `validate`, `isContByte`. Returns U+FFFD for malformed input. No allocations.
 
+### update.zig -- Auto-update
+
+Detects newer releases, optionally downloads and signature-verifies replacement binaries, and re-execs in place without disturbing the open buffer. Implemented in three phases, all shipping together:
+
+- **Notify** (`startupCheck`, `readCachedState`): On editor startup, reads a cached commit SHA from `~/.cache/issy/commit.txt` and compares against `build_info.commit_sha`. A mismatch sets the in-memory `UpdateState.status` to `.available` and surfaces `update available: <sha>` in the status bar. Dev builds short-circuit the check entirely.
+- **Refresh worker** (`spawnWorker`, `doWork`): After reading the cache, the parent double-forks a detached grandchild that refetches `commit.txt` over HTTPS via `std.http.Client`. The grandchild is orphaned (adopted by init) so the editor never has to reap it. `alarm(fetch_timeout_seconds)` caps the worker's total runtime; a stuck TCP connection is killed by SIGALRM rather than lingering forever.
+- **Signed download** (`downloadAndStage`, `verifyManifestSignature`, `findAssetHash`): When `cfg.autoupdate` is on and a configured public key is present, the same worker also fetches `sha256sums.txt` and `sha256sums.txt.sig`. The 64-byte raw Ed25519 signature is verified with `std.crypto.sign.Ed25519` against `update_key.public_key`. On success, the worker parses the manifest for our platform's line (`currentAssetName()` picks the right asset from `builtin.target`), downloads the binary, checks its SHA-256 against the signed value, and atomic-renames it into `~/.cache/issy/issy.staged`.
+- **Apply** (`apply`, `canAutoApply`, `writeResumeFile`): In the main loop, when all gates are satisfied (a staged binary exists, `autoupdate` is on, buffer is clean, `argv0` is writable, the editor has been idle for 60 seconds), the editor writes a one-shot resume record, snapshots the running binary to `issy.prev`, atomically renames the staged binary over its own executable, tears down the terminal, and `execve()`s the new binary with `--resume <path>`. Termios state lives on the tty device, not the file descriptor, so the terminal survives `execve` cleanly — the user sees one re-render.
+- **Resume** (`tryResume`): The new binary, when invoked with `--resume <path>`, reads the resume record, verifies it's fresh (<5 min) and that the file's mtime still matches the snapshot, then restores `cursor.line`/`cursor.col` and shows `upgraded to <sha>` in the footer. Missing or stale records are a safe no-op.
+- **Rollback** (`rollback`): `issy --rollback` runs before any TUI init: it renames `issy.prev` back over `argv0` and exits. One-shot, atomic.
+
+All HTTP fetches use bounded `std.Io.Writer.fixed` buffers so a malicious or broken server can't drive memory usage past the per-fetch cap. All failures on the download/verify/stage path are silent and non-fatal — on any error the editor falls back to notify-only and retries on the next run.
+
+### update_key.zig -- Signing Trust Root
+
+Holds the 32-byte Ed25519 public key that the auto-update path verifies `sha256sums.txt.sig` against. Committed to the repo; the matching private key is a GitHub Actions Secret (`UPDATE_SIGNING_KEY`) that only the CI workflow can read. Fresh checkouts start with an all-zero placeholder — `isConfigured()` returns false and the whole signed-download path becomes a no-op until the maintainer runs `zig build keygen` and commits a real key. Forks wanting auto-update for their own releases go through the same bootstrap.
+
+### build_info.zig -- Generated
+
+Written by `build.zig` at configure time via `git rev-parse HEAD` and `git status --porcelain`. On a clean release build (e.g. CI), embeds the full 40-char commit SHA and `build_type = .release`. On a dirty or un-gitted tree, embeds the placeholder `"dev" ++ "0"*37` and `build_type = .dev`, which the update path uses as a kill switch. Always gitignored — never committed.
+
+### tools/keygen.zig -- Keypair Generator
+
+Standalone program, built and run via `zig build keygen`. Generates a fresh Ed25519 keypair using `std.crypto.sign.Ed25519.KeyPair.generate()`, PKCS#8-wraps the private key into a PEM envelope (for pasting into a GitHub Actions Secret), and prints the matching public key as a Zig byte-array literal (for pasting into `update_key.zig`). The private key never touches disk; the caller is responsible for transferring both halves and then deleting the terminal output.
+
 ## Build System
 
 `build.zig` defines:
@@ -119,6 +150,8 @@ Low-level functions: `decode`, `encode`, `utf8Len`, `countCodepoints`, `validate
 - **`issy` executable**: Links libc on POSIX targets (for termios). Defaults to ReleaseSafe optimization.
 - **`cross` step**: Builds for all 5 target platforms.
 - **`test` step**: Runs test blocks from every source file independently (not via a root test import -- each file is its own test compilation unit).
+- **`keygen` step**: Builds and runs `tools/keygen.zig` to print a fresh signing keypair. Used once per repo to bootstrap the auto-update trust root.
+- **`writeBuildInfo` (configure-time)**: Runs `git rev-parse HEAD` + `git status --porcelain` to regenerate `src/build_info.zig` with the current commit SHA and build type. Skipped silently if git is unavailable or the tree is dirty (falls back to `dev`).
 
 ## Design Constraints
 

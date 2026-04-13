@@ -29,6 +29,11 @@ Skip loading the configuration file.
 .TP
 .BI \-\-print " output.pdf"
 Export the file to PDF and exit without opening the TUI.
+.TP
+.B \-\-rollback
+Swap in the previous binary (from
+.IR ~/.cache/issy/issy.prev )
+and exit. Only meaningful after the auto-update path has successfully applied an update. Prints an error if no snapshot exists.
 .SH KEYBINDINGS
 .TP
 .B Ctrl+S
@@ -111,7 +116,7 @@ key = "value with spaces"
 color_key = "#rrggbb"
 .fi
 .PP
-Keys: tab_width (default 4), expand_tabs (true), line_numbers (true), word_wrap (false), auto_indent (true), auto_close_brackets (false), auto_detect_indent (true), trailing_whitespace (true), indent_mismatch (true), scroll_margin (5), gutter_padding (2), left_padding (1), right_margin (100), cursor_line_bg (true), cursor_style (bar|block|underline), font_file, font_size (10.0), print_margin_top (72), print_margin_bottom (72), print_margin_left (108), print_margin_right (72).
+Keys: tab_width (default 4), expand_tabs (true), line_numbers (true), word_wrap (false), auto_indent (true), auto_close_brackets (false), auto_detect_indent (true), trailing_whitespace (true), indent_mismatch (true), scroll_margin (5), gutter_padding (2), left_padding (1), right_margin (100), cursor_line_bg (true), cursor_style (bar|block|underline), notify_updates (true), autoupdate (false), font_file, font_size (10.0), print_margin_top (72), print_margin_bottom (72), print_margin_left (108), print_margin_right (72).
 .SH THEMES
 .B default
 \- Dark, restrained. Most syntax colors near fg luminance. Keywords violet, strings green, comments nearly invisible.
@@ -124,6 +129,33 @@ Design philosophy: restraint. Only 2\-3 token types get real contrast. The eye p
 Requires
 .B font_file
 set in config to a TTF/OTF font path. PDF output uses a separate print theme with colors tuned for ink on white paper. Supports syntax highlighting, line numbers, headers, and page breaks.
+.SH AUTO-UPDATE
+Release builds (those produced by CI, not local dev builds) check for newer versions on startup. A detached background worker fetches the latest release's
+.I commit.txt
+asset over HTTPS and caches it under
+.IR ~/.cache/issy/ .
+If the cached commit SHA differs from the running binary's, the status bar shows
+.IR "update available: <sha>" .
+.PP
+With
+.B autoupdate = true
+in the config, the worker additionally downloads
+.IR sha256sums.txt " and " sha256sums.txt.sig ,
+verifies the Ed25519 signature against the public key embedded at build time, hashes the downloaded binary against the signed manifest, and stages it as
+.IR ~/.cache/issy/issy.staged .
+When the buffer is clean and the editor has been idle for 60 seconds, the editor snapshots its running binary to
+.IR issy.prev ,
+atomically renames the staged binary into place, and re-execs itself with
+.BI \-\-resume " path"
+so the new instance restores the open file at the same cursor position. The terminal state survives the
+.BR execve ,
+so the user sees at most one re-render.
+.PP
+Auto-apply is a no-op for root-owned install paths (the binary is not writable by the running user) and for dev builds. Use
+.B \-\-rollback
+to revert after an apply, or set
+.B notify_updates = false
+to disable the whole mechanism.
 .SH FILES
 .TP
 .I ~/.issyrc
@@ -131,5 +163,8 @@ User configuration (POSIX).
 .TP
 .I %APPDATA%\\issy\\config
 User configuration (Windows).
+.TP
+.I ~/.cache/issy/
+Auto-update cache: cached release SHA, signed manifest, staged binary, pre-apply snapshot, and one-shot resume records.
 .SH AUTHOR
 David Emerson

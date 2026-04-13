@@ -52,6 +52,27 @@
 # Faintly highlight leading indent that doesn't match the detected file style
 # indent_mismatch = true
 
+# ── Auto-update ──
+#
+# Release builds check the latest GitHub release on startup. Dev builds
+# (unreleased working trees) skip the check entirely. Both keys are
+# silent no-ops if the editor binary is not writable by the current user
+# (e.g. a .deb/.rpm install at /usr/bin/issy).
+
+# On startup, check for a newer release and show "update available: <sha>"
+# in the status bar. Set to false to disable the check and its background
+# network fetch entirely.
+# notify_updates = true
+
+# Opt into automatic download, Ed25519 signature verification, and
+# in-session re-exec when a newer release is available. When on, the
+# editor downloads the signed manifest, verifies it against the public
+# key embedded in src/update_key.zig, hashes the downloaded binary, and
+# stages it at ~/.cache/issy/issy.staged. It is then applied the next
+# time the buffer is clean and the editor has been idle for 60s.
+# Rollback the swap any time with: issy --rollback
+# autoupdate = false
+
 # ── PDF / Print ──
 
 # Path to a TTF or OTF font file. Required for Ctrl+P and --print.

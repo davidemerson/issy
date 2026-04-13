@@ -76,6 +76,7 @@ issy                      # empty buffer
 | `--font PATH` | TTF/OTF font for PDF output |
 | `--no-config` | Skip loading config file |
 | `--print FILE` | Export to PDF and exit (no TUI) |
+| `--rollback` | Swap in the previous binary (if auto-update has run) and exit |
 
 ### Headless PDF export
 
@@ -188,6 +189,47 @@ issy --font "Berkeley Mono.ttf" --print output.pdf source.py
 ```
 
 Recommended fonts: Berkeley Mono, Iosevka, JetBrains Mono, Commit Mono.
+
+## Auto-update
+
+Release builds check for newer versions on startup. The check is a one-shot HTTPS request to the `commit.txt` asset on the latest GitHub release, made by a detached grandchild process so the editor itself never blocks on the network. If the commit SHA on the release differs from the one the running binary was built from, the footer shows `update available: <sha>`.
+
+By default the editor only notifies. To opt into automatic download and in-session apply, set `autoupdate = true` in `~/.issyrc`. With auto-apply on:
+
+1. The background worker downloads `sha256sums.txt` and its Ed25519 signature from the latest release, verifies the signature against the public key embedded in `src/update_key.zig`, then downloads the platform-specific binary and checks it against the signed manifest.
+2. The verified binary is written to `~/.cache/issy/issy.staged` and the footer switches to `update staged: <sha>`.
+3. The next time the buffer is clean (no unsaved changes) and the editor has been idle for 60 seconds, it writes a small resume record, snapshots the current binary to `~/.cache/issy/issy.prev`, atomically renames the staged binary over its own executable, tears down the terminal, and `execve()`s the new binary with `--resume <path>`. The terminal state survives `execve`, so the visible effect is a single re-render — the open file, the cursor line, even the file mtime check all carry across.
+4. If anything goes wrong (non-writable binary, signature mismatch, dirty buffer, failed rename), the editor falls back to notify-only and keeps running the old version.
+
+Dev builds (unreleased working trees) short-circuit the check entirely — only `ReleaseSafe` builds produced by CI participate.
+
+**Rollback:** after an apply, run `issy --rollback` to swap the previous binary back. It's a one-shot atomic rename with a clear error if there's no snapshot to restore.
+
+**Security model.** The auto-update path trusts only the Ed25519 public key committed to `src/update_key.zig`. The matching private key is held as a GitHub Actions Secret (`UPDATE_SIGNING_KEY`) and only the repo's CI workflow can sign releases. A tampered `sha256sums.txt` or a tampered binary will fail signature verification or hash mismatch, respectively, and staging aborts. The worker runs inside the editor's user, not as root, and refuses to operate on root-owned install paths (e.g. `/usr/bin/issy` from `.deb`/`.rpm` — those installs silently stay in notify-only mode).
+
+**Cache layout.** Everything auto-update related lives under `~/.cache/issy/`:
+
+| File | Contents |
+|------|----------|
+| `commit.txt` | Latest-release commit SHA (refreshed by the background worker) |
+| `sha256sums.txt` / `.sig` | Signed manifest of release binary hashes |
+| `issy.staged` | Verified replacement binary waiting to be applied |
+| `issy.prev` | Pre-apply snapshot of the running binary (used by `--rollback`) |
+| `resume.<ts>.txt` | One-shot cursor snapshot written by `apply()` and consumed by the new instance |
+
+Opt out by setting `notify_updates = false` (disables the check entirely) or leaving `autoupdate = false` (default — only notify, never apply). Both keys live in `~/.issyrc`.
+
+### Signing key bootstrap (maintainers / forks)
+
+If you fork this repo and want auto-update to work for your own release builds, generate your own Ed25519 keypair:
+
+```sh
+zig build keygen > /tmp/keys.txt
+```
+
+The tool prints a PKCS#8 PEM private key and a Zig array literal for the matching public key. Paste the PEM into a repo secret named `UPDATE_SIGNING_KEY` (Settings → Secrets and variables → Actions), and replace the `public_key` bytes in `src/update_key.zig` with the printed array. Commit that file. On the next push, CI will start signing releases and your users' editors will start verifying them.
+
+The private key never needs to be saved to disk — delete `/tmp/keys.txt` after transferring the two halves.
 
 ## Testing
 
