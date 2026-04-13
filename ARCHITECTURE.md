@@ -153,6 +153,12 @@ Standalone program, built and run via `zig build keygen`. Generates a fresh Ed25
 - **`keygen` step**: Builds and runs `tools/keygen.zig` to print a fresh signing keypair. Used once per repo to bootstrap the auto-update trust root.
 - **`writeBuildInfo` (configure-time)**: Runs `git rev-parse HEAD` + `git status --porcelain` to regenerate `src/build_info.zig` with the current commit SHA and build type. Skipped silently if git is unavailable or the tree is dirty (falls back to `dev`).
 
+## macOS distribution
+
+macOS does not ship prebuilt binaries in GitHub releases. Cross-compiled Mach-O from Linux has no `LC_CODE_SIGNATURE` load command and the Apple Silicon kernel refuses to `execve` it. Rather than grow a cross-signing pipeline, macOS users install via a Homebrew HEAD-install formula (`Formula/issy.rb`) that depends on Zig and builds from source, producing a native host-signed binary that just works on both Intel and Apple Silicon.
+
+The auto-update worker's `currentAssetName()` in `src/update.zig` returns `null` for macOS, which disables the download/verify/stage codepath on that platform. The notify-only path still runs (reads `commit.txt` from the latest release and compares against `build_info.commit_sha`), so macOS users see the "update available" notice in the footer and run `brew upgrade --fetch-HEAD issy` to act on it. CI includes a macOS cross-compile smoke test to catch compilation regressions that would break the brew build.
+
 ## Design Constraints
 
 - Zero external dependencies. Zig `std` only.

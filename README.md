@@ -4,7 +4,9 @@ A text editor that looks like a printed page, not a terminal application.
 
 Built in Zig with zero external dependencies. Single binary, cross-compiles to Linux, macOS, Windows, and OpenBSD. Gap buffer text storage, syntax highlighting for 16 languages, PDF export with TTF/OTF font embedding, multiple cursors, undo/redo, and incremental search.
 
-## Downloads
+## Install
+
+### Linux
 
 Pre-built binaries from the latest commit on main:
 
@@ -12,16 +14,32 @@ Pre-built binaries from the latest commit on main:
 |----------|---------|--------|
 | Linux x64 | [.deb](https://github.com/davidemerson/issy/releases/latest/download/issy_0.1.0-1_amd64.deb) / [.rpm](https://github.com/davidemerson/issy/releases/latest/download/issy-0.1.0-1.x86_64.rpm) | [issy-linux-amd64](https://github.com/davidemerson/issy/releases/latest/download/issy-linux-amd64) |
 | Linux ARM64 | [.deb](https://github.com/davidemerson/issy/releases/latest/download/issy_0.1.0-1_arm64.deb) / [.rpm](https://github.com/davidemerson/issy/releases/latest/download/issy-0.1.0-1.aarch64.rpm) | [issy-linux-arm64](https://github.com/davidemerson/issy/releases/latest/download/issy-linux-arm64) |
-| macOS x64 | | [issy-macos-amd64](https://github.com/davidemerson/issy/releases/latest/download/issy-macos-amd64) |
-| macOS ARM64 | | [issy-macos-arm64](https://github.com/davidemerson/issy/releases/latest/download/issy-macos-arm64) |
-| OpenBSD x64 | | [build from source](#build) |
 
-**macOS note:** After downloading, remove the quarantine attribute before running:
+### macOS
+
+**Homebrew (recommended):**
+
 ```sh
-xattr -d com.apple.quarantine issy-macos-arm64
-chmod +x issy-macos-arm64
-sudo mv issy-macos-arm64 /usr/local/bin/issy
+brew tap davidemerson/issy https://github.com/davidemerson/issy
+brew install --HEAD issy
 ```
+
+To upgrade: `brew upgrade --fetch-HEAD issy`.
+
+**Build from source** (if you don't use Homebrew):
+
+```sh
+git clone https://github.com/davidemerson/issy.git
+cd issy
+zig build -Doptimize=ReleaseSafe
+sudo install -m 0755 zig-out/bin/issy /usr/local/bin/issy
+```
+
+Requires [Zig 0.15.2+](https://ziglang.org/download/). Both paths produce a native host-signed binary that runs on both Intel and Apple Silicon without any `xattr`, `codesign`, or quarantine workarounds. Prebuilt macOS binaries are intentionally not shipped because cross-compiled Mach-O from Linux has no code signature and is refused by the Apple Silicon kernel.
+
+### OpenBSD
+
+[Build from source](#build).
 
 ## Build
 
@@ -202,6 +220,8 @@ By default the editor only notifies. To opt into automatic download and in-sessi
 4. If anything goes wrong (non-writable binary, signature mismatch, dirty buffer, failed rename), the editor falls back to notify-only and keeps running the old version.
 
 Dev builds (unreleased working trees) short-circuit the check entirely — only `ReleaseSafe` builds produced by CI participate.
+
+**macOS note.** `autoupdate = true` is silently a no-op on macOS because no prebuilt macOS binaries exist to download. The notify path still works — the footer shows `update available: <sha>` when a newer commit has been published — and macOS users run `brew upgrade --fetch-HEAD issy` (or re-run `zig build -Doptimize=ReleaseSafe`) to actually update.
 
 **Rollback:** after an apply, run `issy --rollback` to swap the previous binary back. It's a one-shot atomic rename with a clear error if there's no snapshot to restore.
 

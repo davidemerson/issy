@@ -38,6 +38,11 @@ jobs:
       - name: Build
         run: zig build
 
+      - name: Smoke-test macOS cross-compile
+        run: |
+          zig build -Dtarget=aarch64-macos -Doptimize=ReleaseSafe
+          zig build -Dtarget=x86_64-macos -Doptimize=ReleaseSafe
+
       - name: Integration tests
         run: |
           sudo apt-get install -y -qq expect
@@ -78,11 +83,13 @@ jobs:
           declare -A names
           names[x86_64-linux-gnu]="issy-linux-amd64"
           names[aarch64-linux-gnu]="issy-linux-arm64"
-          names[x86_64-macos]="issy-macos-amd64"
-          names[aarch64-macos]="issy-macos-arm64"
           names[x86_64-openbsd]="issy-openbsd-amd64"
 
-          for target in x86_64-linux-gnu aarch64-linux-gnu x86_64-macos aarch64-macos x86_64-openbsd; do
+          # macOS is intentionally omitted: cross-compiled Mach-O from Linux
+          # has no LC_CODE_SIGNATURE and is rejected by the Apple Silicon
+          # kernel. Mac users install via `brew install --HEAD davidemerson/issy/issy`
+          # or build from source with `zig build`.
+          for target in x86_64-linux-gnu aarch64-linux-gnu x86_64-openbsd; do
             echo "::group::Building $target"
             if zig build -Dtarget=$target -Doptimize=ReleaseSafe; then
               cp zig-out/bin/issy "dist/${names[$target]}"
@@ -176,6 +183,6 @@ jobs:
           **Install:**
           - Debian/Ubuntu: \`sudo dpkg -i issy_0.1.0-1_amd64.deb\`
           - RHEL/Fedora: \`sudo rpm -i issy-0.1.0-1.x86_64.rpm\`
-          - macOS: \`xattr -d com.apple.quarantine issy-macos-arm64 && chmod +x issy-macos-arm64 && sudo mv issy-macos-arm64 /usr/local/bin/issy\`" \
+          - macOS: \`brew tap davidemerson/issy https://github.com/davidemerson/issy && brew install --HEAD issy\` (or build from source with \`zig build -Doptimize=ReleaseSafe\`)" \
             --latest \
             dist/*

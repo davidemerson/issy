@@ -156,6 +156,11 @@ Auto-apply is a no-op for root-owned install paths (the binary is not writable b
 to revert after an apply, or set
 .B notify_updates = false
 to disable the whole mechanism.
+.PP
+On macOS, auto-apply is also a no-op because issy does not ship prebuilt macOS binaries \(em cross-compiled Mach-O from Linux has no code signature and is refused by the Apple Silicon kernel. The notify path still works; run
+.B "brew upgrade --fetch-HEAD issy"
+to update, or rebuild from source with
+.BR "zig build -Doptimize=ReleaseSafe" .
 .SH FILES
 .TP
 .I ~/.issyrc
