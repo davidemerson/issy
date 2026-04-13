@@ -8,7 +8,7 @@ DISTNAME =	issy-0.1.0
 CATEGORIES =	editors
 HOMEPAGE =	https://github.com/davidemerson/issy
 
-MAINTAINER =	David Emerson <REPLACE-WITH-YOUR-EMAIL@example.com>
+MAINTAINER =	David Emerson <d@nnix.com>
 
 # ISC
 PERMIT_PACKAGE =	Yes
