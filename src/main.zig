@@ -5,6 +5,7 @@
 //! and cleans up on exit.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const config_mod = @import("config.zig");
 const term = @import("term.zig");
 const editor_mod = @import("editor.zig");
@@ -12,6 +13,12 @@ const render_mod = @import("render.zig");
 const print_mod = @import("print.zig");
 const update_mod = @import("update.zig");
 const build_info = @import("build_info.zig");
+
+comptime {
+    if (builtin.os.tag == .windows) {
+        @compileError("issy does not support Windows. Target Linux, macOS, or OpenBSD.");
+    }
+}
 
 const Args = struct {
     file: ?[]const u8 = null,

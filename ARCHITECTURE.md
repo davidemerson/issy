@@ -61,7 +61,7 @@ The central struct. Owns the buffer, cursor(s), mode, undo/redo stacks, clipboar
 
 ### term.zig -- Terminal Abstraction
 
-Platform abstraction over raw terminal I/O (currently POSIX via termios, Windows support is stubbed).
+Abstraction over raw terminal I/O (POSIX via termios). issy targets Linux, macOS, and OpenBSD.
 
 - **Raw mode**: Disables echo, canonical mode, and signal processing. Sets 100ms read timeout.
 - **Read-ahead buffer**: A 256-byte buffer sits between `read()` and key parsing. When multiple keystrokes arrive in one `read()` call, they're consumed one at a time across successive `readKey()` calls. This prevents input loss during fast typing.

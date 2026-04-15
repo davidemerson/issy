@@ -1,8 +1,8 @@
 //! Terminal I/O abstraction.
 //!
 //! Provides raw mode terminal input/output, key reading, cursor control,
-//! color and style management, and screen operations. Abstracts over
-//! platform-specific terminal APIs (termios on POSIX, Console API on Windows).
+//! color and style management, and screen operations over POSIX termios
+//! (Linux, macOS, OpenBSD).
 
 const std = @import("std");
 const builtin = @import("builtin");

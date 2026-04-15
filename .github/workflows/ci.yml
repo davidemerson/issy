@@ -129,46 +129,8 @@ jobs:
             -in dist/sha256sums.txt -out dist/sha256sums.txt.sig
           echo "Signed sha256sums.txt ($(stat -c%s dist/sha256sums.txt.sig) bytes)"
 
-      - name: Package .deb and .rpm
-        run: |
-          sudo gem install fpm --no-document
-
-          VERSION="0.1.0"
-          gzip -k issy.1
-
-          # amd64
-          fpm -s dir -t deb -n issy -v "$VERSION" -a amd64 \
-            --description "A minimal text editor" --license ISC \
-            --category editors --maintainer "David Emerson" \
-            --url "https://github.com/davidemerson/issy" \
-            dist/issy-linux-amd64=/usr/bin/issy \
-            issy.1.gz=/usr/share/man/man1/issy.1.gz
-
-          fpm -s dir -t rpm -n issy -v "$VERSION" -a x86_64 \
-            --description "A minimal text editor" --license ISC \
-            --category "Applications/Editors" --maintainer "David Emerson" \
-            --url "https://github.com/davidemerson/issy" \
-            dist/issy-linux-amd64=/usr/bin/issy \
-            issy.1.gz=/usr/share/man/man1/issy.1.gz
-
-          # arm64
-          fpm -s dir -t deb -n issy -v "$VERSION" -a arm64 \
-            --description "A minimal text editor" --license ISC \
-            --category editors --maintainer "David Emerson" \
-            --url "https://github.com/davidemerson/issy" \
-            dist/issy-linux-arm64=/usr/bin/issy \
-            issy.1.gz=/usr/share/man/man1/issy.1.gz
-
-          fpm -s dir -t rpm -n issy -v "$VERSION" -a aarch64 \
-            --description "A minimal text editor" --license ISC \
-            --category "Applications/Editors" --maintainer "David Emerson" \
-            --url "https://github.com/davidemerson/issy" \
-            dist/issy-linux-arm64=/usr/bin/issy \
-            issy.1.gz=/usr/share/man/man1/issy.1.gz
-
-          mv *.deb *.rpm dist/
-          cp issy.1 dist/issy.1
-          ls -lh dist/
+      - name: Stage manpage
+        run: cp issy.1 dist/issy.1
 
       - name: Create release
         env:
@@ -180,9 +142,11 @@ jobs:
             --title "Latest Build" \
             --notes "Automated build from commit \`$(git rev-parse --short HEAD)\` on $(date -u +%Y-%m-%d).
 
-          **Install:**
-          - Debian/Ubuntu: \`sudo dpkg -i issy_0.1.0-1_amd64.deb\`
-          - RHEL/Fedora: \`sudo rpm -i issy-0.1.0-1.x86_64.rpm\`
-          - macOS: \`brew tap davidemerson/issy https://github.com/davidemerson/issy && brew install --HEAD issy\` (or build from source with \`zig build -Doptimize=ReleaseSafe\`)" \
+          **Install (Linux, macOS, OpenBSD):**
+          \`\`\`
+          curl -sSL https://raw.githubusercontent.com/davidemerson/issy/main/install.sh | sh
+          \`\`\`
+
+          Installs to \`~/.local/bin/issy\`, verifies the Ed25519 signature on the release manifest, and seeds \`~/.issyrc\` with commented defaults. See the [README](https://github.com/davidemerson/issy#install) for details." \
             --latest \
             dist/*

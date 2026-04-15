@@ -34,8 +34,6 @@ const update_key = @import("update_key.zig");
 const editor_mod = @import("editor.zig");
 const term = @import("term.zig");
 
-const is_posix = builtin.os.tag != .windows;
-
 pub const Status = enum { none, available, staged, error_state };
 
 pub const UpdateState = struct {
@@ -101,7 +99,6 @@ pub fn startupCheck(
 ) void {
     if (!cfg.notify_updates and !cfg.autoupdate) return;
     if (build_info.build_type == .dev) return;
-    if (!is_posix) return;
 
     const cache_dir = ensureCacheDir(allocator) catch return;
     defer allocator.free(cache_dir);
@@ -179,8 +176,6 @@ fn spawnWorker(
     commit_path: []const u8,
     autoupdate: bool,
 ) void {
-    if (!is_posix) return;
-
     const pid = std.posix.fork() catch return;
     if (pid != 0) {
         _ = std.posix.waitpid(pid, 0);
@@ -574,8 +569,6 @@ pub fn tryResume(
 /// successful apply). This is called from main() when `--rollback` is
 /// on argv, before any TUI or editor state is created.
 pub fn rollback(allocator: std.mem.Allocator) !void {
-    if (!is_posix) return error.UnsupportedPlatform;
-
     const cache_dir = try ensureCacheDir(allocator);
     defer allocator.free(cache_dir);
 

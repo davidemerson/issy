@@ -2,7 +2,7 @@
 
 A text editor that looks like a printed page, not a terminal application.
 
-Built in Zig with zero external dependencies. Single binary, cross-compiles to Linux, macOS, Windows, and OpenBSD. Gap buffer text storage, syntax highlighting for 17 languages (including TeX/LaTeX), PDF export with TTF/OTF font embedding, multiple cursors, undo/redo, and incremental search.
+Built in Zig with zero external dependencies. Single binary, cross-compiles to Linux, macOS, and OpenBSD. Gap buffer text storage, syntax highlighting for 17 languages (including TeX/LaTeX), PDF export with TTF/OTF font embedding, multiple cursors, undo/redo, and incremental search.
 
 ### Two themes: default (dark) and paper (Solarized Light)
 
@@ -38,67 +38,64 @@ Pick the one that matches your environment. Both follow the same design principl
 
 ## Install
 
-### Linux
+```sh
+curl -sSL https://raw.githubusercontent.com/davidemerson/issy/main/install.sh | sh
+```
 
-Pre-built binaries from the latest commit on main:
+Installs `issy` to `~/.local/bin/issy`, seeds `~/.issyrc` with commented defaults if it doesn't already exist, and enables the opt-in auto-update path. The installer verifies an Ed25519 signature over the release manifest before writing anything.
 
-| Platform | Package | Binary |
-|----------|---------|--------|
-| Linux x64 | [.deb](https://github.com/davidemerson/issy/releases/latest/download/issy_0.1.0-1_amd64.deb) / [.rpm](https://github.com/davidemerson/issy/releases/latest/download/issy-0.1.0-1.x86_64.rpm) | [issy-linux-amd64](https://github.com/davidemerson/issy/releases/latest/download/issy-linux-amd64) |
-| Linux ARM64 | [.deb](https://github.com/davidemerson/issy/releases/latest/download/issy_0.1.0-1_arm64.deb) / [.rpm](https://github.com/davidemerson/issy/releases/latest/download/issy-0.1.0-1.aarch64.rpm) | [issy-linux-arm64](https://github.com/davidemerson/issy/releases/latest/download/issy-linux-arm64) |
+Flags: `--prefix DIR` (default `~/.local/bin`), `--no-rc` (skip seeding), `--version VER` (default `latest`).
 
-### macOS
+If you'd rather inspect the script before running it:
 
-**Homebrew (recommended):**
+```sh
+curl -sSL https://raw.githubusercontent.com/davidemerson/issy/main/install.sh -o install.sh
+less install.sh
+sh install.sh
+```
+
+**Supported platforms:** Linux amd64/arm64 and OpenBSD amd64 get a verified prebuilt binary. macOS and any other platform fall through to building from source if `zig` (0.15.2+) is on your PATH.
+
+### macOS via Homebrew
 
 ```sh
 brew tap davidemerson/issy https://github.com/davidemerson/issy
 brew install --HEAD issy
 ```
 
-To upgrade: `brew upgrade --fetch-HEAD issy`.
-
-**Build from source** (if you don't use Homebrew):
-
-```sh
-git clone https://github.com/davidemerson/issy.git
-cd issy
-zig build -Doptimize=ReleaseSafe
-sudo install -m 0755 zig-out/bin/issy /usr/local/bin/issy
-```
-
-Requires [Zig 0.15.2+](https://ziglang.org/download/). Both paths produce a native host-signed binary that runs on both Intel and Apple Silicon without any `xattr`, `codesign`, or quarantine workarounds. Prebuilt macOS binaries are intentionally not shipped because cross-compiled Mach-O from Linux has no code signature and is refused by the Apple Silicon kernel.
+Upgrade with `brew upgrade --fetch-HEAD issy`. The installer script also works on macOS and builds from source — use either.
 
 ### OpenBSD
 
-[Build from source](#build).
+The shell installer downloads a prebuilt amd64 binary. An OpenBSD ports submission is in progress; once it lands, `pkg_add issy` will be the preferred path.
 
-## Build
+## Build from source
 
-Requires [Zig](https://ziglang.org/) 0.15+.
+Requires [Zig 0.15.2+](https://ziglang.org/download/).
+
+```sh
+git clone https://github.com/davidemerson/issy
+cd issy
+zig build -Doptimize=ReleaseSafe      # release build (~470KB)
+install -m 0755 zig-out/bin/issy ~/.local/bin/issy
+```
+
+Other `build.zig` targets:
 
 ```sh
 zig build                              # debug build
-zig build -Doptimize=ReleaseSafe       # release build (~470KB)
 zig build test                         # run all tests
+zig build cross                        # build all cross-compile targets
 ```
 
-The binary is placed in `zig-out/bin/issy`.
-
-### Cross-compile
+Cross-compile any single target:
 
 ```sh
 zig build -Dtarget=x86_64-linux-gnu
+zig build -Dtarget=aarch64-linux-gnu
 zig build -Dtarget=x86_64-macos
 zig build -Dtarget=aarch64-macos
-zig build -Dtarget=x86_64-windows-gnu
 zig build -Dtarget=x86_64-openbsd
-```
-
-Or build all cross targets at once:
-
-```sh
-zig build cross
 ```
 
 ## Usage
@@ -197,7 +194,7 @@ All editing operations (typing, backspace, delete, paste) apply to every cursor 
 
 ## Configuration
 
-Create `~/.issyrc` (POSIX) or `%APPDATA%\issy\config` (Windows). See [CONFIGURATION.md](CONFIGURATION.md) for the full reference, or copy [examples/issyrc](examples/issyrc) as a starting point.
+The installer seeds `~/.issyrc` with commented defaults on first install. See [CONFIGURATION.md](CONFIGURATION.md) for the full reference, or copy [examples/issyrc](examples/issyrc) as a starting point.
 
 Quick example:
 
@@ -257,7 +254,7 @@ Dev builds (unreleased working trees) short-circuit the check entirely — only 
 
 **Rollback:** after an apply, run `issy --rollback` to swap the previous binary back. It's a one-shot atomic rename with a clear error if there's no snapshot to restore.
 
-**Security model.** The auto-update path trusts only the Ed25519 public key committed to `src/update_key.zig`. The matching private key is held as a GitHub Actions Secret (`UPDATE_SIGNING_KEY`) and only the repo's CI workflow can sign releases. A tampered `sha256sums.txt` or a tampered binary will fail signature verification or hash mismatch, respectively, and staging aborts. The worker runs inside the editor's user, not as root, and refuses to operate on root-owned install paths (e.g. `/usr/bin/issy` from `.deb`/`.rpm` — those installs silently stay in notify-only mode).
+**Security model.** The auto-update path trusts only the Ed25519 public key committed to `src/update_key.zig`. The matching private key is held as a GitHub Actions Secret (`UPDATE_SIGNING_KEY`) and only the repo's CI workflow can sign releases. A tampered `sha256sums.txt` or a tampered binary will fail signature verification or hash mismatch, respectively, and staging aborts. The worker runs inside the editor's user, not as root, and refuses to operate on root-owned install paths — those installs silently stay in notify-only mode.
 
 **Cache layout.** Everything auto-update related lives under `~/.cache/issy/`:
 

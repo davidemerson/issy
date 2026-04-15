@@ -1,7 +1,8 @@
 # issy configuration
 #
-# Place this file at ~/.issyrc (POSIX) or %APPDATA%\issy\config (Windows).
-# Lines starting with # are comments. Unknown keys are ignored.
+# Place this file at ~/.issyrc. The installer seeds a commented default
+# if the file does not exist. Lines starting with # are comments;
+# unknown keys are ignored.
 
 # ── Editing ──
 

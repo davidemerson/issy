@@ -1,6 +1,6 @@
 # Configuration Reference
 
-issy reads its configuration from `~/.issyrc` on POSIX systems or `%APPDATA%\issy\config` on Windows. You can override the path with `--config`.
+issy reads its configuration from `~/.issyrc`. You can override the path with `--config`. The installer seeds a commented default `~/.issyrc` on first install.
 
 ## File Format
 
