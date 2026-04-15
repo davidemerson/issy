@@ -41,6 +41,14 @@ pub const Key = union(enum) {
     scroll_up,
     scroll_down,
     mouse_click: struct { row: u16, col: u16 },
+    mouse_drag: struct { row: u16, col: u16 },
+    mouse_release: struct { row: u16, col: u16 },
+    shift_up,
+    shift_down,
+    shift_left,
+    shift_right,
+    shift_home,
+    shift_end,
     ctrl: u8,
     f1,
     help, // Ctrl+/ or Ctrl+Shift+?
@@ -121,8 +129,10 @@ pub fn init() !void {
             truecolor_supported = false;
         }
 
-        // Enable mouse button events + SGR extended mouse format
-        writeStr("\x1b[?1000h\x1b[?1006h");
+        // Enable mouse button events + button-event drag tracking + SGR
+        // extended mouse format. Mode 1002 is what makes drag motion
+        // arrive at all — without it the terminal only reports clicks.
+        writeStr("\x1b[?1000h\x1b[?1002h\x1b[?1006h");
         // Enter alternate screen
         writeStr("\x1b[?1049h");
         doFlush() catch {};
@@ -139,7 +149,7 @@ pub fn deinit() void {
         // Restore cursor shape to terminal default
         writeStr("\x1b[0 q");
         // Disable mouse reporting
-        writeStr("\x1b[?1000l\x1b[?1006l");
+        writeStr("\x1b[?1000l\x1b[?1002l\x1b[?1006l");
         // Leave alternate screen
         writeStr("\x1b[?1049l");
         // Reset styles
@@ -369,6 +379,21 @@ fn parseExtended(buf: []const u8) Key {
         };
     }
 
+    // ESC [ 1 ; 2 X = shift+arrow / shift+home / shift+end. Modifier
+    // code 2 is the standard xterm shift modifier; we use these to
+    // start and extend a keyboard-driven selection.
+    if (buf[2] == '1' and buf.len >= 6 and buf[3] == ';' and buf[4] == '2') {
+        return switch (buf[5]) {
+            'A' => .shift_up,
+            'B' => .shift_down,
+            'C' => .shift_right,
+            'D' => .shift_left,
+            'H' => .shift_home,
+            'F' => .shift_end,
+            else => .unknown,
+        };
+    }
+
     // ESC [ 1 ~ = home, ESC [ 4 ~ = end
     if (buf[3] == '~') {
         return switch (buf[2]) {
@@ -422,12 +447,22 @@ fn parseSgrMouse(buf: []const u8) Key {
     if (button == 64) return .scroll_up;
     if (button == 65) return .scroll_down;
 
-    // Left click press
-    if (button == 0 and is_press) {
-        return .{ .mouse_click = .{
-            .row = if (cy > 0) cy - 1 else 0,
-            .col = if (cx > 0) cx - 1 else 0,
-        } };
+    const row: u16 = if (cy > 0) cy - 1 else 0;
+    const col: u16 = if (cx > 0) cx - 1 else 0;
+
+    // Left click press / release
+    if (button == 0) {
+        if (is_press) {
+            return .{ .mouse_click = .{ .row = row, .col = col } };
+        } else {
+            return .{ .mouse_release = .{ .row = row, .col = col } };
+        }
+    }
+
+    // Mode 1002 reports left-button drag motion as button 32. Buttons
+    // 33/34 (middle/right drag) are intentionally ignored.
+    if (button == 32) {
+        return .{ .mouse_drag = .{ .row = row, .col = col } };
     }
 
     return .none;
@@ -605,6 +640,37 @@ test "key parsing - SGR mouse click" {
     const result = parseEscape("\x1b[<0;10;5M");
     switch (result) {
         .mouse_click => |pos| {
+            try std.testing.expectEqual(@as(u16, 4), pos.row);
+            try std.testing.expectEqual(@as(u16, 9), pos.col);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "key parsing - shift+arrow keys" {
+    try std.testing.expectEqual(Key.shift_up, parseEscape("\x1b[1;2A"));
+    try std.testing.expectEqual(Key.shift_down, parseEscape("\x1b[1;2B"));
+    try std.testing.expectEqual(Key.shift_right, parseEscape("\x1b[1;2C"));
+    try std.testing.expectEqual(Key.shift_left, parseEscape("\x1b[1;2D"));
+    try std.testing.expectEqual(Key.shift_home, parseEscape("\x1b[1;2H"));
+    try std.testing.expectEqual(Key.shift_end, parseEscape("\x1b[1;2F"));
+}
+
+test "key parsing - SGR mouse drag" {
+    const result = parseEscape("\x1b[<32;15;7M");
+    switch (result) {
+        .mouse_drag => |pos| {
+            try std.testing.expectEqual(@as(u16, 6), pos.row);
+            try std.testing.expectEqual(@as(u16, 14), pos.col);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "key parsing - SGR mouse release" {
+    const result = parseEscape("\x1b[<0;10;5m");
+    switch (result) {
+        .mouse_release => |pos| {
             try std.testing.expectEqual(@as(u16, 4), pos.row);
             try std.testing.expectEqual(@as(u16, 9), pos.col);
         },

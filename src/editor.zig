@@ -303,22 +303,27 @@ pub const Editor = struct {
                 return .redraw;
             },
             .up => {
+                self.sel_active = false;
                 self.moveCursorUp(1);
                 return .redraw;
             },
             .down => {
+                self.sel_active = false;
                 self.moveCursorDown(1);
                 return .redraw;
             },
             .left => {
+                self.sel_active = false;
                 self.moveCursorLeft();
                 return .redraw;
             },
             .right => {
+                self.sel_active = false;
                 self.moveCursorRight();
                 return .redraw;
             },
             .home => {
+                self.sel_active = false;
                 self.cursor.col = 0;
                 self.cursor.col_want = 0;
                 self.ensureCursorVisible();
@@ -326,6 +331,40 @@ pub const Editor = struct {
                 return .redraw;
             },
             .end => {
+                self.sel_active = false;
+                self.moveCursorToLineEnd();
+                return .redraw;
+            },
+            .shift_up => {
+                self.extendOrStartSelection();
+                self.moveCursorUp(1);
+                return .redraw;
+            },
+            .shift_down => {
+                self.extendOrStartSelection();
+                self.moveCursorDown(1);
+                return .redraw;
+            },
+            .shift_left => {
+                self.extendOrStartSelection();
+                self.moveCursorLeft();
+                return .redraw;
+            },
+            .shift_right => {
+                self.extendOrStartSelection();
+                self.moveCursorRight();
+                return .redraw;
+            },
+            .shift_home => {
+                self.extendOrStartSelection();
+                self.cursor.col = 0;
+                self.cursor.col_want = 0;
+                self.ensureCursorVisible();
+                self.updateBracketMatch();
+                return .redraw;
+            },
+            .shift_end => {
+                self.extendOrStartSelection();
                 self.moveCursorToLineEnd();
                 return .redraw;
             },
@@ -358,6 +397,14 @@ pub const Editor = struct {
             },
             .mouse_click => |pos| {
                 self.handleMouseClick(pos.row, pos.col);
+                return .redraw;
+            },
+            .mouse_drag => |pos| {
+                self.handleMouseDrag(pos.row, pos.col);
+                return .redraw;
+            },
+            .mouse_release => |pos| {
+                self.handleMouseRelease(pos.row, pos.col);
                 return .redraw;
             },
             .ctrl => |c| {
@@ -684,50 +731,83 @@ pub const Editor = struct {
         const info = self.buf.getLine(line) orelse return 1;
         const line_len = info.len;
         const w = self.wrapWidth();
-        if (w == 0 or line_len <= w) return 1;
+        if (w == 0) return 1;
 
         var line_tmp: [8192]u8 = undefined;
         const data = self.buf.contiguousSlice(info.start, @min(line_len, 8192), &line_tmp);
         const cont_w = if (w > 2) w - 2 else 1;
+        const tw = self.effectiveTabWidth();
+
+        // Single forward scan tracking (byte_offset, visual_col) per
+        // codepoint. Break candidates (last space, last punctuation byte)
+        // are remembered in bytes so the recorded break positions stay
+        // byte-indexed for callers. Tabs expand to the next tab stop.
+        // Multi-byte UTF-8 sequences are advanced as a unit, so a break
+        // never lands inside a sequence.
 
         var count: usize = 1;
-        var pos: usize = 0;
+        var pos: usize = 0; // byte offset of current sub-line start
         var first = true;
 
         while (pos < data.len and count < MAX_WRAP_BREAKS) {
             const avail = if (first) w else cont_w;
             first = false;
 
-            if (pos + avail >= data.len) break; // rest fits
+            // Walk forward measuring visual width, remembering break candidates.
+            var visual: usize = 0;
+            var i: usize = pos;
+            var last_space_byte: ?usize = null;
+            var last_space_visual: usize = 0;
+            var last_punct_byte: ?usize = null;
+            var last_punct_visual: usize = 0;
 
-            // Find the best break point within the available width
-            const limit = pos + avail;
-            var break_at = limit; // hard break fallback
+            while (i < data.len) {
+                const b = data[i];
+                if (b == '\n') break;
 
-            // Look backwards for a good break point (don't search more than 40% back)
-            const min_scan = pos + avail * 3 / 5;
-            var best_space: ?usize = null;
-            var best_punct: ?usize = null;
+                const cp_visual: usize = if (b == '\t')
+                    (tw - (visual % tw))
+                else
+                    1;
+                const cp_len: usize = if (b == '\t' or b < 0x80)
+                    1
+                else
+                    @max(@as(usize, unicode.utf8Len(b)), 1);
 
-            var scan = limit;
-            while (scan > min_scan) {
-                scan -= 1;
-                const ch = data[scan];
-                if (ch == ' ' or ch == '\t') {
-                    best_space = scan + 1; // break after the space
-                    break;
-                }
-                if (best_punct == null and isBreakAfter(ch)) {
-                    best_punct = scan + 1; // break after the punctuation
+                // If this codepoint would push us past avail, stop here.
+                if (visual + cp_visual > avail) break;
+
+                visual += cp_visual;
+                i += cp_len;
+
+                // After consuming the codepoint, record candidates that
+                // can break *after* this byte position.
+                if (b == ' ' or b == '\t') {
+                    last_space_byte = i;
+                    last_space_visual = visual;
+                } else if (isBreakAfter(b)) {
+                    last_punct_byte = i;
+                    last_punct_visual = visual;
                 }
             }
 
-            if (best_space) |bp| {
-                break_at = bp;
-            } else if (best_punct) |bp| {
-                break_at = bp;
+            // If the entire remainder fit, no more breaks needed.
+            if (i >= data.len or data[i] == '\n') break;
+
+            // Decide where to break. Prefer last space, then last punct,
+            // but only if they sit past the 60% lookback threshold (matches
+            // the previous behavior — avoids wrapping pathologically early).
+            const min_visual = avail * 3 / 5;
+            var break_at: usize = i;
+            if (last_space_byte) |bp| {
+                if (last_space_visual >= min_visual) break_at = bp;
+            } else if (last_punct_byte) |bp| {
+                if (last_punct_visual >= min_visual) break_at = bp;
             }
-            // else: hard break at limit
+
+            // Guard against zero-progress (line full of nonbreakable
+            // codepoints wider than `avail`): force at least one byte.
+            if (break_at <= pos) break_at = pos + @max(@as(usize, unicode.utf8Len(data[pos])), 1);
 
             breaks[count] = break_at;
             count += 1;
@@ -824,7 +904,7 @@ pub const Editor = struct {
 
     fn moveCursorLeft(self: *Editor) void {
         if (self.cursor.col > 0) {
-            self.cursor.col -= 1;
+            self.cursor.col -= self.prevCodepointLen(self.cursor.line, self.cursor.col);
         } else if (self.cursor.line > 0) {
             self.cursor.line -= 1;
             self.moveCursorToLineEnd();
@@ -838,7 +918,7 @@ pub const Editor = struct {
     fn moveCursorRight(self: *Editor) void {
         const line_len = self.currentLineLen();
         if (self.cursor.col < line_len) {
-            self.cursor.col += 1;
+            self.cursor.col += self.codepointLenAt(self.cursor.line, self.cursor.col);
         } else if (self.cursor.line + 1 < self.buf.lineCount()) {
             self.cursor.line += 1;
             self.cursor.col = 0;
@@ -846,6 +926,37 @@ pub const Editor = struct {
         self.cursor.col_want = self.cursor.col;
         self.ensureCursorVisible();
         self.updateBracketMatch();
+    }
+
+    /// Length in bytes of the codepoint starting at `byte_col` on `line`.
+    /// Returns 1 for ASCII or end-of-line; 2-4 for multi-byte UTF-8.
+    fn codepointLenAt(self: *Editor, line: usize, byte_col: usize) usize {
+        const info = self.buf.getLine(line) orelse return 1;
+        if (byte_col >= info.len) return 1;
+        var tmp: [4]u8 = undefined;
+        const slice_len = @min(@as(usize, 4), info.len - byte_col);
+        const data = self.buf.contiguousSlice(info.start + byte_col, slice_len, &tmp);
+        if (data.len == 0) return 1;
+        return @max(@as(usize, unicode.utf8Len(data[0])), 1);
+    }
+
+    /// Length in bytes of the codepoint *ending* at `byte_col` on `line`.
+    /// Walks backward over any continuation bytes (0x80..0xBF) until a
+    /// non-continuation byte; returns 1 if `byte_col == 0` or under any
+    /// malformed condition.
+    fn prevCodepointLen(self: *Editor, line: usize, byte_col: usize) usize {
+        if (byte_col == 0) return 1;
+        const info = self.buf.getLine(line) orelse return 1;
+        var tmp: [4]u8 = undefined;
+        const start = if (byte_col >= 4) byte_col - 4 else 0;
+        const want = byte_col - start;
+        const data = self.buf.contiguousSlice(info.start + start, want, &tmp);
+        var n: usize = 1;
+        while (n < data.len and n < 4) : (n += 1) {
+            const b = data[data.len - n];
+            if (!unicode.isContByte(b)) break;
+        }
+        return n;
     }
 
     fn moveCursorToLineEnd(self: *Editor) void {
@@ -872,28 +983,82 @@ pub const Editor = struct {
     }
 
     fn handleMouseClick(self: *Editor, row: u16, col: u16) void {
-        // Clear multi-cursors
+        // Clear multi-cursors and any prior selection.
         self.cursors.clearRetainingCapacity();
         self.sel_active = false;
 
-        const target_line = self.scroll_top + row;
-        const max_line = if (self.buf.lineCount() > 0) self.buf.lineCount() - 1 else 0;
-        self.cursor.line = @min(target_line, max_line);
+        const pos = self.screenToBufferPos(row, col);
+        self.cursor.line = pos.line;
+        self.cursor.col = pos.col;
+        self.cursor.col_want = self.cursor.col;
 
-        // Account for centering offset and gutter
+        // Pre-arm the selection anchor at the click position. A
+        // subsequent mouse_drag will flip sel_active = true and treat
+        // this as the anchor; if no drag follows, the anchor is simply
+        // unused and discarded on the next click.
+        self.sel_anchor_line = pos.line;
+        self.sel_anchor_col = pos.col;
+
+        self.updateBracketMatch();
+    }
+
+    fn handleMouseDrag(self: *Editor, row: u16, col: u16) void {
+        const pos = self.screenToBufferPos(row, col);
+        // First drag motion since the click flips sel_active on. The
+        // anchor was set in handleMouseClick so getSelectionRange has a
+        // valid starting point.
+        self.sel_active = true;
+        self.cursor.line = pos.line;
+        self.cursor.col = pos.col;
+        self.cursor.col_want = self.cursor.col;
+        self.updateBracketMatch();
+    }
+
+    fn handleMouseRelease(self: *Editor, row: u16, col: u16) void {
+        _ = row;
+        _ = col;
+        // If the user clicked without dragging, the anchor and cursor
+        // collapse to the same position — discard the empty selection
+        // so a single click doesn't leave a phantom selected range.
+        if (self.sel_active) {
+            if (self.getSelectionRange()) |s| {
+                if (s.len == 0) self.sel_active = false;
+            }
+        }
+    }
+
+    /// Convert a (screen_row, screen_col) cell coordinate into a
+    /// (buffer_line, buffer_col) position. Accounts for the gutter,
+    /// centering offset, and horizontal scroll. Tab expansion and
+    /// multi-byte visual width are NOT accounted for — pre-existing
+    /// limitation shared with handleMouseClick. Clamps row to the
+    /// buffer's last line and col to the line's byte length.
+    fn screenToBufferPos(self: *Editor, row: u16, col: u16) struct { line: usize, col: usize } {
+        const max_line = if (self.buf.lineCount() > 0) self.buf.lineCount() - 1 else 0;
+        const target_line = @min(self.scroll_top + row, max_line);
+
         const c_offset = self.centerOffset();
         const gutter_width = self.gutterWidth();
         const total_offset = c_offset + gutter_width;
-        if (col >= total_offset) {
-            self.cursor.col = @as(usize, col - total_offset) + self.scroll_left;
-        } else {
-            self.cursor.col = 0;
+
+        var target_col: usize = if (col >= total_offset)
+            @as(usize, col - total_offset) + self.scroll_left
+        else
+            0;
+
+        if (self.buf.getLine(target_line)) |li| {
+            if (target_col > li.len) target_col = li.len;
         }
 
-        const line_len = self.currentLineLen();
-        if (self.cursor.col > line_len) self.cursor.col = line_len;
-        self.cursor.col_want = self.cursor.col;
-        self.updateBracketMatch();
+        return .{ .line = target_line, .col = target_col };
+    }
+
+    fn extendOrStartSelection(self: *Editor) void {
+        if (!self.sel_active) {
+            self.sel_anchor_line = self.cursor.line;
+            self.sel_anchor_col = self.cursor.col;
+            self.sel_active = true;
+        }
     }
 
     /// Compute the horizontal centering offset for wide terminals.
@@ -991,11 +1156,23 @@ pub const Editor = struct {
         var visual: usize = 0;
         var i: usize = 0;
         const limit = @min(byte_col, data.len);
-        while (i < limit) : (i += 1) {
-            if (data[i] == '\t') {
+        while (i < limit) {
+            const b = data[i];
+            if (b == '\t') {
                 visual += tw - (visual % tw);
-            } else {
+                i += 1;
+            } else if (b < 0x80) {
                 visual += 1;
+                i += 1;
+            } else if (unicode.isContByte(b)) {
+                // byte_col landed inside a multi-byte sequence — defensive
+                // skip without counting. cursor.col is kept on codepoint
+                // boundaries elsewhere, so this is a safety net only.
+                i += 1;
+            } else {
+                const r = unicode.decode(data[i..]);
+                visual += 1;
+                i += @max(@as(usize, r.len), 1);
             }
         }
         return visual;
@@ -1088,12 +1265,14 @@ pub const Editor = struct {
         const len = unicode.encode(cp, &enc);
 
         if (self.cursors.items.len == 0) {
-            // Fast path: single cursor. Keep the original behavior bit-for-bit
-            // so there's no behavioral drift for the common case.
+            // Fast path: single cursor. cursor.col is a byte offset into
+            // the line, so advance it by the encoded length, not 1 — for
+            // a 3-byte codepoint like ─ stepping by 1 would leave the
+            // cursor on a continuation byte.
             const pos = self.cursorBytePos();
             self.pushUndo(pos, null, len);
             self.buf.insert(pos, enc[0..len]) catch return;
-            self.cursor.col += 1;
+            self.cursor.col += len;
             self.cursor.col_want = self.cursor.col;
             self.modified = true;
             self.ensureCursorVisible();
@@ -1183,13 +1362,17 @@ pub const Editor = struct {
                 self.pushUndo(pos, saved, 0);
                 self.buf.delete(pos, 1);
             } else {
-                self.cursor.col -= 1;
+                // Delete the *whole* preceding codepoint, not one byte —
+                // otherwise backspacing over `─` would leave behind two
+                // continuation bytes and corrupt every following render.
+                const del_len = self.prevCodepointLen(self.cursor.line, self.cursor.col);
+                self.cursor.col -= del_len;
                 const pos = self.cursorBytePos();
-                var tmp: [1]u8 = undefined;
-                const ch = self.buf.contiguousSlice(pos, 1, &tmp);
+                var tmp: [4]u8 = undefined;
+                const ch = self.buf.contiguousSlice(pos, del_len, &tmp);
                 const saved = self.allocator.dupe(u8, ch) catch return;
                 self.pushUndo(pos, saved, 0);
-                self.buf.delete(pos, 1);
+                self.buf.delete(pos, del_len);
             }
             self.cursor.col_want = self.cursor.col;
             self.modified = true;
@@ -1208,11 +1391,15 @@ pub const Editor = struct {
             const total_len = self.buf.logicalLen();
             if (pos >= total_len) return;
 
-            var tmp: [1]u8 = undefined;
-            const ch = self.buf.contiguousSlice(pos, 1, &tmp);
+            // Delete the whole codepoint at the cursor, not one byte.
+            const del_len = self.codepointLenAt(self.cursor.line, self.cursor.col);
+            const remaining = total_len - pos;
+            const eff_len = @min(del_len, remaining);
+            var tmp: [4]u8 = undefined;
+            const ch = self.buf.contiguousSlice(pos, eff_len, &tmp);
             const saved = self.allocator.dupe(u8, ch) catch return;
             self.pushUndo(pos, saved, 0);
-            self.buf.delete(pos, 1);
+            self.buf.delete(pos, eff_len);
 
             self.modified = true;
             self.updateBracketMatch();
@@ -1245,14 +1432,14 @@ pub const Editor = struct {
         self.ensureCursorVisible();
     }
 
-    const SelectionRange = struct {
+    pub const SelectionRange = struct {
         start: usize,
         len: usize,
         start_line: usize,
         start_col: usize,
     };
 
-    fn getSelectionRange(self: *Editor) ?SelectionRange {
+    pub fn getSelectionRange(self: *Editor) ?SelectionRange {
         if (!self.sel_active) return null;
 
         const anchor_pos = self.lineColToBytePos(self.sel_anchor_line, self.sel_anchor_col);
@@ -2255,4 +2442,372 @@ test "editor bracket matching" {
     if (ed.matching_bracket_pos) |pos| {
         try std.testing.expectEqual(@as(usize, 6), pos.col);
     }
+}
+
+// ── UTF-8 handling ──
+
+test "byteColToVisualCol handles multi-byte UTF-8" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // "a─b\n" — 'a' (1) + ─ (3) + 'b' (1) + '\n' (1) = 6 bytes
+    try ed.buf.insert(0, "a\xE2\x94\x80b\n");
+
+    try std.testing.expectEqual(@as(usize, 0), ed.byteColToVisualCol(0, 0));
+    try std.testing.expectEqual(@as(usize, 1), ed.byteColToVisualCol(0, 1));
+    // Past the 3-byte ─: visual col 2.
+    try std.testing.expectEqual(@as(usize, 2), ed.byteColToVisualCol(0, 4));
+    try std.testing.expectEqual(@as(usize, 3), ed.byteColToVisualCol(0, 5));
+}
+
+test "byteColToVisualCol with tab and multi-byte interleaved" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // "a\t─b\n" — tab_width default 4, 'a' at vis 0, tab fills to 4,
+    // ─ at vis 4, 'b' at vis 5.
+    try ed.buf.insert(0, "a\t\xE2\x94\x80b\n");
+
+    try std.testing.expectEqual(@as(usize, 0), ed.byteColToVisualCol(0, 0));
+    try std.testing.expectEqual(@as(usize, 1), ed.byteColToVisualCol(0, 1));
+    try std.testing.expectEqual(@as(usize, 4), ed.byteColToVisualCol(0, 2)); // past tab
+    try std.testing.expectEqual(@as(usize, 5), ed.byteColToVisualCol(0, 5)); // past ─
+    try std.testing.expectEqual(@as(usize, 6), ed.byteColToVisualCol(0, 6)); // past b
+}
+
+test "computeWrapBreaks does not split multi-byte UTF-8" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // 60 ─ characters (180 bytes) + newline.
+    var buf: [200]u8 = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < 60) : (i += 1) {
+        buf[n] = 0xE2;
+        buf[n + 1] = 0x94;
+        buf[n + 2] = 0x80;
+        n += 3;
+    }
+    buf[n] = '\n';
+    n += 1;
+    try ed.buf.insert(0, buf[0..n]);
+
+    // Force a narrow wrap window.
+    ed.visible_cols = 30;
+    ed.visible_rows = 20;
+    ed.config.right_margin = 20;
+
+    var breaks: [Editor.MAX_WRAP_BREAKS]usize = undefined;
+    const count = ed.computeWrapBreaks(0, &breaks);
+    try std.testing.expect(count > 1);
+
+    // Every break offset must land on a codepoint boundary — never on a
+    // continuation byte (0x80..0xBF).
+    var line_tmp: [200]u8 = undefined;
+    const line_info = ed.buf.getLine(0).?;
+    const data = ed.buf.contiguousSlice(line_info.start, line_info.len, &line_tmp);
+    var k: usize = 0;
+    while (k < count) : (k += 1) {
+        const off = breaks[k];
+        if (off >= data.len) continue;
+        const b = data[off];
+        try std.testing.expect(b & 0xC0 != 0x80);
+    }
+}
+
+test "computeWrapBreaks measures width in codepoints not bytes" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // 30 ─ characters = 90 bytes but only 30 visual columns.
+    var buf: [120]u8 = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        buf[n] = 0xE2;
+        buf[n + 1] = 0x94;
+        buf[n + 2] = 0x80;
+        n += 3;
+    }
+    buf[n] = '\n';
+    n += 1;
+    try ed.buf.insert(0, buf[0..n]);
+
+    // Wrap window: 50 columns. With byte-counting (90 > 50) the line
+    // would wrap; with codepoint-counting (30 < 50) it must not.
+    ed.visible_cols = 100;
+    ed.visible_rows = 20;
+    ed.config.right_margin = 50;
+
+    var breaks: [Editor.MAX_WRAP_BREAKS]usize = undefined;
+    const count = ed.computeWrapBreaks(0, &breaks);
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "insertCodepoint of 3-byte char advances cursor by codepoint" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // Insert ─ (U+2500) — 3 bytes in UTF-8.
+    _ = ed.handleKey(.{ .char = 0x2500 });
+    try std.testing.expectEqual(@as(usize, 3), ed.cursor.col);
+    try std.testing.expectEqual(@as(usize, 3), ed.buf.logicalLen());
+
+    // Insert another — cursor should land on a codepoint boundary again.
+    _ = ed.handleKey(.{ .char = 0x2500 });
+    try std.testing.expectEqual(@as(usize, 6), ed.cursor.col);
+    try std.testing.expectEqual(@as(usize, 6), ed.buf.logicalLen());
+}
+
+test "moveCursorRight steps over multi-byte codepoint" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "a\xE2\x94\x80b");
+    ed.cursor.line = 0;
+    ed.cursor.col = 0;
+
+    _ = ed.handleKey(.right);
+    try std.testing.expectEqual(@as(usize, 1), ed.cursor.col);
+    _ = ed.handleKey(.right);
+    try std.testing.expectEqual(@as(usize, 4), ed.cursor.col); // jumped over 3-byte ─
+    _ = ed.handleKey(.right);
+    try std.testing.expectEqual(@as(usize, 5), ed.cursor.col);
+}
+
+test "moveCursorLeft steps over multi-byte codepoint" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "a\xE2\x94\x80b");
+    ed.cursor.line = 0;
+    ed.cursor.col = 5;
+
+    _ = ed.handleKey(.left);
+    try std.testing.expectEqual(@as(usize, 4), ed.cursor.col);
+    _ = ed.handleKey(.left);
+    try std.testing.expectEqual(@as(usize, 1), ed.cursor.col); // jumped back over ─
+    _ = ed.handleKey(.left);
+    try std.testing.expectEqual(@as(usize, 0), ed.cursor.col);
+}
+
+test "doBackspace deletes whole multi-byte codepoint" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "a\xE2\x94\x80");
+    ed.cursor.line = 0;
+    ed.cursor.col = 4;
+
+    _ = ed.handleKey(.backspace);
+    try std.testing.expectEqual(@as(usize, 1), ed.buf.logicalLen());
+    try std.testing.expectEqual(@as(usize, 1), ed.cursor.col);
+}
+
+test "doDelete forward removes whole multi-byte codepoint" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "a\xE2\x94\x80b");
+    ed.cursor.line = 0;
+    ed.cursor.col = 1;
+
+    _ = ed.handleKey(.delete);
+    try std.testing.expectEqual(@as(usize, 2), ed.buf.logicalLen());
+    // Cursor stays put (byte 1 was 'a's end / ─'s start, now 'b's start)
+    try std.testing.expectEqual(@as(usize, 1), ed.cursor.col);
+}
+
+// ── Selection: keyboard ──
+
+test "shift_right starts and extends selection" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "hello");
+    ed.cursor.line = 0;
+    ed.cursor.col = 0;
+
+    _ = ed.handleKey(.shift_right);
+    _ = ed.handleKey(.shift_right);
+
+    try std.testing.expect(ed.sel_active);
+    try std.testing.expectEqual(@as(usize, 0), ed.sel_anchor_line);
+    try std.testing.expectEqual(@as(usize, 0), ed.sel_anchor_col);
+    try std.testing.expectEqual(@as(usize, 2), ed.cursor.col);
+
+    const sr = ed.getSelectionRange().?;
+    try std.testing.expectEqual(@as(usize, 2), sr.len);
+}
+
+test "shift_up extends across lines" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "hello\nworld\n");
+    ed.cursor.line = 1;
+    ed.cursor.col = 3;
+    // moveCursorUp uses col_want when crossing into a new buffer line.
+    // Real editing always keeps col_want in sync via the move helpers;
+    // tests that seed cursor.col directly must do the same.
+    ed.cursor.col_want = 3;
+
+    _ = ed.handleKey(.shift_up);
+
+    try std.testing.expect(ed.sel_active);
+    try std.testing.expectEqual(@as(usize, 1), ed.sel_anchor_line);
+    try std.testing.expectEqual(@as(usize, 3), ed.sel_anchor_col);
+    try std.testing.expectEqual(@as(usize, 0), ed.cursor.line);
+    try std.testing.expectEqual(@as(usize, 3), ed.cursor.col);
+
+    // Selection covers "lo\nwor" — 2 + 1 (newline) + 3 = 6 bytes.
+    const sr = ed.getSelectionRange().?;
+    try std.testing.expectEqual(@as(usize, 6), sr.len);
+}
+
+test "plain right collapses active selection" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "hello");
+    ed.cursor.line = 0;
+    ed.cursor.col = 0;
+
+    _ = ed.handleKey(.shift_right);
+    _ = ed.handleKey(.shift_right);
+    try std.testing.expect(ed.sel_active);
+
+    _ = ed.handleKey(.right);
+    try std.testing.expect(!ed.sel_active);
+    try std.testing.expectEqual(@as(usize, 3), ed.cursor.col);
+}
+
+test "shift_left at line start crosses into previous line" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "hello\nworld\n");
+    ed.cursor.line = 1;
+    ed.cursor.col = 0;
+
+    _ = ed.handleKey(.shift_left);
+
+    try std.testing.expect(ed.sel_active);
+    try std.testing.expectEqual(@as(usize, 1), ed.sel_anchor_line);
+    try std.testing.expectEqual(@as(usize, 0), ed.sel_anchor_col);
+    try std.testing.expectEqual(@as(usize, 0), ed.cursor.line);
+    try std.testing.expectEqual(@as(usize, 5), ed.cursor.col);
+}
+
+test "shift_right over multi-byte char" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "a\xE2\x94\x80b");
+    ed.cursor.line = 0;
+    ed.cursor.col = 0;
+
+    _ = ed.handleKey(.shift_right);
+    try std.testing.expectEqual(@as(usize, 1), ed.cursor.col);
+    _ = ed.handleKey(.shift_right);
+    try std.testing.expectEqual(@as(usize, 4), ed.cursor.col);
+
+    const sr = ed.getSelectionRange().?;
+    try std.testing.expectEqual(@as(usize, 4), sr.len);
+}
+
+test "Ctrl+A select all then Ctrl+C still works" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "hi");
+    _ = ed.handleKey(.{ .ctrl = 'a' });
+    try std.testing.expect(ed.sel_active);
+    const sr = ed.getSelectionRange().?;
+    try std.testing.expectEqual(@as(usize, 2), sr.len);
+
+    _ = ed.handleKey(.{ .ctrl = 'c' });
+    // Buffer unchanged.
+    try std.testing.expectEqual(@as(usize, 2), ed.buf.logicalLen());
+}
+
+// ── Selection: mouse drag ──
+
+test "mouse drag creates selection" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "abcdef\n");
+    ed.visible_cols = 80;
+    ed.visible_rows = 10;
+
+    // gutter_width=0 in this config; click at col 1 -> buffer col 1.
+    _ = ed.handleKey(.{ .mouse_click = .{ .row = 0, .col = 1 } });
+    try std.testing.expect(!ed.sel_active);
+    try std.testing.expectEqual(@as(usize, 1), ed.cursor.col);
+    try std.testing.expectEqual(@as(usize, 1), ed.sel_anchor_col);
+
+    _ = ed.handleKey(.{ .mouse_drag = .{ .row = 0, .col = 4 } });
+    try std.testing.expect(ed.sel_active);
+    try std.testing.expectEqual(@as(usize, 4), ed.cursor.col);
+    const sr = ed.getSelectionRange().?;
+    try std.testing.expectEqual(@as(usize, 1), sr.start);
+    try std.testing.expectEqual(@as(usize, 3), sr.len);
+}
+
+test "mouse release without drag clears selection" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "abcdef\n");
+    ed.visible_cols = 80;
+
+    _ = ed.handleKey(.{ .mouse_click = .{ .row = 0, .col = 2 } });
+    _ = ed.handleKey(.{ .mouse_release = .{ .row = 0, .col = 2 } });
+    try std.testing.expect(!ed.sel_active);
+}
+
+test "mouse drag past viewport clamps to last line" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "ab\ncd\n");
+    ed.visible_cols = 80;
+
+    _ = ed.handleKey(.{ .mouse_click = .{ .row = 0, .col = 0 } });
+    // Drag to row 99 — should clamp to the last line (line 1 or 2).
+    _ = ed.handleKey(.{ .mouse_drag = .{ .row = 99, .col = 0 } });
+    try std.testing.expect(ed.sel_active);
+    try std.testing.expect(ed.cursor.line <= ed.buf.lineCount());
 }

@@ -10,6 +10,7 @@ const term = @import("term.zig");
 const editor_mod = @import("editor.zig");
 const config_mod = @import("config.zig");
 const syntax_mod = @import("syntax.zig");
+const unicode = @import("unicode.zig");
 
 pub const Color = term.Color;
 
@@ -80,6 +81,16 @@ pub const Renderer = struct {
     }
 
     pub fn drawFrame(self: *Renderer, ed: *editor_mod.Editor) !void {
+        const code_start, const center_offset = self.paintFrame(ed);
+        try self.flushDiff(ed, code_start, center_offset);
+    }
+
+    /// Build the cell grid for one frame without flushing to the
+    /// terminal. Returns `(code_start, center_offset)` for the caller
+    /// (drawFrame uses these to position the hardware cursor in
+    /// flushDiff). Tests use this entry point because flushDiff writes
+    /// to stdout and deadlocks under the Zig test runner's listen pipe.
+    pub fn paintFrame(self: *Renderer, ed: *editor_mod.Editor) struct { u16, u16 } {
         const theme = &ed.config.theme;
 
         // 1. Clear all cells to bg
@@ -112,6 +123,11 @@ pub const Renderer = struct {
         const content_rows: u16 = if (self.rows > 1) self.rows - 1 else 1;
         const wrap_enabled = ed.config.word_wrap;
         const cont_indent: u16 = if (wrap_enabled) 2 else 0;
+
+        // Resolve the active selection once per frame. Each cell-write
+        // checks `abs_byte` against this range and applies the
+        // selection bg if it's inside.
+        const sel_range: ?editor_mod.Editor.SelectionRange = if (ed.sel_active) ed.getSelectionRange() else null;
 
         // Track syntax state
         var syn_state: syntax_mod.State = .normal;
@@ -213,6 +229,21 @@ pub const Renderer = struct {
                     const ch = line_data[byte_idx];
                     if (ch == '\n') break;
 
+                    // Determine how many bytes this codepoint occupies up
+                    // front so every branch advances byte_idx correctly.
+                    // For ASCII (and tab) this is 1; for multi-byte UTF-8
+                    // it is 2-4.
+                    const cp_len: usize = if (ch < 0x80) 1 else unicode.utf8Len(ch);
+
+                    // Selection check is computed once per character so
+                    // tab-expanded space cells all inherit the same
+                    // in_sel value.
+                    const abs_byte = line_info.start + byte_idx;
+                    const in_sel = if (sel_range) |sr|
+                        (abs_byte >= sr.start and abs_byte < sr.start + sr.len)
+                    else
+                        false;
+
                     // In non-wrap mode, skip chars before scroll_left
                     if (!wrap_enabled and buf_col < ed.scroll_left) {
                         if (ch == '\t') {
@@ -221,7 +252,7 @@ pub const Renderer = struct {
                         } else {
                             buf_col += 1;
                         }
-                        byte_idx += 1;
+                        byte_idx += cp_len;
                         continue;
                     }
 
@@ -230,7 +261,9 @@ pub const Renderer = struct {
                         const spaces = tw - (buf_col % tw);
                         var s: usize = 0;
                         while (s < spaces and col < code_end) : (s += 1) {
-                            self.cellAt(screen_row, col).char = ' ';
+                            const cell = self.cellAt(screen_row, col);
+                            cell.char = ' ';
+                            if (in_sel) cell.bg = theme.selection;
                             col += 1;
                         }
                         buf_col += spaces;
@@ -239,20 +272,40 @@ pub const Renderer = struct {
                             const cell = self.cellAt(screen_row, col);
                             cell.char = ch;
                             cell.fg = tokenColor(tokens, byte_idx, theme);
+                            if (in_sel) cell.bg = theme.selection;
+                            col += 1;
+                        }
+                        buf_col += 1;
+                    } else if (ch < 0x20) {
+                        // C0 control byte — render as a placeholder dot.
+                        if (col < code_end) {
+                            const cell = self.cellAt(screen_row, col);
+                            cell.char = '.';
+                            cell.fg = tokenColor(tokens, byte_idx, theme);
+                            if (in_sel) cell.bg = theme.selection;
                             col += 1;
                         }
                         buf_col += 1;
                     } else {
+                        // Multi-byte UTF-8. Decode the full codepoint and
+                        // store it in a single cell. Storing the raw lead
+                        // byte (0xC2..0xF4) in cell.char would emit it as
+                        // U+00C2..U+00F4 — that is the source of the
+                        // garbled `â` glyphs the user reported.
+                        const r = unicode.decode(line_data[byte_idx..]);
                         if (col < code_end) {
                             const cell = self.cellAt(screen_row, col);
-                            cell.char = if (ch < 0x20) '.' else ch;
+                            cell.char = r.codepoint;
                             cell.fg = tokenColor(tokens, byte_idx, theme);
+                            if (in_sel) cell.bg = theme.selection;
                             col += 1;
                         }
                         buf_col += 1;
+                        byte_idx += r.len;
+                        continue;
                     }
 
-                    byte_idx += 1;
+                    byte_idx += cp_len;
                 }
 
                 // Bracket match highlight. bp.col is a byte offset but
@@ -272,9 +325,16 @@ pub const Renderer = struct {
                     }
                 }
 
-                // Trailing whitespace highlight (only on last visual sub-line of the buffer line)
+                // Trailing whitespace highlight (only on last visual sub-line of the buffer line).
+                // Skipped when this line overlaps the active selection so
+                // selection bg is not overwritten by the trailing-ws bg.
                 const at_line_end = (byte_idx >= line_data.len or (byte_idx < line_data.len and line_data[byte_idx] == '\n'));
-                if (at_line_end and ed.config.trailing_whitespace and line_data.len > 0) {
+                const line_in_sel = if (sel_range) |sr| blk: {
+                    const line_end = line_info.start + line_data.len;
+                    const sel_end = sr.start + sr.len;
+                    break :blk (sr.start < line_end and sel_end > line_info.start);
+                } else false;
+                if (at_line_end and ed.config.trailing_whitespace and line_data.len > 0 and !line_in_sel) {
                     const stripped = std.mem.trimRight(u8, line_data, " \t\n\r");
                     if (stripped.len > 0 and stripped.len < line_data.len) {
                         // Highlight trailing whitespace cells on this row
@@ -330,8 +390,7 @@ pub const Renderer = struct {
             self.renderHelpOverlay(theme);
         }
 
-        // 7. Diff and flush
-        try self.flushDiff(ed, code_start, center_offset);
+        return .{ code_start, center_offset };
     }
 
     fn renderStatusBar(self: *Renderer, ed: *const editor_mod.Editor, row: u16, theme: *const config_mod.Theme, center_offset: u16, code_end: u16) void {
@@ -776,4 +835,116 @@ test "encodeChar ASCII" {
     const len = encodeChar('A', &buf);
     try std.testing.expectEqual(@as(usize, 1), len);
     try std.testing.expectEqual(@as(u8, 'A'), buf[0]);
+}
+
+test "render decodes multi-byte UTF-8 into a single cell" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+    cfg.word_wrap = false;
+    cfg.right_margin = 0;
+    cfg.cursor_line_bg = false;
+
+    var ed = editor_mod.Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // "# ─\n" — '#' (1) + ' ' (1) + ─ (3) + '\n' (1) = 6 bytes.
+    try ed.buf.insert(0, "# \xE2\x94\x80\n");
+    ed.visible_cols = 20;
+    ed.visible_rows = 4;
+
+    var renderer = try Renderer.init(std.testing.allocator, 4, 20);
+    defer renderer.deinit();
+
+    _ = renderer.paintFrame(&ed);
+
+    // No gutter, so character cells start at column 0.
+    try std.testing.expectEqual(@as(u21, '#'), renderer.cellAt(0, 0).char);
+    try std.testing.expectEqual(@as(u21, ' '), renderer.cellAt(0, 1).char);
+    try std.testing.expectEqual(@as(u21, 0x2500), renderer.cellAt(0, 2).char);
+    // The cell that USED to receive a continuation byte (0x94) must now
+    // be untouched (a space from the initial clear).
+    try std.testing.expectEqual(@as(u21, ' '), renderer.cellAt(0, 3).char);
+}
+
+fn bgEq(a: Color, b: Color) bool {
+    return colorEq(a, b);
+}
+
+test "selection highlights character cells" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+    cfg.word_wrap = false;
+    cfg.right_margin = 0;
+    cfg.cursor_line_bg = false;
+    cfg.trailing_whitespace = false;
+
+    var ed = editor_mod.Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "hello\n");
+    ed.visible_cols = 20;
+    ed.visible_rows = 4;
+
+    // Anchor at byte 0, cursor at byte 3 — selection covers "hel".
+    ed.sel_active = true;
+    ed.sel_anchor_line = 0;
+    ed.sel_anchor_col = 0;
+    ed.cursor.line = 0;
+    ed.cursor.col = 3;
+
+    var renderer = try Renderer.init(std.testing.allocator, 4, 20);
+    defer renderer.deinit();
+
+    _ = renderer.paintFrame(&ed);
+
+    const sel_color = cfg.theme.selection;
+    try std.testing.expect(bgEq(renderer.cellAt(0, 0).bg, sel_color));
+    try std.testing.expect(bgEq(renderer.cellAt(0, 1).bg, sel_color));
+    try std.testing.expect(bgEq(renderer.cellAt(0, 2).bg, sel_color));
+    // Cell after the selection must NOT have selection bg.
+    try std.testing.expect(!bgEq(renderer.cellAt(0, 3).bg, sel_color));
+}
+
+test "selection highlight covers tab expansion" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+    cfg.word_wrap = false;
+    cfg.right_margin = 0;
+    cfg.cursor_line_bg = false;
+    cfg.trailing_whitespace = false;
+    // Default tab_width is 4.
+
+    var ed = editor_mod.Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // "a\tb\n" — 'a' at vis 0, tab fills vis 1..3 (4 cells: cols 1..3),
+    // then 'b' at vis 4. Selection covering bytes 0..3 (a, tab, b)
+    // means the tab cells must inherit the selection bg.
+    try ed.buf.insert(0, "a\tb\n");
+    ed.visible_cols = 20;
+    ed.visible_rows = 4;
+
+    ed.sel_active = true;
+    ed.sel_anchor_line = 0;
+    ed.sel_anchor_col = 0;
+    ed.cursor.line = 0;
+    ed.cursor.col = 3;
+
+    var renderer = try Renderer.init(std.testing.allocator, 4, 20);
+    defer renderer.deinit();
+
+    _ = renderer.paintFrame(&ed);
+
+    const sel = cfg.theme.selection;
+    try std.testing.expect(bgEq(renderer.cellAt(0, 0).bg, sel)); // 'a'
+    try std.testing.expect(bgEq(renderer.cellAt(0, 1).bg, sel)); // tab cell 1
+    try std.testing.expect(bgEq(renderer.cellAt(0, 2).bg, sel)); // tab cell 2
+    try std.testing.expect(bgEq(renderer.cellAt(0, 3).bg, sel)); // tab cell 3
+    try std.testing.expect(bgEq(renderer.cellAt(0, 4).bg, sel)); // 'b'
 }
