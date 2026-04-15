@@ -211,8 +211,16 @@ pub fn main() !void {
         const key = try term.readKey();
         if (key == .none) {
             // term.readKey has a ~100ms timeout; each .none return is
-            // roughly one quiet tick. Use this as our idle accumulator,
-            // and attempt an auto-apply when all gates are satisfied.
+            // roughly one quiet tick. Use this to drive drag
+            // autoscroll (the terminal only sends drag events when
+            // the pointer moves, so a stationary drag at the
+            // viewport edge would otherwise freeze) and for the idle
+            // auto-update accumulator.
+            if (ed.is_dragging) {
+                _ = ed.dragAutoscrollTick();
+                // Fall through so the top of the loop repaints.
+                continue;
+            }
             idle_ms += 100;
             if (update_mod.canAutoApply(&update_state, &ed, &cfg, idle_ms, update_mod.min_idle_ms_default)) {
                 // apply either succeeds (noreturn, process is replaced) or

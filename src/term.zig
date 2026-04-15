@@ -41,6 +41,7 @@ pub const Key = union(enum) {
     scroll_up,
     scroll_down,
     mouse_click: struct { row: u16, col: u16 },
+    mouse_shift_click: struct { row: u16, col: u16 },
     mouse_drag: struct { row: u16, col: u16 },
     mouse_release: struct { row: u16, col: u16 },
     shift_up,
@@ -49,6 +50,10 @@ pub const Key = union(enum) {
     shift_right,
     shift_home,
     shift_end,
+    ctrl_word_left,
+    ctrl_word_right,
+    ctrl_shift_left,
+    ctrl_shift_right,
     ctrl: u8,
     f1,
     help, // Ctrl+/ or Ctrl+Shift+?
@@ -370,11 +375,13 @@ fn parseExtended(buf: []const u8) Key {
     // ESC [ 1 1 ~ = F1
     if (buf[2] == '1' and buf.len >= 5 and buf[3] == '1' and buf[4] == '~') return .f1;
 
-    // ESC [ 1 ; 5 C = ctrl+right, ESC [ 1 ; 5 D = ctrl+left
+    // ESC [ 1 ; 5 C/D = ctrl+right/left. Emit distinct word-jump
+    // keys so handleCtrl's 'f' (search) doesn't swallow a ctrl+right
+    // intended for word navigation.
     if (buf[2] == '1' and buf.len >= 6 and buf[3] == ';' and buf[4] == '5') {
         return switch (buf[5]) {
-            'C' => .{ .ctrl = 'f' }, // ctrl+right -> word forward
-            'D' => .{ .ctrl = 'b' }, // ctrl+left -> word backward
+            'C' => .ctrl_word_right,
+            'D' => .ctrl_word_left,
             else => .unknown,
         };
     }
@@ -390,6 +397,16 @@ fn parseExtended(buf: []const u8) Key {
             'D' => .shift_left,
             'H' => .shift_home,
             'F' => .shift_end,
+            else => .unknown,
+        };
+    }
+
+    // ESC [ 1 ; 6 C/D = ctrl+shift+right/left (xterm modifier 6 =
+    // ctrl+shift). Used for word-wise selection extension.
+    if (buf[2] == '1' and buf.len >= 6 and buf[3] == ';' and buf[4] == '6') {
+        return switch (buf[5]) {
+            'C' => .ctrl_shift_right,
+            'D' => .ctrl_shift_left,
             else => .unknown,
         };
     }
@@ -459,9 +476,23 @@ fn parseSgrMouse(buf: []const u8) Key {
         }
     }
 
+    // SGR encodes modifier bits on the button: shift=4, meta=8,
+    // ctrl=16. Left-click with shift held is button 0 | 4 = 4. Emit
+    // a distinct key so the editor can extend the existing selection
+    // anchor instead of starting a new click.
+    if (button == 4) {
+        if (is_press) {
+            return .{ .mouse_shift_click = .{ .row = row, .col = col } };
+        } else {
+            return .{ .mouse_release = .{ .row = row, .col = col } };
+        }
+    }
+
     // Mode 1002 reports left-button drag motion as button 32. Buttons
-    // 33/34 (middle/right drag) are intentionally ignored.
-    if (button == 32) {
+    // 33/34 (middle/right drag) are intentionally ignored. Button 36
+    // is a shift-held drag (32 | 4); treat it the same as a plain
+    // drag so selection extension works after a shift+click.
+    if (button == 32 or button == 36) {
         return .{ .mouse_drag = .{ .row = row, .col = col } };
     }
 

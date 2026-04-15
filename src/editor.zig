@@ -77,6 +77,27 @@ pub const Editor = struct {
     sel_anchor_line: usize = 0,
     sel_anchor_col: usize = 0,
 
+    // Click-count state for double/triple-click word/line selection.
+    // A click within CLICK_TIMEOUT_MS at the same buffer line+col
+    // bumps the count. We use buffer position (not screen position)
+    // so mid-sequence scrolling or autoscroll doesn't break the
+    // streak.
+    last_click_ms: i64 = 0,
+    last_click_line: usize = 0,
+    last_click_col: usize = 0,
+    click_count: u8 = 0,
+
+    // Drag state for autoscroll-past-viewport-edge. `is_dragging` is
+    // true between a mouse_click/shift_click and the matching release.
+    // `has_dragged` is only set once an actual mouse_drag event has
+    // been delivered — this prevents a double/triple-click at row 0
+    // (which sets is_dragging and sel_active but never moved) from
+    // spuriously scrolling the view on the next idle tick.
+    is_dragging: bool = false,
+    has_dragged: bool = false,
+    last_drag_row_raw: u16 = 0,
+    last_drag_col_raw: u16 = 0,
+
     matching_bracket_pos: ?LineCol = null,
 
     file_mtime: ?i128 = null,
@@ -368,6 +389,26 @@ pub const Editor = struct {
                 self.moveCursorToLineEnd();
                 return .redraw;
             },
+            .ctrl_word_left => {
+                self.sel_active = false;
+                self.moveCursorWordLeft();
+                return .redraw;
+            },
+            .ctrl_word_right => {
+                self.sel_active = false;
+                self.moveCursorWordRight();
+                return .redraw;
+            },
+            .ctrl_shift_left => {
+                self.extendOrStartSelection();
+                self.moveCursorWordLeft();
+                return .redraw;
+            },
+            .ctrl_shift_right => {
+                self.extendOrStartSelection();
+                self.moveCursorWordRight();
+                return .redraw;
+            },
             .page_up => {
                 const amount = if (self.visible_rows > 2) self.visible_rows - 2 else 1;
                 self.moveCursorUp(amount);
@@ -397,6 +438,10 @@ pub const Editor = struct {
             },
             .mouse_click => |pos| {
                 self.handleMouseClick(pos.row, pos.col);
+                return .redraw;
+            },
+            .mouse_shift_click => |pos| {
+                self.handleMouseShiftClick(pos.row, pos.col);
                 return .redraw;
             },
             .mouse_drag => |pos| {
@@ -724,6 +769,10 @@ pub const Editor = struct {
     /// spaces, then after punctuation/operators, then hard-break.
     pub const MAX_WRAP_BREAKS = 256;
 
+    /// Maximum delay in ms between clicks for them to count as a
+    /// double/triple click. 400ms is the common desktop default.
+    pub const CLICK_TIMEOUT_MS: i64 = 400;
+
     pub fn computeWrapBreaks(self: *Editor, line: usize, breaks: *[MAX_WRAP_BREAKS]usize) usize {
         breaks[0] = 0;
         if (!self.config.word_wrap) return 1;
@@ -928,6 +977,105 @@ pub const Editor = struct {
         self.updateBracketMatch();
     }
 
+    /// Move cursor one word to the right. Skips any trailing non-word
+    /// bytes at the cursor position, then skips word bytes, landing
+    /// just past the next word's end. Crosses line boundaries by
+    /// advancing to the start of the next line when stuck at EOL.
+    /// Non-ASCII bytes are treated as non-word (matching the existing
+    /// Ctrl+D multi-cursor word logic).
+    fn moveCursorWordRight(self: *Editor) void {
+        var line = self.cursor.line;
+        var col = self.cursor.col;
+
+        // If already at EOL, jump to next line.
+        const cur_len0 = self.currentLineLenAt(line);
+        if (col >= cur_len0) {
+            if (line + 1 < self.buf.lineCount()) {
+                line += 1;
+                col = 0;
+                self.cursor.line = line;
+                self.cursor.col = col;
+                self.cursor.col_want = col;
+                self.ensureCursorVisible();
+                self.updateBracketMatch();
+                return;
+            }
+            return;
+        }
+
+        var tmp: [4096]u8 = undefined;
+        const info = self.buf.getLine(line) orelse return;
+        const data = self.buf.contiguousSlice(info.start, @min(info.len, 4096), &tmp);
+
+        // Skip non-word bytes first (whitespace, punctuation,
+        // non-ASCII). Walk by codepoint so we don't split multi-byte
+        // sequences.
+        while (col < data.len and !isWordChar(data[col])) {
+            col += self.codepointLenAt(line, col);
+        }
+        // Then skip the word itself.
+        while (col < data.len and isWordChar(data[col])) {
+            col += 1;
+        }
+
+        self.cursor.line = line;
+        self.cursor.col = col;
+        self.cursor.col_want = col;
+        self.ensureCursorVisible();
+        self.updateBracketMatch();
+    }
+
+    /// Move cursor one word to the left. Skips any immediately
+    /// preceding non-word bytes, then skips word bytes backward,
+    /// landing at the start of that word. Crosses line boundaries to
+    /// the end of the previous line when at col 0.
+    fn moveCursorWordLeft(self: *Editor) void {
+        var line = self.cursor.line;
+        var col = self.cursor.col;
+
+        if (col == 0) {
+            if (line == 0) return;
+            line -= 1;
+            col = self.currentLineLenAt(line);
+            self.cursor.line = line;
+            self.cursor.col = col;
+            self.cursor.col_want = col;
+            self.ensureCursorVisible();
+            self.updateBracketMatch();
+            return;
+        }
+
+        var tmp: [4096]u8 = undefined;
+        const info = self.buf.getLine(line) orelse return;
+        const data = self.buf.contiguousSlice(info.start, @min(info.len, 4096), &tmp);
+
+        // Walk backward across any immediately preceding non-word
+        // bytes (the ones between the current cursor and the word
+        // we're jumping into). Step by codepoint so we don't land
+        // inside a multi-byte sequence.
+        while (col > 0 and col - 1 < data.len and !isWordChar(data[col - 1])) {
+            col -= self.prevCodepointLen(line, col);
+        }
+        // Then walk backward over the word itself to its start.
+        while (col > 0 and col - 1 < data.len and isWordChar(data[col - 1])) {
+            col -= 1;
+        }
+
+        self.cursor.line = line;
+        self.cursor.col = col;
+        self.cursor.col_want = col;
+        self.ensureCursorVisible();
+        self.updateBracketMatch();
+    }
+
+    /// Byte length of `line` (excluding any newline). Defaults to 0
+    /// if the line is out of range. Split out so word-movement can
+    /// query a line other than the cursor's current line.
+    fn currentLineLenAt(self: *Editor, line: usize) usize {
+        const info = self.buf.getLine(line) orelse return 0;
+        return info.len;
+    }
+
     /// Length in bytes of the codepoint starting at `byte_col` on `line`.
     /// Returns 1 for ASCII or end-of-line; 2-4 for multi-byte UTF-8.
     fn codepointLenAt(self: *Editor, line: usize, byte_col: usize) usize {
@@ -983,27 +1131,111 @@ pub const Editor = struct {
     }
 
     fn handleMouseClick(self: *Editor, row: u16, col: u16) void {
-        // Clear multi-cursors and any prior selection.
+        // Clear multi-cursors.
         self.cursors.clearRetainingCapacity();
-        self.sel_active = false;
 
         const pos = self.screenToBufferPos(row, col);
+
+        // Click-count tracking for double/triple-click word/line
+        // selection. A click within CLICK_TIMEOUT_MS at the same
+        // buffer position bumps the count; anything else resets it.
+        const now = std.time.milliTimestamp();
+        if (now - self.last_click_ms < CLICK_TIMEOUT_MS and
+            pos.line == self.last_click_line and
+            pos.col == self.last_click_col)
+        {
+            self.click_count = @min(self.click_count + 1, 3);
+        } else {
+            self.click_count = 1;
+        }
+        self.last_click_ms = now;
+        self.last_click_line = pos.line;
+        self.last_click_col = pos.col;
+
+        // Arm drag state for all click counts. `has_dragged` stays
+        // false until a real mouse_drag event arrives, so idle-tick
+        // autoscroll doesn't fire on a bare click at row 0.
+        self.is_dragging = true;
+        self.has_dragged = false;
+        self.last_drag_row_raw = row;
+        self.last_drag_col_raw = col;
+
+        switch (self.click_count) {
+            2 => {
+                self.selectWordAt(pos.line, pos.col);
+            },
+            3 => {
+                self.selectLineAt(pos.line);
+            },
+            else => {
+                // Single click: clear prior selection, move cursor,
+                // pre-arm anchor at click pos. A subsequent drag flips
+                // sel_active = true using this anchor; no drag = no
+                // selection.
+                self.sel_active = false;
+                self.cursor.line = pos.line;
+                self.cursor.col = pos.col;
+                self.cursor.col_want = self.cursor.col;
+                self.sel_anchor_line = pos.line;
+                self.sel_anchor_col = pos.col;
+            },
+        }
+
+        self.updateBracketMatch();
+    }
+
+    fn handleMouseShiftClick(self: *Editor, row: u16, col: u16) void {
+        // Shift+click extends the selection from the existing anchor
+        // (or from the current cursor if no selection is active) to
+        // the click position. Multi-cursors are cleared to match the
+        // plain-click behavior.
+        self.cursors.clearRetainingCapacity();
+
+        // A shift+click always breaks the double/triple-click streak
+        // so the next plain click starts a fresh single-click.
+        self.click_count = 0;
+
+        const pos = self.screenToBufferPos(row, col);
+
+        if (!self.sel_active) {
+            self.sel_anchor_line = self.cursor.line;
+            self.sel_anchor_col = self.cursor.col;
+            self.sel_active = true;
+        }
+
         self.cursor.line = pos.line;
         self.cursor.col = pos.col;
         self.cursor.col_want = self.cursor.col;
 
-        // Pre-arm the selection anchor at the click position. A
-        // subsequent mouse_drag will flip sel_active = true and treat
-        // this as the anchor; if no drag follows, the anchor is simply
-        // unused and discarded on the next click.
-        self.sel_anchor_line = pos.line;
-        self.sel_anchor_col = pos.col;
+        // A shift+click may be followed by a drag (button 36 in SGR
+        // mouse); arm drag state so the drag extends the selection
+        // smoothly and triggers autoscroll past viewport edges. Like
+        // a plain click, has_dragged stays false until a real
+        // mouse_drag event arrives.
+        self.is_dragging = true;
+        self.has_dragged = false;
+        self.last_drag_row_raw = row;
+        self.last_drag_col_raw = col;
 
         self.updateBracketMatch();
     }
 
     fn handleMouseDrag(self: *Editor, row: u16, col: u16) void {
-        const pos = self.screenToBufferPos(row, col);
+        // Store the raw coordinates for autoscroll tick logic before
+        // clamping. Mode-1002 terminals only send drag events when
+        // the pointer moves, so a stationary pointer at the viewport
+        // edge still needs the idle-tick autoscroll to keep
+        // extending the selection.
+        self.last_drag_row_raw = row;
+        self.last_drag_col_raw = col;
+        self.is_dragging = true;
+        self.has_dragged = true;
+
+        // Any drag breaks a double/triple-click streak.
+        self.click_count = 0;
+
+        const clamped = self.clampDragToView(row, col);
+        const pos = self.screenToBufferPos(clamped.row, clamped.col);
         // First drag motion since the click flips sel_active on. The
         // anchor was set in handleMouseClick so getSelectionRange has a
         // valid starting point.
@@ -1017,6 +1249,8 @@ pub const Editor = struct {
     fn handleMouseRelease(self: *Editor, row: u16, col: u16) void {
         _ = row;
         _ = col;
+        self.is_dragging = false;
+        self.has_dragged = false;
         // If the user clicked without dragging, the anchor and cursor
         // collapse to the same position — discard the empty selection
         // so a single click doesn't leave a phantom selected range.
@@ -1027,12 +1261,144 @@ pub const Editor = struct {
         }
     }
 
+    /// Clamp a raw mouse (row, col) to the editable viewport so
+    /// screenToBufferPos always gets an in-bounds cell. Used by drag
+    /// handling so the selection endpoint tracks the viewport edge
+    /// while the pointer sits outside it.
+    fn clampDragToView(self: *Editor, row: u16, col: u16) struct { row: u16, col: u16 } {
+        const max_row: u16 = if (self.visible_rows >= 2) self.visible_rows - 2 else 0;
+        const clamped_row = @min(row, max_row);
+        const max_col: u16 = if (self.visible_cols > 0) self.visible_cols - 1 else 0;
+        const clamped_col = @min(col, max_col);
+        return .{ .row = clamped_row, .col = clamped_col };
+    }
+
+    /// Called from the main loop on idle ticks while `is_dragging`
+    /// is true. If the last raw drag coordinate sits at the viewport
+    /// edge, scroll in that direction by one row/col and re-run the
+    /// drag at the edge so the selection keeps growing. Returns true
+    /// when something scrolled, so the caller can force a redraw.
+    ///
+    /// Gated on `has_dragged` — a stationary click with no drag
+    /// never autoscrolls even if it happened at row 0 / the last row.
+    pub fn dragAutoscrollTick(self: *Editor) bool {
+        if (!self.is_dragging or !self.has_dragged) return false;
+
+        var scrolled = false;
+        const row = self.last_drag_row_raw;
+        const col = self.last_drag_col_raw;
+
+        // Editable region is rows [0, visible_rows - 2]. The last
+        // row (visible_rows - 1) is the status bar.
+        const max_editable_row: u16 = if (self.visible_rows >= 2) self.visible_rows - 2 else 0;
+
+        // Vertical: row == 0 with content above → scroll up;
+        // row >= max_editable_row with content below → scroll down.
+        if (row == 0 and self.scroll_top > 0) {
+            self.scroll_top -= 1;
+            scrolled = true;
+        } else if (row >= max_editable_row) {
+            const line_count = self.buf.lineCount();
+            const visible_editable: usize = if (self.visible_rows >= 2)
+                @as(usize, self.visible_rows - 1)
+            else
+                1;
+            if (line_count > visible_editable and
+                self.scroll_top + visible_editable < line_count)
+            {
+                self.scroll_top += 1;
+                scrolled = true;
+            }
+        }
+
+        // Horizontal autoscroll (non-wrap mode only). The editable
+        // column range starts after the gutter + centering offset.
+        if (!self.config.word_wrap) {
+            const total_offset: u16 = self.centerOffset() + self.gutterWidth();
+            const max_col: u16 = if (self.visible_cols > 0) self.visible_cols - 1 else 0;
+
+            if (col <= total_offset and self.scroll_left > 0) {
+                self.scroll_left -= 1;
+                scrolled = true;
+            } else if (col >= max_col) {
+                self.scroll_left += 1;
+                scrolled = true;
+            }
+        }
+
+        if (!scrolled) return false;
+
+        // Re-run the drag at the (already in-range) pointer position
+        // so the selection endpoint follows the newly-scrolled edge.
+        // We deliberately don't update last_drag_*_raw — the next
+        // idle tick will keep scrolling if the pointer is still at
+        // the edge.
+        const pos = self.screenToBufferPos(row, col);
+        self.cursor.line = pos.line;
+        self.cursor.col = pos.col;
+        self.cursor.col_want = self.cursor.col;
+        self.updateBracketMatch();
+        return true;
+    }
+
+    /// Select the word under `col` on `line`. If the byte at `col` is
+    /// a word character, walk forward and backward to find the word
+    /// bounds; otherwise select just the single codepoint at `col`.
+    /// Sets sel_active = true with anchor at word start and cursor
+    /// at word end.
+    fn selectWordAt(self: *Editor, line: usize, col: usize) void {
+        const bounds = self.wordBoundsAt(line, col);
+        self.sel_anchor_line = line;
+        self.sel_anchor_col = bounds.start;
+        self.sel_active = true;
+        self.cursor.line = line;
+        self.cursor.col = bounds.end;
+        self.cursor.col_want = self.cursor.col;
+    }
+
+    /// Select the entire line. Anchor at column 0, cursor at the
+    /// line's byte length (excluding the newline).
+    fn selectLineAt(self: *Editor, line: usize) void {
+        const info = self.buf.getLine(line) orelse return;
+        self.sel_anchor_line = line;
+        self.sel_anchor_col = 0;
+        self.sel_active = true;
+        self.cursor.line = line;
+        self.cursor.col = info.len;
+        self.cursor.col_want = self.cursor.col;
+    }
+
+    /// Walk the byte span of the word containing `col`. If `col` is
+    /// on a word byte (ASCII alphanumeric or underscore), expand in
+    /// both directions across word bytes. Otherwise return the span
+    /// of the single codepoint at `col` so double-clicking punctuation
+    /// still gives a one-glyph highlight.
+    fn wordBoundsAt(self: *Editor, line: usize, col: usize) struct { start: usize, end: usize } {
+        const info = self.buf.getLine(line) orelse return .{ .start = 0, .end = 0 };
+        var tmp: [4096]u8 = undefined;
+        const data = self.buf.contiguousSlice(info.start, @min(info.len, 4096), &tmp);
+        const c = @min(col, data.len);
+
+        if (c >= data.len or !isWordChar(data[c])) {
+            // Non-word or end-of-line: select the single codepoint at
+            // col, or a zero-width span if we're past the line end.
+            if (c >= data.len) return .{ .start = c, .end = c };
+            const cp_len = self.codepointLenAt(line, c);
+            return .{ .start = c, .end = c + cp_len };
+        }
+
+        var start = c;
+        while (start > 0 and isWordChar(data[start - 1])) start -= 1;
+        var end = c;
+        while (end < data.len and isWordChar(data[end])) end += 1;
+        return .{ .start = start, .end = end };
+    }
+
     /// Convert a (screen_row, screen_col) cell coordinate into a
     /// (buffer_line, buffer_col) position. Accounts for the gutter,
-    /// centering offset, and horizontal scroll. Tab expansion and
-    /// multi-byte visual width are NOT accounted for — pre-existing
-    /// limitation shared with handleMouseClick. Clamps row to the
-    /// buffer's last line and col to the line's byte length.
+    /// centering offset, horizontal scroll, tab expansion, and
+    /// multi-byte UTF-8 codepoints. Clamps row to the buffer's last
+    /// line and col to the line's byte length.
     fn screenToBufferPos(self: *Editor, row: u16, col: u16) struct { line: usize, col: usize } {
         const max_line = if (self.buf.lineCount() > 0) self.buf.lineCount() - 1 else 0;
         const target_line = @min(self.scroll_top + row, max_line);
@@ -1041,14 +1407,17 @@ pub const Editor = struct {
         const gutter_width = self.gutterWidth();
         const total_offset = c_offset + gutter_width;
 
-        var target_col: usize = if (col >= total_offset)
+        // `scroll_left` is tracked in visual columns (the renderer at
+        // render.zig uses it as a visual-column threshold), so we add
+        // it to the screen-cell column to get an absolute visual
+        // column within the line, then reverse tab/multi-byte
+        // expansion to land on the correct byte offset.
+        const visual_col: usize = if (col >= total_offset)
             @as(usize, col - total_offset) + self.scroll_left
         else
             0;
 
-        if (self.buf.getLine(target_line)) |li| {
-            if (target_col > li.len) target_col = li.len;
-        }
+        const target_col = self.visualColToByteCol(target_line, visual_col);
 
         return .{ .line = target_line, .col = target_col };
     }
@@ -1176,6 +1545,45 @@ pub const Editor = struct {
             }
         }
         return visual;
+    }
+
+    /// Inverse of `byteColToVisualCol`. Given a visual column on
+    /// `line`, walk the line bytes accumulating visual width until we
+    /// reach or pass `target_visual`, and return the byte offset of
+    /// the codepoint whose visual span contains the target. Snaps
+    /// left for clicks inside a tab cell (returns the byte position
+    /// of the tab itself) and for the interior bytes of a multi-byte
+    /// UTF-8 sequence. If `target_visual` is past the line's visual
+    /// end, returns the line's byte length.
+    pub fn visualColToByteCol(self: *Editor, line: usize, target_visual: usize) usize {
+        const info = self.buf.getLine(line) orelse return 0;
+        var tmp: [8192]u8 = undefined;
+        const data = self.buf.contiguousSlice(info.start, @min(info.len, 8192), &tmp);
+        const tw = self.effectiveTabWidth();
+        var visual: usize = 0;
+        var i: usize = 0;
+        while (i < data.len) {
+            const b = data[i];
+            if (b == '\t') {
+                const next_visual = visual + (tw - (visual % tw));
+                if (target_visual < next_visual) return i;
+                visual = next_visual;
+                i += 1;
+            } else if (b < 0x80) {
+                if (target_visual <= visual) return i;
+                visual += 1;
+                i += 1;
+            } else if (unicode.isContByte(b)) {
+                // Defensive: landed inside a multi-byte sequence.
+                i += 1;
+            } else {
+                if (target_visual <= visual) return i;
+                const r = unicode.decode(data[i..]);
+                visual += 1;
+                i += @max(@as(usize, r.len), 1);
+            }
+        }
+        return info.len;
     }
 
     /// Visual-column version of `cursorColInSubLine`. Accounts for tab
@@ -2810,4 +3218,435 @@ test "mouse drag past viewport clamps to last line" {
     _ = ed.handleKey(.{ .mouse_drag = .{ .row = 99, .col = 0 } });
     try std.testing.expect(ed.sel_active);
     try std.testing.expect(ed.cursor.line <= ed.buf.lineCount());
+}
+
+// ── visualColToByteCol ──
+
+test "visualColToByteCol identity on ASCII" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "abcdef\n");
+    try std.testing.expectEqual(@as(usize, 0), ed.visualColToByteCol(0, 0));
+    try std.testing.expectEqual(@as(usize, 3), ed.visualColToByteCol(0, 3));
+    try std.testing.expectEqual(@as(usize, 6), ed.visualColToByteCol(0, 6));
+    // Past the end clamps to info.len.
+    try std.testing.expectEqual(@as(usize, 6), ed.visualColToByteCol(0, 99));
+}
+
+test "visualColToByteCol snaps inside tab to tab byte" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // Default tab_width is 4. "\tabc" → tab covers visual 0..3,
+    // 'a' at 4, 'b' at 5, 'c' at 6.
+    try ed.buf.insert(0, "\tabc\n");
+
+    // Visual cols 0..3 all fall inside the tab cell → snap to byte 0.
+    try std.testing.expectEqual(@as(usize, 0), ed.visualColToByteCol(0, 0));
+    try std.testing.expectEqual(@as(usize, 0), ed.visualColToByteCol(0, 1));
+    try std.testing.expectEqual(@as(usize, 0), ed.visualColToByteCol(0, 3));
+    try std.testing.expectEqual(@as(usize, 1), ed.visualColToByteCol(0, 4)); // 'a'
+    try std.testing.expectEqual(@as(usize, 3), ed.visualColToByteCol(0, 6)); // 'c'
+}
+
+test "visualColToByteCol handles multi-byte codepoints" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // "a─b" — 'a' visual 0, ─ (3 bytes) visual 1, 'b' visual 2.
+    try ed.buf.insert(0, "a\xE2\x94\x80b\n");
+
+    try std.testing.expectEqual(@as(usize, 0), ed.visualColToByteCol(0, 0));
+    try std.testing.expectEqual(@as(usize, 1), ed.visualColToByteCol(0, 1)); // ─ start
+    try std.testing.expectEqual(@as(usize, 4), ed.visualColToByteCol(0, 2)); // 'b'
+    try std.testing.expectEqual(@as(usize, 5), ed.visualColToByteCol(0, 3)); // EOL
+}
+
+test "screenToBufferPos clicks past tab land on next char" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // "\tabc": with tab_width=4, visual col 4 is 'a'. Clicking at
+    // screen col 4 used to land on byte 4 (past "abc"); should now
+    // land on byte 1 ('a').
+    try ed.buf.insert(0, "\tabc\n");
+    ed.visible_cols = 80;
+    ed.visible_rows = 10;
+
+    _ = ed.handleKey(.{ .mouse_click = .{ .row = 0, .col = 4 } });
+    try std.testing.expectEqual(@as(usize, 1), ed.cursor.col);
+
+    // Clicking at col 5 → 'b' (byte 2).
+    _ = ed.handleKey(.{ .mouse_click = .{ .row = 0, .col = 5 } });
+    try std.testing.expectEqual(@as(usize, 2), ed.cursor.col);
+
+    // Clicking inside the tab (col 2) snaps to the tab byte (0).
+    _ = ed.handleKey(.{ .mouse_click = .{ .row = 0, .col = 2 } });
+    try std.testing.expectEqual(@as(usize, 0), ed.cursor.col);
+}
+
+test "screenToBufferPos clicks past multi-byte land correctly" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // "a─b" — 'a' visual 0, ─ visual 1, 'b' visual 2.
+    try ed.buf.insert(0, "a\xE2\x94\x80b\n");
+    ed.visible_cols = 80;
+    ed.visible_rows = 10;
+
+    _ = ed.handleKey(.{ .mouse_click = .{ .row = 0, .col = 2 } });
+    // Should land on 'b' at byte 4, not byte 2 (inside the ─).
+    try std.testing.expectEqual(@as(usize, 4), ed.cursor.col);
+}
+
+// ── Selection: shift+click and double/triple click ──
+
+test "shift+click without selection anchors at current cursor" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "abcdefghij\n");
+    ed.visible_cols = 80;
+    ed.cursor.line = 0;
+    ed.cursor.col = 2;
+
+    _ = ed.handleKey(.{ .mouse_shift_click = .{ .row = 0, .col = 6 } });
+
+    try std.testing.expect(ed.sel_active);
+    try std.testing.expectEqual(@as(usize, 2), ed.sel_anchor_col);
+    try std.testing.expectEqual(@as(usize, 6), ed.cursor.col);
+    const sr = ed.getSelectionRange().?;
+    try std.testing.expectEqual(@as(usize, 4), sr.len);
+}
+
+test "shift+click extends existing selection from original anchor" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "abcdefghij\n");
+    ed.visible_cols = 80;
+    ed.cursor.line = 0;
+    ed.cursor.col = 1;
+
+    // Build an initial 3-char selection via shift+right.
+    _ = ed.handleKey(.shift_right);
+    _ = ed.handleKey(.shift_right);
+    _ = ed.handleKey(.shift_right);
+    try std.testing.expect(ed.sel_active);
+    try std.testing.expectEqual(@as(usize, 1), ed.sel_anchor_col);
+    try std.testing.expectEqual(@as(usize, 4), ed.cursor.col);
+
+    // Shift+click further right — anchor must not move.
+    _ = ed.handleKey(.{ .mouse_shift_click = .{ .row = 0, .col = 8 } });
+    try std.testing.expectEqual(@as(usize, 1), ed.sel_anchor_col);
+    try std.testing.expectEqual(@as(usize, 8), ed.cursor.col);
+}
+
+test "double click selects word" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "foo bar baz\n");
+    ed.visible_cols = 80;
+
+    _ = ed.handleKey(.{ .mouse_click = .{ .row = 0, .col = 5 } });
+    _ = ed.handleKey(.{ .mouse_click = .{ .row = 0, .col = 5 } });
+
+    try std.testing.expect(ed.sel_active);
+    try std.testing.expectEqual(@as(usize, 4), ed.sel_anchor_col);
+    try std.testing.expectEqual(@as(usize, 7), ed.cursor.col);
+}
+
+test "double click on punctuation selects single char" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "foo,bar\n");
+    ed.visible_cols = 80;
+
+    // Click on the comma (col 3).
+    _ = ed.handleKey(.{ .mouse_click = .{ .row = 0, .col = 3 } });
+    _ = ed.handleKey(.{ .mouse_click = .{ .row = 0, .col = 3 } });
+
+    try std.testing.expect(ed.sel_active);
+    const sr = ed.getSelectionRange().?;
+    try std.testing.expectEqual(@as(usize, 1), sr.len);
+}
+
+test "triple click selects line" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "first line\nsecond line\n");
+    ed.visible_cols = 80;
+
+    _ = ed.handleKey(.{ .mouse_click = .{ .row = 1, .col = 3 } });
+    _ = ed.handleKey(.{ .mouse_click = .{ .row = 1, .col = 3 } });
+    _ = ed.handleKey(.{ .mouse_click = .{ .row = 1, .col = 3 } });
+
+    try std.testing.expect(ed.sel_active);
+    try std.testing.expectEqual(@as(usize, 1), ed.sel_anchor_line);
+    try std.testing.expectEqual(@as(usize, 0), ed.sel_anchor_col);
+    try std.testing.expectEqual(@as(usize, 11), ed.cursor.col); // "second line".len
+}
+
+test "click count resets on different position" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "foo bar\n");
+    ed.visible_cols = 80;
+
+    _ = ed.handleKey(.{ .mouse_click = .{ .row = 0, .col = 1 } });
+    _ = ed.handleKey(.{ .mouse_click = .{ .row = 0, .col = 5 } });
+
+    // Second click at a different buffer col → count resets to 1,
+    // no word selection.
+    try std.testing.expect(!ed.sel_active);
+    try std.testing.expectEqual(@as(usize, 5), ed.cursor.col);
+}
+
+// ── Selection: word-wise keyboard ──
+
+test "ctrl_shift_right extends selection to next word" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "foo bar baz\n");
+    ed.cursor.line = 0;
+    ed.cursor.col = 0;
+
+    _ = ed.handleKey(.ctrl_shift_right);
+    try std.testing.expect(ed.sel_active);
+    // From col 0 ('f'): skip no non-word, skip "foo" → col 3.
+    try std.testing.expectEqual(@as(usize, 3), ed.cursor.col);
+
+    _ = ed.handleKey(.ctrl_shift_right);
+    // Skip " " → skip "bar" → col 7.
+    try std.testing.expectEqual(@as(usize, 7), ed.cursor.col);
+    try std.testing.expectEqual(@as(usize, 0), ed.sel_anchor_col);
+}
+
+test "ctrl_shift_left at BOF is noop" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "foo bar\n");
+    ed.cursor.line = 0;
+    ed.cursor.col = 0;
+
+    _ = ed.handleKey(.ctrl_shift_left);
+    try std.testing.expectEqual(@as(usize, 0), ed.cursor.col);
+    try std.testing.expectEqual(@as(usize, 0), ed.cursor.line);
+}
+
+test "ctrl_word_right crosses line boundary at EOL" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "foo\nbar\n");
+    ed.cursor.line = 0;
+    ed.cursor.col = 3; // At EOL of "foo"
+
+    _ = ed.handleKey(.ctrl_word_right);
+    try std.testing.expectEqual(@as(usize, 1), ed.cursor.line);
+    try std.testing.expectEqual(@as(usize, 0), ed.cursor.col);
+}
+
+test "ctrl_word_right does not trigger search" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "foo bar\n");
+    ed.cursor.line = 0;
+    ed.cursor.col = 0;
+
+    _ = ed.handleKey(.ctrl_word_right);
+    // Must stay in normal mode — regression guard against the old
+    // ctrl+right → .{ .ctrl = 'f' } → search-mode wiring.
+    try std.testing.expectEqual(Mode.normal, ed.mode);
+    try std.testing.expectEqual(@as(usize, 3), ed.cursor.col);
+}
+
+test "moveCursorWordLeft from mid-word goes to word start" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "foo bar\n");
+    ed.cursor.line = 0;
+    ed.cursor.col = 6; // mid "bar"
+
+    _ = ed.handleKey(.ctrl_word_left);
+    try std.testing.expectEqual(@as(usize, 4), ed.cursor.col);
+}
+
+test "moveCursorWordLeft from space skips non-word then word" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "foo bar\n");
+    ed.cursor.line = 0;
+    ed.cursor.col = 4; // just before 'b' in "bar"
+
+    _ = ed.handleKey(.ctrl_word_left);
+    try std.testing.expectEqual(@as(usize, 0), ed.cursor.col);
+}
+
+// ── Drag autoscroll ──
+
+test "dragAutoscrollTick noop when not dragging" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "abc\n");
+    ed.visible_rows = 10;
+    ed.visible_cols = 80;
+    ed.scroll_top = 0;
+
+    try std.testing.expect(!ed.dragAutoscrollTick());
+    try std.testing.expectEqual(@as(usize, 0), ed.scroll_top);
+}
+
+test "dragAutoscrollTick scrolls down at bottom edge" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // 20 lines so scrolling is possible with visible_rows = 10.
+    var buf: [128]u8 = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        buf[n] = 'a' + @as(u8, @intCast(i % 26));
+        buf[n + 1] = '\n';
+        n += 2;
+    }
+    try ed.buf.insert(0, buf[0..n]);
+
+    ed.visible_rows = 10;
+    ed.visible_cols = 80;
+
+    // Click on last editable row (row 8 = visible_rows - 2).
+    _ = ed.handleKey(.{ .mouse_click = .{ .row = 8, .col = 0 } });
+    _ = ed.handleKey(.{ .mouse_drag = .{ .row = 8, .col = 1 } });
+    try std.testing.expect(ed.sel_active);
+    try std.testing.expectEqual(@as(usize, 0), ed.scroll_top);
+
+    // Autoscroll tick should advance scroll_top by 1.
+    try std.testing.expect(ed.dragAutoscrollTick());
+    try std.testing.expectEqual(@as(usize, 1), ed.scroll_top);
+}
+
+test "dragAutoscrollTick scrolls up at top edge and clamps" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    var buf: [128]u8 = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        buf[n] = 'a' + @as(u8, @intCast(i % 26));
+        buf[n + 1] = '\n';
+        n += 2;
+    }
+    try ed.buf.insert(0, buf[0..n]);
+    ed.visible_rows = 10;
+    ed.visible_cols = 80;
+    ed.scroll_top = 5;
+
+    _ = ed.handleKey(.{ .mouse_click = .{ .row = 0, .col = 0 } });
+    _ = ed.handleKey(.{ .mouse_drag = .{ .row = 0, .col = 1 } });
+    try std.testing.expect(ed.sel_active);
+
+    // One tick scrolls up by 1.
+    try std.testing.expect(ed.dragAutoscrollTick());
+    try std.testing.expectEqual(@as(usize, 4), ed.scroll_top);
+
+    // Run enough ticks to reach scroll_top = 0, then one more must
+    // be a no-op clamped at 0.
+    _ = ed.dragAutoscrollTick();
+    _ = ed.dragAutoscrollTick();
+    _ = ed.dragAutoscrollTick();
+    _ = ed.dragAutoscrollTick();
+    try std.testing.expectEqual(@as(usize, 0), ed.scroll_top);
+    try std.testing.expect(!ed.dragAutoscrollTick());
+}
+
+test "mouse release clears is_dragging" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "abcdef\n");
+    ed.visible_cols = 80;
+
+    _ = ed.handleKey(.{ .mouse_click = .{ .row = 0, .col = 0 } });
+    try std.testing.expect(ed.is_dragging);
+
+    _ = ed.handleKey(.{ .mouse_release = .{ .row = 0, .col = 0 } });
+    try std.testing.expect(!ed.is_dragging);
 }
