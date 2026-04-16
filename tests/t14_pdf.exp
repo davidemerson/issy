@@ -8,12 +8,14 @@ source "$test_dir/helpers.tcl"
 
 set tmpdir [exec mktemp -d]
 
-# We need a font file. Check if one exists at a known location.
+# We need a real TTF or OTF (not a TTC collection — issy's PDF writer
+# doesn't unpack TTC). CI macos-test pre-downloads a TTF to /tmp/issy-test-font.ttf.
+# Linux runners have DejaVu installed by default.
 set font_paths [list \
+    "/tmp/issy-test-font.ttf" \
     "/Users/david/bmv.ttf" \
     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf" \
     "/usr/share/fonts/TTF/DejaVuSansMono.ttf" \
-    "/System/Library/Fonts/Menlo.ttc" \
 ]
 set font_file ""
 foreach fp $font_paths {

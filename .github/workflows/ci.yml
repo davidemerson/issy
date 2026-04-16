@@ -135,6 +135,16 @@ jobs:
         run: |
           ./zig-out/bin/issy --version
           ./zig-out/bin/issy --help
+      - name: Install a TTF for PDF export test
+        # macOS ships /System/Library/Fonts/Menlo.ttc but our PDF
+        # writer doesn't unpack TTC collections. Drop a real TTF at
+        # the path t14_pdf.exp looks for so the PDF export path is
+        # actually exercised (rather than silently skipped).
+        run: |
+          curl -fsSL -o /tmp/issy-test-font.ttf \
+            https://github.com/JetBrains/JetBrainsMono/raw/master/fonts/ttf/JetBrainsMono-Regular.ttf
+          ls -l /tmp/issy-test-font.ttf
+          file /tmp/issy-test-font.ttf
       - name: Integration tests
         # expect ships with macOS
         run: bash tests/run_tests.sh
