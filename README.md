@@ -291,4 +291,4 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full flow, the cache layout, and 
 
 ## License
 
-ISC
+BSD 3-Clause

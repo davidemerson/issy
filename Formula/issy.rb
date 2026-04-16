@@ -1,7 +1,7 @@
 class Issy < Formula
   desc "Minimal text editor that looks like a printed page"
   homepage "https://github.com/davidemerson/issy"
-  license "ISC"
+  license "BSD-3-Clause"
   head "https://github.com/davidemerson/issy.git", branch: "main"
 
   # Use zig@0.15 (not the unversioned `zig` formula, which is a moving

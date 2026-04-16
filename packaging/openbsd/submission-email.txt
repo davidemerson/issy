@@ -3,74 +3,53 @@ Subject: NEW: editors/issy
 
 Hello,
 
-I'd like to submit a new port for OpenBSD: editors/issy, a small
-console text editor written in Zig. The source lives at
-https://github.com/davidemerson/issy and is released under the ISC
-license.
+Submitting editors/issy: a small console text editor written in Zig,
+BSD 3-Clause licensed. Source at https://github.com/davidemerson/issy.
 
 What it is:
 
-  issy is a gap-buffer text editor with syntax highlighting for 17
-  languages (including TeX/LaTeX), multi-cursor editing, incremental
-  search, undo/redo, and PDF export via a hand-rolled PDF 1.4 writer
-  with TTF/OTF font embedding. It has no runtime dependencies beyond
-  libc and deliberately keeps its UI minimal: a centered code column
-  on wide terminals, luminance-driven syntax highlighting, and a
-  soft right margin.
+  A gap-buffer editor with syntax highlighting for 17 languages
+  (including TeX/LaTeX), multi-cursor editing, incremental search,
+  undo/redo, and PDF export via a hand-rolled PDF 1.4 writer with
+  TTF/OTF font embedding. No runtime dependencies beyond libc.
 
 Build notes:
 
-  issy is built with `zig build -Doptimize=ReleaseSafe`. The
-  Makefile depends on lang/zig and redirects the zig cache into
-  ${WRKBUILD} via ZIG_GLOBAL_CACHE_DIR / ZIG_LOCAL_CACHE_DIR in
-  MAKE_ENV, mirroring the pattern used by lang/zig's own Makefile.
-  The project's unit tests are wired to do-test and run under
-  `zig build test`.
+  `zig build -Doptimize=ReleaseSafe`. BUILD_DEPENDS on lang/zig and
+  redirects the zig cache into ${WRKBUILD} via MAKE_ENV (same pattern
+  as lang/zig's own Makefile) so the ports build doesn't write to
+  $HOME. Unit tests run under `zig build test`, wired to do-test.
 
-  As far as I can tell this is the first port in the tree that
-  *consumes* lang/zig as a build tool (lang/zig itself bootstraps
-  from CMake+LLVM), so there is no existing zig-based port I could
-  inherit from. The do-build / do-install / do-test targets are
-  written explicitly rather than using a module. Suggestions on
-  factoring this out into a lang/zig consumer module — similar to
-  lang/go — would be welcome if the maintainers think that's
-  worthwhile.
+  As far as I can tell this is the first port in the tree consuming
+  lang/zig as a build tool — lang/zig itself bootstraps from
+  CMake+LLVM — so there's no existing zig module to inherit. If you'd
+  like a lang/zig consumer module (à la lang/go) factored out, happy
+  to help.
 
 Arches:
 
   ONLY_FOR_ARCHS = amd64 arm64, matching lang/zig. powerpc64 is
-  excluded because the upstream lang/zig port is marked BROKEN
-  there.
+  excluded because lang/zig is marked BROKEN there.
 
 Testing:
 
   Re-submission. The first round failed at do-build with
-  `std.fs.Dir.realpath ... unsupported on this host` because Zig's
-  stdlib reaches for /proc/self/fd/ which OpenBSD lacks. Three call
-  sites are fixed upstream in commit 4438a2d by switching to
-  std.posix.getcwd (plain libc getcwd(3), works everywhere).
+  `std.fs.Dir.realpath ... unsupported on this host` — Zig's stdlib
+  reaches for /proc/self/fd/ which OpenBSD lacks. Fixed upstream in
+  commit 4438a2d by switching to std.posix.getcwd (plain libc).
 
-  Build and test are now verified end-to-end on a real OpenBSD 7.8
-  amd64 VM with lang/zig 0.15.1+3db960767:
-    - zig build -Doptimize=ReleaseSafe — clean
-    - zig build test — 666/666 unit tests pass
-    - bash tests/run_tests.sh — 13 PTY-based integration suites
-      (76 individual cases) pass
-  Upstream CI now runs the same sequence on every push/PR via
-  cross-platform-actions/action@v1.0.0 (the openbsd-test job in
-  .github/workflows/ci.yml), so any future regression that breaks
-  the OpenBSD build will block main.
+  Build and test now verified end-to-end on a real OpenBSD 7.8 amd64
+  VM with lang/zig 0.15.1 from packages: 666/666 unit tests pass,
+  and all 14 integration suites under `bash tests/run_tests.sh`
+  pass. Upstream CI runs the same sequence on every push via
+  cross-platform-actions/action, so future regressions will block
+  main.
 
-  I still don't expect to have hit every corner of `make package`
-  (ports-specific fakeroot behavior, WANTLIB completeness, etc.),
-  so please continue to flag anything the build farm notices.
+  Upstream build.zig calls linkLibC() on OpenBSD so native builds go
+  through libc rather than raw syscalls.
 
-  Upstream note: build.zig calls linkLibC() on OpenBSD so native
-  builds go through libc instead of issuing raw syscalls (which
-  modern OpenBSD would refuse to execute).
-
-The port directory is attached as a gzipped tarball. Extract into
+Port directory attached as a gzipped tarball; extract into
 ports/editors/ to produce ports/editors/issy/.
 
-Thanks for reviewing,
+Thanks,
 David Emerson

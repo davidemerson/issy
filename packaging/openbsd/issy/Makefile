@@ -10,7 +10,7 @@ HOMEPAGE =	https://github.com/davidemerson/issy
 
 MAINTAINER =	David Emerson <d@nnix.com>
 
-# ISC
+# BSD 3-Clause
 PERMIT_PACKAGE =	Yes
 
 # zig itself is only packaged on amd64 and arm64 in the current ports
