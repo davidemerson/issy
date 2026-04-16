@@ -186,6 +186,9 @@ jobs:
         # but fail the second.  Also grep for strings that only exist
         # in the rewritten page, to catch the case where a stale page
         # from a prior install is shadowing the new one.
+        #
+        # man(1) renders bold via backspace-overstrike (S\bS\bh\bh...),
+        # so we pipe through `col -b` to strip that before grepping.
         run: |
           set -eux
           # Where did brew install it?
@@ -193,8 +196,9 @@ jobs:
           echo "Manpage path: $man_path"
           test -s "$man_path"
           file "$man_path"
-          # Render and spot-check content that only exists post-rewrite
-          man issy > /tmp/rendered-man.txt 2>&1
+          # Render, strip overstrike, and spot-check content that only
+          # exists post-rewrite
+          man issy 2>&1 | col -b > /tmp/rendered-man.txt
           head -20 /tmp/rendered-man.txt
           grep -q 'Shift+Home' /tmp/rendered-man.txt
           grep -q 'Triple-click' /tmp/rendered-man.txt
