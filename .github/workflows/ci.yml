@@ -69,9 +69,13 @@ jobs:
           memory: 4G
           cpu_count: 2
           shell: bash
-          # rsync is needed for the action's file sync from runner to VM,
-          # and for the bash test runner. zig comes from packages.
-          # PKG_PATH points at the cdn so installs are reproducible.
+          # cross-platform-actions/action rsyncs the workspace to the VM
+          # before `run`, then rsyncs back after, so anything we drop in
+          # the workspace (including the built binary) ends up on the
+          # runner.  We exploit that to publish the binary as a CI
+          # artifact for the release job to pick up — Linux can't
+          # cross-compile to OpenBSD because Zig doesn't ship OpenBSD
+          # libc headers.
           run: |
             set -euxo pipefail
             # cross-platform-actions/action's OpenBSD image runs as user
@@ -84,6 +88,19 @@ jobs:
             ./zig-out/bin/issy --version
             ./zig-out/bin/issy --help
             bash tests/run_tests.sh
+      - name: Stage OpenBSD binary for release
+        run: |
+          mkdir -p openbsd-dist
+          cp zig-out/bin/issy openbsd-dist/issy-openbsd-amd64
+          chmod +x openbsd-dist/issy-openbsd-amd64
+          file openbsd-dist/issy-openbsd-amd64
+      - name: Upload OpenBSD binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: issy-openbsd-amd64
+          path: openbsd-dist/issy-openbsd-amd64
+          if-no-files-found: error
+          retention-days: 7
 
   release:
     needs: [test, openbsd-test]
@@ -113,20 +130,22 @@ jobs:
       - name: Add Zig to PATH
         run: echo "$HOME/zig" >> $GITHUB_PATH
 
-      - name: Build all targets
+      - name: Build Linux targets
         run: |
           mkdir -p dist
 
           declare -A names
           names[x86_64-linux-gnu]="issy-linux-amd64"
           names[aarch64-linux-gnu]="issy-linux-arm64"
-          names[x86_64-openbsd]="issy-openbsd-amd64"
 
           # macOS is intentionally omitted: cross-compiled Mach-O from Linux
           # has no LC_CODE_SIGNATURE and is rejected by the Apple Silicon
           # kernel. Mac users install via `brew install --HEAD davidemerson/issy/issy`
           # or build from source with `zig build`.
-          for target in x86_64-linux-gnu aarch64-linux-gnu x86_64-openbsd; do
+          # OpenBSD also can't be cross-compiled from Linux (Zig doesn't
+          # ship OpenBSD libc headers); the binary comes from the
+          # openbsd-test job's artifact, downloaded in the next step.
+          for target in x86_64-linux-gnu aarch64-linux-gnu; do
             echo "::group::Building $target"
             if zig build -Dtarget=$target -Doptimize=ReleaseSafe; then
               cp zig-out/bin/issy "dist/${names[$target]}"
@@ -136,6 +155,16 @@ jobs:
             fi
             echo "::endgroup::"
           done
+
+      - name: Download OpenBSD binary from openbsd-test job
+        uses: actions/download-artifact@v4
+        with:
+          name: issy-openbsd-amd64
+          path: dist/
+
+      - name: Finalize release manifest
+        run: |
+          chmod +x dist/issy-openbsd-amd64
 
           # Full 40-char commit SHA — consumed by the in-editor update checker.
           git rev-parse HEAD > dist/commit.txt
