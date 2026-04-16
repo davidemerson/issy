@@ -1,175 +1,667 @@
-.TH ISSY 1 "2026" "issy 0.1.0" "User Commands"
+.TH ISSY 1 "April 15, 2026" "issy 0.1.0" "General Commands Manual"
 .SH NAME
-issy \- a minimal text editor
+issy \- a text editor that looks like a printed page
 .SH SYNOPSIS
 .B issy
-.RI [ options ] " " [ file\fR[:\fIline\fR]]
+.RB [ \-\-version ]
+.RB [ \-\-help ]
+.RB [ \-\-no\-config ]
+.RB [ \-\-config
+.IR file ]
+.RB [ \-\-theme
+.IR name ]
+.RB [ \-\-font
+.IR path ]
+.RB [ \-\-print
+.IR output ]
+.RB [ \-\-rollback ]
+.RI [ file\fR[\fB:\fIline\fR]]
 .SH DESCRIPTION
 .B issy
-is a tiny, fast, cross-platform text editor written in Zig. It looks like a printed page, not a terminal application. Zero external dependencies.
+is a text editor written in Zig with zero external dependencies.
+It renders a single buffer in a terminal using gap-buffer text storage,
+syntax highlighting, undo/redo, incremental search, search and replace,
+multi-cursor editing, keyboard and mouse selection, bracket matching,
+and PDF export with real TTF/OTF font embedding.
+.PP
+The visual design is deliberately restrained: only two or three token
+types get real chromatic contrast; the eye parses structure through
+gentle luminance shifts rather than a full-spectrum rainbow.
+Two built-in themes are provided:
+.B default
+(dark) and
+.B paper
+(Solarized Light).
+.PP
+.B issy
+requires a terminal.
+Standard input must be a tty; if it is not,
+.B issy
+prints a diagnostic to standard error and exits with status 1.
 .SH OPTIONS
 .TP
-.B \-\-version
-Print version and exit.
+.BR \-\-version ", " \-v
+Print version string and exit.
+The output includes the version number, abbreviated commit SHA, and
+build type
+.RB ( release
+or
+.BR dev ).
 .TP
-.B \-\-help
-Print usage and exit.
+.BR \-\-help ", " \-h
+Print a usage summary and exit.
 .TP
 .BI \-\-config " file"
-Use the specified configuration file.
+Read configuration from
+.I file
+instead of the default
+.IR ~/.issyrc .
 .TP
 .BI \-\-theme " name"
-Override theme (default, paper).
+Override the theme.
+.I name
+is one of
+.B default
+or
+.BR paper .
 .TP
 .BI \-\-font " path"
-TTF/OTF font file for PDF output.
+Use
+.I path
+as the TTF or OTF font for PDF output.
+Overrides the
+.B font_file
+setting in the configuration file.
 .TP
 .B \-\-no\-config
-Skip loading the configuration file.
+Skip loading any configuration file.
+All settings take their compiled-in defaults.
 .TP
-.BI \-\-print " output.pdf"
-Export the file to PDF and exit without opening the TUI.
+.BI \-\-print " output"
+Export the file to PDF at
+.I output
+and exit without opening the TUI.
+Requires a font, either via
+.B \-\-font
+or
+.B font_file
+in the configuration file.
+A file argument must also be provided.
 .TP
 .B \-\-rollback
-Swap in the previous binary (from
-.IR ~/.cache/issy/issy.prev )
-and exit. Only meaningful after the auto-update path has successfully applied an update. Prints an error if no snapshot exists.
+Replace the running binary on disk with the snapshot taken before the
+last successful auto-update apply
+.RI ( ~/.cache/issy/issy.prev ),
+then exit.
+Prints an error and exits with status 1 if no snapshot exists or the
+binary is not writable.
 .SH KEYBINDINGS
+In normal mode the following key sequences are recognized.
+Multi-byte input is handled as UTF-8.
+.SS Editing
 .TP
 .B Ctrl+S
-Save file.
+Save the current buffer.
+If the buffer has no filename, the status bar shows an error; use
+.B Ctrl+O
+to open or name a file first.
 .TP
 .B Ctrl+Q
-Quit (prompts if unsaved changes; press again to discard).
+Quit.
+If the buffer has unsaved changes, the status bar prompts for
+confirmation; press
+.B Ctrl+Q
+again to discard changes and exit.
 .TP
 .B Ctrl+W
-Same as Ctrl+Q.
-.TP
-.B Ctrl+F
-Incremental search. Type to search, Enter to confirm, Escape to cancel.
-.TP
-.B Ctrl+G
-Find next match.
-.TP
-.B Ctrl+H
-Search and replace. Tab switches between fields. Enter replaces current and advances. Ctrl+A replaces all.
+Same as
+.BR Ctrl+Q .
 .TP
 .B Ctrl+Z
-Undo.
+Undo the last editing operation.
+Multi-cursor edits are undone as a single atomic step.
 .TP
 .B Ctrl+Y
 Redo.
 .TP
 .B Ctrl+C
-Copy selection.
+Copy the current selection to the internal clipboard.
 .TP
 .B Ctrl+X
-Cut selection.
+Cut the current selection.
 .TP
 .B Ctrl+V
-Paste.
+Paste from the internal clipboard.
+With multiple cursors active, the paste is applied at every cursor.
 .TP
 .B Ctrl+A
-Select all.
+Select all text in the buffer.
 .TP
-.B Ctrl+D
-Add cursor at next occurrence of word under cursor.
+.B Tab
+Insert a tab character or the equivalent number of spaces,
+depending on the
+.B expand_tabs
+and
+.B tab_width
+settings.
+If the file's indentation style was auto-detected, the detected style
+takes precedence.
 .TP
-.B Ctrl+O
-Open file (prompts for path).
+.B Enter
+Insert a newline.
+If
+.B auto_indent
+is enabled, the new line copies the leading whitespace of the
+preceding line.
 .TP
-.B Ctrl+N
-New empty buffer.
+.B Backspace
+Delete the character before the cursor.
+If a selection is active, delete the selected text instead.
 .TP
-.B Ctrl+P
-Export to PDF (requires font_file in config).
+.B Delete
+Delete the character under the cursor.
+If a selection is active, delete the selected text instead.
+.SS Cursor movement
 .TP
-.B Ctrl+R
-Reload file from disk (when file has changed externally).
+.B Arrow keys
+Move the cursor one character or one line.
+Clears any active selection.
+.TP
+.BR Ctrl+Left ", " Ctrl+Right
+Jump the cursor one word boundary at a time.
+Clears any active selection.
+.TP
+.B Home
+Move to the beginning of the current line.
+Clears any active selection.
+.TP
+.B End
+Move to the end of the current line.
+Clears any active selection.
+.TP
+.BR "Page Up" ", " "Page Down"
+Move the cursor by one screenfull minus two lines.
+.SS Selection
+Selection extends a highlighted region from an anchor point to the
+cursor.
+The anchor is set when the first shift-modified movement key is pressed
+or when the mouse initiates a drag.
+.TP
+.BR Shift+Up ", " Shift+Down ", " Shift+Left ", " Shift+Right
+Extend the selection by one character or one line.
+.TP
+.BR Ctrl+Shift+Left ", " Ctrl+Shift+Right
+Extend the selection by one word.
+.TP
+.B Shift+Home
+Extend the selection to the beginning of the current line.
+.TP
+.B Shift+End
+Extend the selection to the end of the current line.
 .TP
 .B Escape
-Clear multi-cursors and selection.
+Clear the selection and all extra cursors.
+.SS Search and replace
 .TP
-.B Ctrl+/
-Show keybindings overlay (any key to dismiss).
+.B Ctrl+F
+Enter incremental search mode.
+Each keystroke re-runs the search and jumps the cursor to the first
+match.
+Press
+.B Enter
+to confirm the cursor position, or
+.B Escape
+to cancel and return the cursor to where it was before the search
+began.
 .TP
-.B F1
-Same as Ctrl+/.
+.B Ctrl+G
+Jump to the next occurrence of the last search pattern.
+Works in both normal mode and search mode.
+.TP
+.B Ctrl+H
+Enter search-and-replace mode.
+Type the search pattern, press
+.B Tab
+to switch to the replacement field (press
+.B Tab
+again to switch back), then:
+.RS
+.TP
+.B Enter
+Replace the current match and advance to the next.
+.TP
+.B Ctrl+A
+Replace all occurrences and return to normal mode.
+.TP
+.B Escape
+Cancel and return to normal mode.
+.RE
+.SS Files and buffers
+.TP
+.B Ctrl+O
+Open a file.
+The prompt is seeded with the current working directory.
+Type a partial path and press
+.B Tab
+to complete against the filesystem.
+Press
+.B Escape
+to cancel.
+.TP
+.B Ctrl+N
+Open a new empty buffer.
+If the current buffer has unsaved changes, the editor prompts for
+confirmation first.
+.TP
+.B Ctrl+P
+Export the current buffer to a PDF file alongside the source file
+(same directory,
+.I .pdf
+suffix).
+Requires the buffer to have a filename and a font to be configured via
+.B font_file
+or
+.BR \-\-font .
+.TP
+.B Ctrl+R
+Reload the file from disk.
+Only takes effect when
+.B issy
+has detected that the file's modification time has changed since it was
+last read.
+The file's mtime is polled once per second.
+.SS Multi-cursor
+.TP
+.B Ctrl+D
+Select the word under the cursor.
+Press again to add an additional cursor at the next occurrence of the
+same word.
+Repeat to keep adding cursors.
+.PP
+All editing operations \(em typing, backspace, delete, paste \(em apply
+to every cursor simultaneously.
+.B Ctrl+Z
+undoes the entire multi-cursor operation as a single step.
+.B Escape
+clears all extra cursors and the selection.
+.SS Mouse
+.TP
+.B Click
+Position the cursor at the click location.
+Clears any selection and extra cursors.
+.TP
+.B Double-click
+Select the word under the pointer.
+.TP
+.B Triple-click
+Select the entire line under the pointer.
+.PP
+Click counting uses a 400\ ms timeout at the same buffer position;
+intervening scrolling does not break the streak.
+.TP
+.B Shift+Click
+Extend the selection from the current anchor (or from the cursor,
+if no selection is active) to the click position.
+.TP
+.B Click and drag
+Extend the selection as the pointer moves.
+Dragging past the top or bottom edge of the viewport autoscrolls.
 .TP
 .B Mouse scroll
-Scroll viewport without moving cursor.
+Scroll the viewport by three lines.
+The cursor position is not changed unless it falls outside the visible
+area, in which case it is clamped to the nearest visible row.
+.SS Help
 .TP
-.B Mouse click
-Position cursor at click location.
+.BR Ctrl+/ ", " F1
+Display a keybindings overlay.
+Press any key to dismiss.
 .SH CONFIGURATION
 Configuration is read from
 .I ~/.issyrc
-on POSIX or
-.I %APPDATA%\\issy\\config
-on Windows. Format is line-oriented:
+on startup, unless
+.B \-\-no\-config
+is given or an alternate file is specified with
+.BR \-\-config .
 .PP
-.nf
-# comment
-key = value
-key = "value with spaces"
-[theme.name]
-color_key = "#rrggbb"
-.fi
+The file format is line-oriented.
+Lines starting with
+.B #
+are comments.
+Unknown keys are silently ignored.
+Values containing spaces may be quoted with double quotes.
+Theme sections are introduced with a
+.BI [theme. name ]
+header.
 .PP
-Keys: tab_width (default 4), expand_tabs (true), line_numbers (true), word_wrap (false), auto_indent (true), auto_close_brackets (false), auto_detect_indent (true), trailing_whitespace (true), indent_mismatch (true), scroll_margin (5), gutter_padding (2), left_padding (1), right_margin (100), cursor_line_bg (true), cursor_style (bar|block|underline), notify_updates (true), autoupdate (false), font_file, font_size (10.0), print_margin_top (72), print_margin_bottom (72), print_margin_left (108), print_margin_right (72).
-.SH THEMES
-.B default
-\- Dark, restrained. Most syntax colors near fg luminance. Keywords violet, strings green, comments nearly invisible.
-.PP
-.B paper
-\- Light, restrained. Same philosophy on white background.
-.PP
-Design philosophy: restraint. Only 2\-3 token types get real contrast. The eye parses structure through gentle luminance shifts.
-.SH PRINTING
-Requires
+The installer seeds
+.I ~/.issyrc
+with every setting commented out so the available keys and their
+defaults are visible.
+See
+.I examples/issyrc
+in the source tree for a complete annotated example.
+.SS Editing settings
+.TP
+.BR tab_width " (default: 4)"
+Number of columns per tab stop.
+.TP
+.BR expand_tabs " (default: true)"
+Insert spaces instead of literal tab characters.
+.TP
+.BR auto_indent " (default: true)"
+Copy leading whitespace from the preceding line when pressing
+.BR Enter .
+.TP
+.BR auto_close_brackets " (default: false)"
+Automatically insert a matching closing bracket or quote after an
+opening one.
+.TP
+.BR auto_detect_indent " (default: true)"
+Scan the file on open to detect whether it uses tabs or spaces, and
+the prevailing tab width.
+The detected values override
+.B tab_width
+and
+.B expand_tabs
+for that file.
+.TP
+.BR scroll_margin " (default: 5)"
+Minimum number of lines between the cursor and the top or bottom of
+the viewport before the view scrolls.
+.SS Display settings
+.TP
+.BR line_numbers " (default: true)"
+Show line numbers in the gutter.
+.TP
+.BR left_padding " (default: 2)"
+Columns of blank space before the line-number gutter.
+.TP
+.BR gutter_padding " (default: 3)"
+Columns of blank space between the line numbers and the code.
+.TP
+.BR word_wrap " (default: true)"
+Soft-wrap long lines at the right margin.
+Continuation lines are indented.
+.TP
+.BR right_margin " (default: 100)"
+Column at which text stops and the remaining terminal width is left
+as empty background.
+Set to 0 to fill the terminal.
+.TP
+.BR cursor_line_bg " (default: true)"
+Subtly highlight the full width of the line containing the cursor.
+.TP
+.BR cursor_style " (default: bar)"
+Terminal cursor shape.
+One of
+.BR bar ,
+.BR block ,
+or
+.BR underline .
+.TP
+.BR trailing_whitespace " (default: true)"
+Faintly highlight trailing spaces and tabs on non-empty lines.
+.TP
+.BR indent_mismatch " (default: true)"
+Faintly highlight leading indentation that does not match the detected
+or configured style for the file.
+.SS Auto-update settings
+.TP
+.BR notify_updates " (default: true)"
+On startup, check for a newer release and show
+\(lqupdate available:
+.IR sha \(rq
+in the status bar.
+Set to
+.B false
+to disable the check and its background network fetch entirely.
+Only applies to release builds; dev builds skip the check regardless.
+.TP
+.BR autoupdate " (default: false)"
+Opt into automatic download, Ed25519 signature verification, and
+in-session re-exec when a newer release is available.
+See
+.B AUTO-UPDATE
+below for the full mechanism.
+.SS PDF settings
+.TP
 .B font_file
-set in config to a TTF/OTF font path. PDF output uses a separate print theme with colors tuned for ink on white paper. Supports syntax highlighting, line numbers, headers, and page breaks.
+Path to a TTF or OTF font file.
+Required for
+.B Ctrl+P
+and
+.BR \-\-print .
+.TP
+.BR font_size " (default: 10.0)"
+Font size in points for PDF output.
+.TP
+.BR print_margin_top " (default: 72.0)"
+Top page margin in points (72\ points = 1\ inch).
+.TP
+.BR print_margin_bottom " (default: 72.0)"
+Bottom page margin in points.
+.TP
+.BR print_margin_left " (default: 108.0)"
+Left page margin in points.
+.TP
+.BR print_margin_right " (default: 72.0)"
+Right page margin in points.
+.SS Theme settings
+Switch themes by adding a section header:
+.PP
+.RS
+.B [theme.paper]
+.RE
+.PP
+The only built-in themes are
+.B default
+(dark, active by default) and
+.B paper
+(Solarized Light).
+.PP
+Individual colors may be overridden after the section header using
+.B #rrggbb
+hex format.
+The available color keys are:
+.BR bg ,
+.BR fg ,
+.BR keyword ,
+.BR string_color ,
+.BR comment ,
+.BR number_color ,
+.BR type_color ,
+.BR function_color ,
+.BR operator_color ,
+.BR preprocessor_color ,
+.BR line_number_color ,
+.BR line_number_active ,
+.BR cursor_line_color ,
+.BR selection_color ,
+.BR trailing_ws_color ,
+and
+.BR indent_mismatch_color .
+.SH SYNTAX HIGHLIGHTING
+Language is detected by file extension.
+The following languages are supported:
+C, C++, Zig, Python, JavaScript, TypeScript, Rust, Go, Shell (sh/bash),
+HTML, CSS, JSON, YAML, TOML, Makefile, Markdown, and TeX/LaTeX.
+.PP
+Tokenization is performed line by line using a state machine with no
+allocations in the hot path.
+Multi-line constructs such as block comments are tracked across lines
+via persistent state.
+.SH PDF EXPORT
+.B Ctrl+P
+exports the current buffer to a PDF\ 1.4 file alongside the source
+(same directory,
+.I .pdf
+suffix).
+.B \-\-print
+does the same headlessly without opening the TUI.
+Both require a TTF or OTF font file configured via
+.B font_file
+in the configuration or
+.B \-\-font
+on the command line.
+.PP
+PDF output uses a dedicated print theme with colors tuned for ink on
+white paper; it never inherits the TUI theme.
+The PDF writer is implemented entirely in Zig with no external
+dependencies \(em no intermediate PostScript, no system libraries.
+Output includes syntax highlighting, line numbers, a header with the
+filename, and automatic page breaks.
 .SH AUTO-UPDATE
-Release builds (those produced by CI, not local dev builds) check for newer versions on startup. A detached background worker fetches the latest release's
+Release builds (those produced by CI, not local dev builds)
+check for newer versions on startup.
+A detached background worker fetches
 .I commit.txt
-asset over HTTPS and caches it under
+from the latest GitHub release and caches it under
 .IR ~/.cache/issy/ .
-If the cached commit SHA differs from the running binary's, the status bar shows
-.IR "update available: <sha>" .
+The editor never blocks on the network.
+If the cached commit SHA differs from the one the running binary was
+built from, the status bar shows
+\(lqupdate available:
+.IR sha \(rq.
 .PP
 With
 .B autoupdate = true
-in the config, the worker additionally downloads
-.IR sha256sums.txt " and " sha256sums.txt.sig ,
-verifies the Ed25519 signature against the public key embedded at build time, hashes the downloaded binary against the signed manifest, and stages it as
+in the configuration, the worker additionally downloads
+.I sha256sums.txt
+and
+.IR sha256sums.txt.sig ,
+verifies the Ed25519 signature against the public key embedded at build
+time
+.RI ( src/update_key.zig ),
+hashes the downloaded binary against the signed manifest, and stages it
+at
 .IR ~/.cache/issy/issy.staged .
-When the buffer is clean and the editor has been idle for 60 seconds, the editor snapshots its running binary to
-.IR issy.prev ,
-atomically renames the staged binary into place, and re-execs itself with
-.BI \-\-resume " path"
-so the new instance restores the open file at the same cursor position. The terminal state survives the
-.BR execve ,
-so the user sees at most one re-render.
 .PP
-Auto-apply is a no-op for root-owned install paths (the binary is not writable by the running user) and for dev builds. Use
+When the buffer is clean (no unsaved changes) and the editor has been
+idle for 60\ seconds, the running binary is snapshotted to
+.IR issy.prev ,
+the staged binary is atomically renamed into place, and the editor
+re-execs itself with an internal
+.B \-\-resume
+flag so the new instance restores the open file at the same cursor
+position.
+The terminal state survives the
+.BR execve (2);
+the user sees at most one re-render.
+.PP
+Auto-apply is a no-op when:
+.IP \(bu 2
+The install path is owned by root (the binary is not writable by the
+running user).
+.IP \(bu 2
+The binary is a dev build.
+.IP \(bu 2
+The platform has no prebuilt binary (macOS \(em see below).
+.PP
+On macOS,
+.B issy
+does not ship prebuilt binaries because cross-compiled Mach-O from
+Linux lacks a code signature and is rejected by the Apple Silicon kernel.
+The notify path still works; run
+.B "brew upgrade \-\-fetch\-HEAD issy"
+or rebuild from source to update.
+.PP
+Use
 .B \-\-rollback
 to revert after an apply, or set
 .B notify_updates = false
-to disable the whole mechanism.
-.PP
-On macOS, auto-apply is also a no-op because issy does not ship prebuilt macOS binaries \(em cross-compiled Mach-O from Linux has no code signature and is refused by the Apple Silicon kernel. The notify path still works; run
-.B "brew upgrade --fetch-HEAD issy"
-to update, or rebuild from source with
-.BR "zig build -Doptimize=ReleaseSafe" .
+to disable the entire mechanism.
+.SH ENVIRONMENT
+.TP
+.B HOME
+Used to locate the default configuration file
+.RI ( $HOME/.issyrc )
+and the auto-update cache directory
+.RI ( $HOME/.cache/issy/ ).
 .SH FILES
 .TP
 .I ~/.issyrc
-User configuration (POSIX).
-.TP
-.I %APPDATA%\\issy\\config
-User configuration (Windows).
+User configuration file.
+See
+.BR CONFIGURATION .
 .TP
 .I ~/.cache/issy/
-Auto-update cache: cached release SHA, signed manifest, staged binary, pre-apply snapshot, and one-shot resume records.
-.SH AUTHOR
+Auto-update cache directory.
+Contains:
+.I commit.txt
+(latest release SHA),
+.I sha256sums.txt
+and
+.I sha256sums.txt.sig
+(signed manifest),
+.I issy.staged
+(verified binary ready for apply), and
+.I issy.prev
+(snapshot of the binary before the last apply, used by
+.BR \-\-rollback ).
+.SH EXIT STATUS
+.TP
+.B 0
+Normal exit.
+.TP
+.B 1
+An error occurred: standard input is not a terminal, PDF export failed,
+or
+.B \-\-rollback
+failed (no snapshot or binary not writable).
+.SH EXAMPLES
+Open a file:
+.PP
+.RS
+.nf
+$ issy main.zig
+.fi
+.RE
+.PP
+Open at a specific line:
+.PP
+.RS
+.nf
+$ issy src/editor.zig:42
+.fi
+.RE
+.PP
+Start with an empty buffer:
+.PP
+.RS
+.nf
+$ issy
+.fi
+.RE
+.PP
+Export to PDF headlessly:
+.PP
+.RS
+.nf
+$ issy \-\-font /path/to/font.ttf \-\-print output.pdf source.c
+.fi
+.RE
+.PP
+Revert the last auto-update:
+.PP
+.RS
+.nf
+$ issy \-\-rollback
+.fi
+.RE
+.SH SEE ALSO
+.BR vi (1),
+.BR nano (1)
+.SH AUTHORS
 David Emerson
+.SH CAVEATS
+.B issy
+uses an internal clipboard, not the system clipboard.
+Copy and paste only work within the same
+.B issy
+session.
+.PP
+The
+.B auto_close_brackets
+feature is available but disabled by default; it can interfere with
+common editing patterns in some languages.
