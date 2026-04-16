@@ -44,17 +44,30 @@ Arches:
 
 Testing:
 
-  I do not currently have an OpenBSD build environment to test on.
-  The port was prepared against the conventions documented in
-  https://www.openbsd.org/faq/ports/guide.html and modeled on
-  editors/ne and lang/zig. Please let me know if anything in the
-  Makefile, PLIST, or build invocation fails under a real `make
-  package`, and I will iterate.
+  Re-submission. The first round failed at do-build with
+  `std.fs.Dir.realpath ... unsupported on this host` because Zig's
+  stdlib reaches for /proc/self/fd/ which OpenBSD lacks. Three call
+  sites are fixed upstream in commit 4438a2d by switching to
+  std.posix.getcwd (plain libc getcwd(3), works everywhere).
 
-  Upstream note: I added OpenBSD to the `linkLibC` branch in the
-  project's build.zig specifically for this port, so native builds
-  go through libc instead of issuing raw syscalls (which modern
-  OpenBSD would refuse to execute).
+  Build and test are now verified end-to-end on a real OpenBSD 7.8
+  amd64 VM with lang/zig 0.15.1+3db960767:
+    - zig build -Doptimize=ReleaseSafe — clean
+    - zig build test — 666/666 unit tests pass
+    - bash tests/run_tests.sh — 13 PTY-based integration suites
+      (76 individual cases) pass
+  Upstream CI now runs the same sequence on every push/PR via
+  cross-platform-actions/action@v1.0.0 (the openbsd-test job in
+  .github/workflows/ci.yml), so any future regression that breaks
+  the OpenBSD build will block main.
+
+  I still don't expect to have hit every corner of `make package`
+  (ports-specific fakeroot behavior, WANTLIB completeness, etc.),
+  so please continue to flag anything the build farm notices.
+
+  Upstream note: build.zig calls linkLibC() on OpenBSD so native
+  builds go through libc instead of issuing raw syscalls (which
+  modern OpenBSD would refuse to execute).
 
 The port directory is attached as a gzipped tarball. Extract into
 ports/editors/ to produce ports/editors/issy/.
