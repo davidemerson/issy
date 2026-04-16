@@ -151,29 +151,54 @@ jobs:
 
   # Verify the Homebrew formula actually builds from HEAD via the
   # same path Mac users take (`brew install --HEAD issy`).  This
-  # catches formula syntax errors, zig@0.15 pinning drift, and the
-  # Xcode SDK path issues we've already hit twice (see 69f0d8e,
-  # 1c16df0).  Runs on macos-latest so zig@0.15 resolves to a real
-  # bottle.
+  # catches formula syntax errors, zig@0.15 pinning drift, the Xcode
+  # SDK path issues we've already hit twice (see 69f0d8e, 1c16df0),
+  # AND whether `bin.install` / `man1.install` actually land in a
+  # place where `issy --version` runs and `man issy` finds the page.
+  # Runs on macos-latest so zig@0.15 resolves to a real bottle.
   homebrew-test:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install formula build-deps
-        run: brew install zig@0.15
-      - name: Exercise formula install steps
-        # Mirror the `def install` block in Formula/issy.rb verbatim
-        # (minus `bin.install` / `man1.install` which need a real
-        # brew cellar).  If this fails, `brew install --HEAD issy`
-        # will too.
+      - name: Tap the checked-out repo as a local Homebrew tap
+        # `brew install --HEAD` requires the formula to be available
+        # through a tap.  Symlink the workspace into
+        # Library/Taps/davidemerson/homebrew-issy so brew treats it
+        # like a real tap.
         run: |
           set -eux
-          export PATH="$(brew --prefix zig@0.15)/bin:$PATH"
-          zig version
-          zig build -Doptimize=ReleaseSafe
-          test -x zig-out/bin/issy
-          ./zig-out/bin/issy --version
-          test -f issy.1
+          tap_dir="$(brew --repository)/Library/Taps/davidemerson/homebrew-issy"
+          mkdir -p "$(dirname "$tap_dir")"
+          ln -sfn "$GITHUB_WORKSPACE" "$tap_dir"
+          brew tap-info davidemerson/issy
+      - name: brew install --HEAD davidemerson/issy/issy
+        run: brew install -v --HEAD davidemerson/issy/issy
+      - name: Verify installed binary
+        run: |
+          set -eux
+          which issy
+          issy --version
+          issy --help | head -3
+      - name: Verify installed manpage
+        # This is the thing that was reportedly not updating.  Check
+        # both that the file exists and that `man` actually renders it
+        # — a symlink pointing at a missing file would pass the first
+        # but fail the second.  Also grep for strings that only exist
+        # in the rewritten page, to catch the case where a stale page
+        # from a prior install is shadowing the new one.
+        run: |
+          set -eux
+          # Where did brew install it?
+          man_path="$(man -w issy)"
+          echo "Manpage path: $man_path"
+          test -s "$man_path"
+          file "$man_path"
+          # Render and spot-check content that only exists post-rewrite
+          man issy > /tmp/rendered-man.txt 2>&1
+          head -20 /tmp/rendered-man.txt
+          grep -q 'Shift+Home' /tmp/rendered-man.txt
+          grep -q 'Triple-click' /tmp/rendered-man.txt
+          grep -q 'EXIT STATUS' /tmp/rendered-man.txt
 
   release:
     needs: [test, openbsd-test, macos-test, homebrew-test]

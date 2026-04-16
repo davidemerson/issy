@@ -90,7 +90,13 @@ brew tap davidemerson/issy https://github.com/davidemerson/issy
 brew install --HEAD issy
 ```
 
-Upgrade with `brew upgrade --fetch-HEAD issy`. The curl installer also works on macOS — use whichever you prefer.
+**Upgrade:** `brew upgrade --fetch-HEAD issy`. Plain `brew upgrade` is a no-op for HEAD-only formulas — it only bumps versioned formulas, so without `--fetch-HEAD` you'll keep running whatever you installed first, including its older man page. If you ever see `man issy` showing stale content after an upgrade, force a rebuild:
+
+```sh
+brew reinstall --HEAD issy
+```
+
+The curl installer also works on macOS — use whichever you prefer.
 
 ### OpenBSD
 
