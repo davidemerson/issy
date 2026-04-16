@@ -102,8 +102,71 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Real macOS runtime test.  The ubuntu-based `test` job cross-compiles
+  # to macOS but never executes the resulting Mach-O.  This job runs
+  # the unit + integration suite on a real macOS arm64 host, catching
+  # macOS-only behaviour differences (Darwin symlink handling,
+  # F_GETPATH vs /proc fallbacks, Apple Silicon PIE, etc.).
+  macos-test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Zig
+        run: |
+          set -eux
+          arch=$(uname -m)
+          case "$arch" in
+            arm64)  zig_arch=aarch64 ;;
+            x86_64) zig_arch=x86_64 ;;
+            *)      echo "unsupported arch: $arch"; exit 1 ;;
+          esac
+          curl -L -o zig.tar.xz \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-${zig_arch}-macos-${ZIG_VERSION}.tar.xz"
+          mkdir -p ~/zig
+          tar xf zig.tar.xz -C ~/zig --strip-components=1
+          echo "$HOME/zig" >> $GITHUB_PATH
+      - name: Zig info
+        run: zig version && zig env
+      - name: Unit tests
+        run: zig build test --summary all
+      - name: Build ReleaseSafe
+        run: zig build -Doptimize=ReleaseSafe
+      - name: Smoke-test binary
+        run: |
+          ./zig-out/bin/issy --version
+          ./zig-out/bin/issy --help
+      - name: Integration tests
+        # expect ships with macOS
+        run: bash tests/run_tests.sh
+
+  # Verify the Homebrew formula actually builds from HEAD via the
+  # same path Mac users take (`brew install --HEAD issy`).  This
+  # catches formula syntax errors, zig@0.15 pinning drift, and the
+  # Xcode SDK path issues we've already hit twice (see 69f0d8e,
+  # 1c16df0).  Runs on macos-latest so zig@0.15 resolves to a real
+  # bottle.
+  homebrew-test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install formula build-deps
+        run: brew install zig@0.15
+      - name: Exercise formula install steps
+        # Mirror the `def install` block in Formula/issy.rb verbatim
+        # (minus `bin.install` / `man1.install` which need a real
+        # brew cellar).  If this fails, `brew install --HEAD issy`
+        # will too.
+        run: |
+          set -eux
+          export PATH="$(brew --prefix zig@0.15)/bin:$PATH"
+          zig version
+          zig build -Doptimize=ReleaseSafe
+          test -x zig-out/bin/issy
+          ./zig-out/bin/issy --version
+          test -f issy.1
+
   release:
-    needs: [test, openbsd-test]
+    needs: [test, openbsd-test, macos-test, homebrew-test]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
