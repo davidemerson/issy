@@ -74,7 +74,9 @@ jobs:
           # PKG_PATH points at the cdn so installs are reproducible.
           run: |
             set -euxo pipefail
-            doas pkg_add -I bash rsync-- expect zig
+            # cross-platform-actions/action's OpenBSD image runs as user
+            # `runner` with sudo (not doas) configured for pkg_add.
+            sudo pkg_add -I bash rsync-- expect zig
             uname -a
             zig version
             zig build -Doptimize=ReleaseSafe
