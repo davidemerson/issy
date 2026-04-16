@@ -28,6 +28,13 @@ class Issy < Formula
     resource("zig").stage(zig_dir)
     zig = zig_dir/"zig"
 
+    # A prebuilt zig from ziglang.org auto-detects the macOS SDK via
+    # `xcrun --show-sdk-path`, which Homebrew's superenv intercepts. Without
+    # SDKROOT set, the linker falls back to zig's bundled libSystem.tbd stub
+    # which is incomplete — native builds fail with undefined libc symbols
+    # (_malloc, _sigaction, _waitpid, …). Point zig at the real SDK.
+    ENV["SDKROOT"] = MacOS.sdk_path.to_s if OS.mac?
+
     system zig, "build", "-Doptimize=ReleaseSafe"
     bin.install "zig-out/bin/issy"
     man1.install "issy.1"
