@@ -21,7 +21,7 @@ check() {
 # A1: --version
 output=$("$ISSY" --version 2>&1)
 rc=$?
-if [ $rc -eq 0 ] && echo "$output" | grep -q "issy 0.1.0"; then
+if [ $rc -eq 0 ] && echo "$output" | grep -Eq "issy [0-9]+\.[0-9]+\.[0-9]+"; then
     check "A1_version" 1
 else
     check "A1_version" 0

@@ -30,7 +30,7 @@ packaging/openbsd/
    bash packaging/openbsd/prep-submission.sh
    ```
 
-   This tags `v0.1.0` on `HEAD`, pushes the tag to origin, downloads
+   This tags `v0.1.1` on `HEAD`, pushes the tag to origin, downloads
    the GitHub archive, computes the base64 SHA256 + byte size, writes
    them into `distinfo`, and builds `packaging/openbsd/issy-port.tar.gz`.
    It is idempotent — re-running is safe.
@@ -63,7 +63,7 @@ If the first submission round needs revisions, iterate on the files
 under `issy/`, bump the tag:
 
 ```sh
-TAG=v0.1.1 bash packaging/openbsd/prep-submission.sh
+TAG=v0.1.2 bash packaging/openbsd/prep-submission.sh
 ```
 
 The prep script will create the new tag, recompute hashes, and
@@ -71,7 +71,7 @@ rebuild the tarball.
 
 ## What's inside the port
 
-- **`Makefile`** — Pins to `GH_TAGNAME = v0.1.0` on the upstream
+- **`Makefile`** — Pins to `GH_TAGNAME = v0.1.1` on the upstream
   repo. Declares `BUILD_DEPENDS = lang/zig`, `WANTLIB += c`,
   `ONLY_FOR_ARCHS = amd64 arm64` (matching lang/zig). Invokes
   `zig build -Doptimize=ReleaseSafe` in `do-build` with
