@@ -94,7 +94,9 @@ Upgrade with `brew upgrade --fetch-HEAD issy`. The curl installer also works on 
 
 ### OpenBSD
 
-The curl installer downloads a prebuilt amd64 binary. An OpenBSD ports submission is in progress; when it lands, `pkg_add issy` will be the preferred path.
+The curl installer downloads a prebuilt amd64 binary. Builds are verified on every push by a real OpenBSD 7.8 amd64 VM in CI (`openbsd-test` job, see `.github/workflows/ci.yml`) — full unit + integration suite must pass on OpenBSD before main accepts a merge. An `editors/issy` ports submission is in flight; when it lands, `pkg_add issy` will be the preferred path.
+
+Building from source on OpenBSD: `pkg_add zig` then `zig build -Doptimize=ReleaseSafe`. `bash` and `expect` (also via `pkg_add`) are needed if you want to run the integration test suite.
 
 ### Build from source
 

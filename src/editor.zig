@@ -546,8 +546,8 @@ pub const Editor = struct {
                 self.command_action = .open;
                 // Seed prompt with CWD
                 self.prompt_len = 0;
-                if (std.fs.cwd().realpath(".", self.prompt_buf[0..])) |resolved| {
-                    self.prompt_len = resolved.len;
+                if (std.posix.getcwd(self.prompt_buf[0..])) |cwd| {
+                    self.prompt_len = cwd.len;
                     if (self.prompt_len < 255) {
                         self.prompt_buf[self.prompt_len] = '/';
                         self.prompt_len += 1;
@@ -2394,8 +2394,8 @@ pub const Editor = struct {
             self.mode = .command;
             self.command_action = .save_as;
             self.prompt_len = 0;
-            if (std.fs.cwd().realpath(".", self.prompt_buf[0..])) |resolved| {
-                self.prompt_len = resolved.len;
+            if (std.posix.getcwd(self.prompt_buf[0..])) |cwd| {
+                self.prompt_len = cwd.len;
                 if (self.prompt_len < 255) {
                     self.prompt_buf[self.prompt_len] = '/';
                     self.prompt_len += 1;

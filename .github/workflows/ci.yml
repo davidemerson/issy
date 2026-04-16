@@ -48,8 +48,43 @@ jobs:
           sudo apt-get install -y -qq expect
           bash tests/run_tests.sh
 
+  # Real OpenBSD smoke test — boots a 7.8 amd64 VM via QEMU/KVM and
+  # runs the full unit + integration suite on it.  Catches OpenBSD-only
+  # regressions like std.fs.Dir.realpath being unsupported, raw-syscall
+  # SIGKILL traps, and pkg_add fallout from zig version drift.  Cannot
+  # be replicated by Linux cross-compile because Zig doesn't ship
+  # OpenBSD libc headers and OpenBSD requires libc for any process
+  # surviving past startup.
+  openbsd-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test on OpenBSD 7.8
+        uses: cross-platform-actions/action@v1.0.0
+        with:
+          operating_system: openbsd
+          version: '7.8'
+          architecture: x86-64
+          memory: 4G
+          cpu_count: 2
+          shell: bash
+          # rsync is needed for the action's file sync from runner to VM,
+          # and for the bash test runner. zig comes from packages.
+          # PKG_PATH points at the cdn so installs are reproducible.
+          run: |
+            set -euxo pipefail
+            doas pkg_add -I bash rsync-- expect zig
+            uname -a
+            zig version
+            zig build -Doptimize=ReleaseSafe
+            zig build test --summary all
+            ./zig-out/bin/issy --version
+            ./zig-out/bin/issy --help
+            bash tests/run_tests.sh
+
   release:
-    needs: test
+    needs: [test, openbsd-test]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:

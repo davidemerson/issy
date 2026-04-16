@@ -98,22 +98,30 @@ rebuild the tarball.
   maintainers may ask for a shared `lang/zig` consumer module
   analogous to `lang/go`. The email draft mentions this up front.
 
-- **I have not tested this on a real OpenBSD system.** The port was
-  modeled on `editors/ne`, `editors/micro`, and `lang/zig`'s own
-  Makefile. Expect at least one review round of feedback from ports@
-  about things the OpenBSD build farm notices that local validation
-  couldn't.
+- **Verified on a real OpenBSD 7.8 amd64 VM.** Issy builds with
+  `zig build -Doptimize=ReleaseSafe`, all 666 unit tests pass under
+  `zig build test`, and all 13 PTY-based integration suites in
+  `tests/run_tests.sh` (76 individual cases) pass. The VM uses
+  Zig 0.15.1+3db960767 from `pkg_add zig`. CI mirrors this
+  end-to-end via the `openbsd-test` job in `.github/workflows/ci.yml`,
+  using `cross-platform-actions/action@v1.0.0` with QEMU/KVM, so any
+  regression that breaks the OpenBSD build will block the merge.
 
-- **`build.zig` was just updated** to link libc on OpenBSD, since
-  modern OpenBSD kernels SIGKILL binaries that issue raw syscalls
-  outside of libc. Without that change the port would build but the
-  resulting binary wouldn't execute. Mention this in the email if
-  the maintainers ask why WANTLIB includes `c` for what looks like
-  a pure-Zig program.
+- **The first ports-submission attempt failed** with
+  `std.fs.Dir.realpath ... unsupported on this host` because OpenBSD
+  doesn't have a `/proc/self/fd/` for Zig's stdlib to readlink against.
+  Fixed in `src/editor.zig` and `src/buffer.zig` by switching the
+  three call sites to `std.posix.getcwd` and a hand-rolled tmpdir
+  path. The CI job above is the regression guard.
 
-- **The `t14_pdf` integration test at `tests/run_tests.sh`** has a
-  pre-existing failure under certain font configurations (a tcl
-  `exec 2>&1` quirk). If `zig build test` runs as part of
-  `make test`, that failure may surface. The Makefile's `do-test`
-  only invokes `zig build test` (unit tests), not the shell
-  integration suite, so this should not affect the port build.
+- **`build.zig` links libc on OpenBSD** because modern OpenBSD kernels
+  SIGKILL binaries that issue raw syscalls outside of libc. Without
+  that the port would build but the resulting binary wouldn't execute.
+  Mention this in the email if the maintainers ask why WANTLIB
+  includes `c` for what looks like a pure-Zig program.
+
+- **The `t14_pdf` integration test at `tests/run_tests.sh`** is
+  skipped if no font file is found; in CI on OpenBSD it skips
+  cleanly. The Makefile's `do-test` only invokes `zig build test`
+  (unit tests), not the shell integration suite, so this should not
+  affect the port build either way.

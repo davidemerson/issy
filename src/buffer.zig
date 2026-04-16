@@ -487,11 +487,21 @@ test "load and save round-trip" {
     try file.writeAll(test_content);
     file.close();
 
-    // Get the real path for load/save.
+    // Build absolute path to the test file.  Avoid Dir.realpath which
+    // is unsupported on OpenBSD; the tmpDir lives under
+    // .zig-cache/tmp/<sub_path> relative to cwd.
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const real_path = try tmp_dir.dir.realpath("test.txt", &path_buf);
+    const cwd = try std.posix.getcwd(&path_buf);
+    const real_path = try std.fmt.bufPrint(
+        path_buf[cwd.len..],
+        "/.zig-cache/tmp/{s}/test.txt",
+        .{&tmp_dir.sub_path},
+    );
+    // bufPrint wrote into path_buf starting at cwd.len; the full
+    // absolute path is path_buf[0 .. cwd.len + real_path.len].
+    const real_path_full = path_buf[0 .. cwd.len + real_path.len];
 
-    try buf.load(real_path);
+    try buf.load(real_path_full);
     try std.testing.expectEqual(@as(usize, test_content.len), buf.logicalLen());
     try std.testing.expect(!buf.dirty);
 
@@ -501,7 +511,7 @@ test "load and save round-trip" {
 
     // Modify and save back to the same file.
     try buf.insert(0, "NEW: ");
-    try buf.save(real_path);
+    try buf.save(real_path_full);
     try std.testing.expect(!buf.dirty);
 
     // Read back and verify.
