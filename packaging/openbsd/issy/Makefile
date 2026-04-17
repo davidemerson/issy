@@ -2,8 +2,8 @@ COMMENT =	tiny text editor that looks like a printed page
 
 GH_ACCOUNT =	davidemerson
 GH_PROJECT =	issy
-GH_TAGNAME =	v0.1.1
-DISTNAME =	issy-0.1.1
+GH_TAGNAME =	v1.0.0
+DISTNAME =	issy-1.0.0
 
 CATEGORIES =	editors
 HOMEPAGE =	https://github.com/davidemerson/issy

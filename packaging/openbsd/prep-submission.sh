@@ -2,7 +2,7 @@
 # Prepare an OpenBSD ports submission tarball for editors/issy.
 #
 # What this script does (idempotent — safe to re-run):
-#   1. Creates the v0.1.1 git tag on HEAD if it does not already exist
+#   1. Creates the v1.0.0 git tag on HEAD if it does not already exist
 #      locally, and pushes it to origin.
 #   2. Downloads the GitHub archive tarball for that tag.
 #   3. Computes the base64 SHA256 and byte size of the tarball and
@@ -22,7 +22,7 @@
 
 set -euo pipefail
 
-TAG="${TAG:-v0.1.1}"
+TAG="${TAG:-v1.0.0}"
 VERSION="${TAG#v}"
 DISTNAME="issy-${VERSION}"
 REPO_URL="https://github.com/davidemerson/issy"
