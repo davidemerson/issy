@@ -18,7 +18,7 @@
 #   bash packaging/openbsd/prep-submission.sh
 #
 # If you need to re-cut the release at a different tag, override:
-#   TAG=v0.1.2 bash packaging/openbsd/prep-submission.sh
+#   TAG=v1.0.1 bash packaging/openbsd/prep-submission.sh
 
 set -euo pipefail
 
