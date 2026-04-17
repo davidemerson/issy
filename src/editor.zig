@@ -1396,11 +1396,58 @@ pub const Editor = struct {
 
     /// Convert a (screen_row, screen_col) cell coordinate into a
     /// (buffer_line, buffer_col) position. Accounts for the gutter,
-    /// centering offset, horizontal scroll, tab expansion, and
-    /// multi-byte UTF-8 codepoints. Clamps row to the buffer's last
-    /// line and col to the line's byte length.
+    /// centering offset, horizontal scroll, word-wrap continuation
+    /// lines, tab expansion, and multi-byte UTF-8 codepoints. Clamps
+    /// row to the buffer's last line and col to the line's byte length.
     fn screenToBufferPos(self: *Editor, row: u16, col: u16) struct { line: usize, col: usize } {
         const max_line = if (self.buf.lineCount() > 0) self.buf.lineCount() - 1 else 0;
+
+        if (self.config.word_wrap) {
+            // Walk from scroll_top, accumulating visual row heights,
+            // to find which buffer line and sub-line the click lands on.
+            var visual_rows_consumed: usize = 0;
+            var file_line: usize = self.scroll_top;
+            var sub_line: usize = 0;
+
+            while (file_line <= max_line) {
+                const vis_lines = self.visualLinesForBufferLine(file_line);
+                if (visual_rows_consumed + vis_lines > row) {
+                    sub_line = row - visual_rows_consumed;
+                    break;
+                }
+                visual_rows_consumed += vis_lines;
+                file_line += 1;
+            }
+            if (file_line > max_line) {
+                file_line = max_line;
+                sub_line = 0;
+            }
+
+            // Find the byte offset where this sub-line starts, convert
+            // that to a visual column, then add the screen column offset
+            // to get the absolute visual column within the line. Pass
+            // through visualColToByteCol for proper tab/UTF-8 snapping.
+            var breaks: [MAX_WRAP_BREAKS]usize = undefined;
+            _ = self.computeWrapBreaks(file_line, &breaks);
+
+            const c_offset = self.centerOffset();
+            const gutter_width = self.gutterWidth();
+            const code_start = c_offset + gutter_width;
+            const cont_indent: u16 = if (sub_line > 0) 2 else 0;
+            const total_col_offset = code_start + cont_indent;
+
+            const sub_start_visual = self.byteColToVisualCol(file_line, breaks[sub_line]);
+            const visual_col: usize = if (col >= total_col_offset)
+                sub_start_visual + @as(usize, col - total_col_offset)
+            else
+                sub_start_visual;
+
+            const target_col = self.visualColToByteCol(file_line, visual_col);
+
+            return .{ .line = file_line, .col = target_col };
+        }
+
+        // No wrap: 1 screen row = 1 buffer line.
         const target_line = @min(self.scroll_top + row, max_line);
 
         const c_offset = self.centerOffset();
@@ -3649,4 +3696,84 @@ test "mouse release clears is_dragging" {
 
     _ = ed.handleKey(.{ .mouse_release = .{ .row = 0, .col = 0 } });
     try std.testing.expect(!ed.is_dragging);
+}
+
+test "mouse click on wrapped continuation line" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+    cfg.word_wrap = true;
+    cfg.right_margin = 0;
+
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // With visible_cols=20 and no gutter, wrapWidth()=20.
+    // "aaaaa..." (25 chars) wraps: sub-line 0 = cols 0-19, sub-line 1 = cols 20-24.
+    // Screen row 0 = line 0 sub-line 0, screen row 1 = line 0 sub-line 1.
+    // "bbb\n" is on screen row 2 = line 1.
+    try ed.buf.insert(0, "aaaaaaaaaaaaaaaaaaaaaaaaa\nbbb\n");
+    ed.visible_cols = 20;
+    ed.visible_rows = 10;
+
+    // Click on screen row 1 (continuation of line 0). col 2 is the
+    // continuation indent, so col 3 maps to visual col 20+1 = byte 21.
+    _ = ed.handleKey(.{ .mouse_click = .{ .row = 1, .col = 3 } });
+    try std.testing.expectEqual(@as(usize, 0), ed.cursor.line);
+    try std.testing.expectEqual(@as(usize, 21), ed.cursor.col);
+
+    // Click on screen row 2 — should land on line 1 (after the wrapped line).
+    _ = ed.handleKey(.{ .mouse_click = .{ .row = 2, .col = 1 } });
+    try std.testing.expectEqual(@as(usize, 1), ed.cursor.line);
+    try std.testing.expectEqual(@as(usize, 1), ed.cursor.col);
+}
+
+test "mouse click after multiple wrapped lines" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+    cfg.word_wrap = true;
+    cfg.right_margin = 0;
+
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // Two long lines that each wrap into 2 screen rows at width 20,
+    // followed by a short line.
+    // Line 0: 25 chars -> screen rows 0-1
+    // Line 1: 25 chars -> screen rows 2-3
+    // Line 2: "end" -> screen row 4
+    try ed.buf.insert(0, "aaaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbbbbbb\nend\n");
+    ed.visible_cols = 20;
+    ed.visible_rows = 10;
+
+    // Click on screen row 4 should land on line 2.
+    _ = ed.handleKey(.{ .mouse_click = .{ .row = 4, .col = 0 } });
+    try std.testing.expectEqual(@as(usize, 2), ed.cursor.line);
+    try std.testing.expectEqual(@as(usize, 0), ed.cursor.col);
+}
+
+test "mouse click on wrap continuation clamps past line end" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+    cfg.word_wrap = true;
+    cfg.right_margin = 0;
+
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // 25-char line wraps at width 20; continuation has 5 chars (cols 20-24).
+    // Clicking at col 15 on the continuation should clamp to line length.
+    try ed.buf.insert(0, "aaaaaaaaaaaaaaaaaaaaaaaaa\n");
+    ed.visible_cols = 20;
+    ed.visible_rows = 10;
+
+    _ = ed.handleKey(.{ .mouse_click = .{ .row = 1, .col = 15 } });
+    try std.testing.expectEqual(@as(usize, 0), ed.cursor.line);
+    const info = ed.buf.getLine(0).?;
+    try std.testing.expect(ed.cursor.col <= info.len);
 }
