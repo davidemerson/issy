@@ -243,15 +243,30 @@ pub const Editor = struct {
         }
     }
 
-    /// Resolve `self.filename` to a canonical absolute path into `buf`
-    /// and return the slice, or null if the file can't be stat'd (e.g.
-    /// a brand-new file that hasn't been saved yet). Used for cursor-
-    /// position persistence — we key on realpath so the same file
-    /// opened via different relative paths still matches.
+    /// Resolve `self.filename` to an absolute path into `buf` and
+    /// return the slice, or null if `buf` is too small. Used for
+    /// cursor-position persistence — we key on the absolute form so
+    /// the same file opened via different relative paths still matches.
+    ///
+    /// Deliberately avoids `std.fs.Dir.realpath`, which resolves
+    /// symlinks via `/proc/self/fd/N` and is unsupported on OpenBSD.
+    /// Symlinks stay unresolved; absolute paths pass through unchanged,
+    /// relatives get cwd-prefixed. Same tradeoff as the rest of the
+    /// codebase (see commit a07881c for the prior migration).
     fn absFilename(self: *const Editor, buf: []u8) ?[]const u8 {
         if (self.filename_len == 0) return null;
         const fname = self.filename[0..self.filename_len];
-        return std.fs.cwd().realpath(fname, buf) catch null;
+        if (fname.len > 0 and fname[0] == '/') {
+            if (fname.len > buf.len) return null;
+            @memcpy(buf[0..fname.len], fname);
+            return buf[0..fname.len];
+        }
+        const cwd = std.posix.getcwd(buf) catch return null;
+        const needed = cwd.len + 1 + fname.len;
+        if (needed > buf.len) return null;
+        buf[cwd.len] = '/';
+        @memcpy(buf[cwd.len + 1 ..][0..fname.len], fname);
+        return buf[0..needed];
     }
 
     /// Save the current cursor's line/col under the current filename's

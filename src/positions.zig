@@ -218,14 +218,19 @@ test "record + lookup round-trip under a scratch path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &root_buf);
+    // Build the absolute positions.txt path manually. std.testing.tmpDir
+    // places the directory at .zig-cache/tmp/<sub_path> relative to cwd.
+    // Dir.realpath would be simpler but is unsupported on OpenBSD (uses
+    // /proc/self/fd/N), and the rest of the codebase avoids it too.
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = try std.posix.getcwd(&cwd_buf);
 
-    // Build a positions.txt path inside the tmpdir and pin it via the
-    // test-only override. Avoids process-wide HOME mutation and the
-    // libc dependency setenv would otherwise pull in.
     var pos_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const pos_path = try std.fmt.bufPrint(&pos_path_buf, "{s}/positions.txt", .{root});
+    const pos_path = try std.fmt.bufPrint(
+        &pos_path_buf,
+        "{s}/.zig-cache/tmp/{s}/positions.txt",
+        .{ cwd, &tmp.sub_path },
+    );
 
     test_path_override = pos_path;
     defer test_path_override = null;
