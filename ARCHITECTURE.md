@@ -53,11 +53,14 @@ The core text data structure. A contiguous byte array with a "gap" (unused regio
 
 The central struct. Owns the buffer, cursor(s), mode, undo/redo stacks, clipboard, and all editing logic.
 
-- **Modes**: `normal`, `search`, `command`, `confirm`, `replace`. Each mode has its own key handler.
+- **Modes**: `normal`, `search`, `command`, `confirm`, `replace`. Each mode has its own key handler. `confirm` carries a `confirm_action` discriminator (`quit` or `new`) so Ctrl+Q after Ctrl+N creates the new buffer instead of quitting. Confirm accepts Enter, Ctrl+Q, or Ctrl+W; Escape cancels.
 - **Undo/redo**: Each edit pushes an `UndoEntry` with position, deleted bytes (if any), and inserted length. Undo reverses the operation and pushes the inverse to the redo stack. Replace operations (which both delete and insert) produce a single combined entry.
 - **Bracket matching**: After each cursor move, scans up to 10,000 characters in each direction for matching `()[]{}` using a nesting-depth counter.
 - **Indent detection**: Scans the first 100 lines on file open. If >60% use tabs or spaces, overrides the config's `expand_tabs` and `tab_width` for that file.
 - **Multiple cursors**: `Ctrl+D` selects the word under cursor and finds the next occurrence. Editing operations apply to all cursors. Overlapping cursors merge. Escape clears extras.
+- **Bracketed paste**: On init the terminal enables DECSET 2004; `ESC[200~` / `ESC[201~` arrive as `paste_start` / `paste_end` keys. The editor toggles an `in_paste` flag across those markers, and while it's set, `insertNewline` skips auto-indent and `insertTab` inserts a literal `\t` so already-formatted pasted content lands verbatim.
+- **Missing-file open**: `openFile` treats `error.FileNotFound` as "open as a new empty buffer bound to this filename," so `issy newdoc.md` starts a new file and `Ctrl+S` writes directly. Other errors still surface.
+- **Selection-replace on typing**: `insertCodepoint`, `insertNewline`, and `insertTab` each delete the active selection before inserting, matching the backspace/delete behavior.
 
 ### term.zig -- Terminal Abstraction
 

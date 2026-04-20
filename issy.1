@@ -1,4 +1,4 @@
-.TH ISSY 1 "April 17, 2026" "issy 1.0.0" "General Commands Manual"
+.TH ISSY 1 "April 20, 2026" "issy 1.0.0" "General Commands Manual"
 .SH NAME
 issy \- a text editor that looks like a printed page
 .SH SYNOPSIS
@@ -38,6 +38,15 @@ requires a terminal.
 Standard input must be a tty; if it is not,
 .B issy
 prints a diagnostic to standard error and exits with status 1.
+.PP
+If the path given on the command line does not exist,
+.B issy
+opens an empty buffer bound to that filename, so
+.B issy
+.I newdoc.md
+behaves like a \(lqcreate new file\(rq and
+.B Ctrl+S
+writes directly to that path without first prompting.
 .SH OPTIONS
 .TP
 .BR \-\-version ", " \-v
@@ -110,8 +119,12 @@ to open or name a file first.
 Quit.
 If the buffer has unsaved changes, the status bar prompts for
 confirmation; press
+.B Enter
+or
 .B Ctrl+Q
-again to discard changes and exit.
+again to discard changes and exit, or
+.B Escape
+to cancel.
 .TP
 .B Ctrl+W
 Same as
@@ -133,6 +146,16 @@ Cut the current selection.
 .B Ctrl+V
 Paste from the internal clipboard.
 With multiple cursors active, the paste is applied at every cursor.
+.PP
+Terminal pastes (for example, Cmd+V in a GUI terminal) use bracketed
+paste mode (DECSET\ 2004).
+While a paste is in progress,
+.B Enter
+and
+.B Tab
+keystreams are inserted verbatim \(em auto-indent is suppressed and
+tabs are not expanded to spaces \(em so already-indented pasted content
+comes through without its left margin compounding.
 .TP
 .B Ctrl+A
 Select all text in the buffer.
@@ -161,6 +184,13 @@ If a selection is active, delete the selected text instead.
 .B Delete
 Delete the character under the cursor.
 If a selection is active, delete the selected text instead.
+.PP
+Typing a character, pressing
+.BR Tab ,
+or pressing
+.B Enter
+while a selection is active first deletes the selected text, so the
+keystroke replaces the selection rather than inserting around it.
 .SS Cursor movement
 .TP
 .B Arrow keys
@@ -251,7 +281,13 @@ to cancel.
 .B Ctrl+N
 Open a new empty buffer.
 If the current buffer has unsaved changes, the editor prompts for
-confirmation first.
+confirmation first; press
+.B Enter
+or
+.B Ctrl+Q
+to discard and start the new buffer, or
+.B Escape
+to cancel.
 .TP
 .B Ctrl+P
 Export the current buffer to a PDF file alongside the source file

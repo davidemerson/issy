@@ -138,6 +138,7 @@ issy [options] [file[:line]]
 ```sh
 issy main.zig
 issy src/editor.zig:42    # open at line 42
+issy newdoc.md            # start a new file at that path
 issy                      # empty buffer
 ```
 
@@ -169,7 +170,7 @@ issy --font /path/to/font.ttf --print output.pdf source.c
 | Key | Action |
 |---|---|
 | Ctrl+S | Save |
-| Ctrl+Q | Quit (press twice to discard unsaved changes) |
+| Ctrl+Q | Quit (on unsaved changes, press Enter or Ctrl+Q again to discard; Escape cancels) |
 | Ctrl+Z | Undo |
 | Ctrl+Y | Redo |
 | Ctrl+C | Copy selection |
@@ -178,6 +179,8 @@ issy --font /path/to/font.ttf --print output.pdf source.c
 | Ctrl+A | Select all |
 | Tab | Insert tab or spaces (per config) |
 | Enter | Newline with auto-indent |
+
+Typing, Tab, or Enter while a selection is active replaces the selection. Terminal pastes use bracketed paste (DECSET 2004): during a paste, auto-indent is suppressed and tabs land as literal `\t`, so already-indented content comes in verbatim instead of compounding.
 
 ### Navigation
 
@@ -216,7 +219,7 @@ issy --font /path/to/font.ttf --print output.pdf source.c
 | Key | Action |
 |---|---|
 | Ctrl+O | Open file (prompts for path) |
-| Ctrl+N | New empty buffer |
+| Ctrl+N | New empty buffer (on unsaved changes, prompts for confirmation) |
 | Ctrl+P | Export to PDF (requires `font_file` in config or `--font`) |
 | Ctrl+R | Reload file from disk |
 | Ctrl+W | Same as Ctrl+Q |
@@ -285,7 +288,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full flow, the cache layout, and 
 ## Architecture, testing, man page
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — tour of the source code and the major subsystems
-- `zig build test` — 666-test unit suite (gap buffer, Unicode, tokenizer, editor operations, mouse/selection, etc.)
+- `zig build test` — 678-test unit suite (gap buffer, Unicode, tokenizer, editor operations, mouse/selection, etc.)
 - `bash tests/run_tests.sh` — end-to-end integration suite via `expect`, launches the real binary in a PTY
 - `man ./issy.1` — man page
 

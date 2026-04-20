@@ -115,7 +115,7 @@ pub const Editor = struct {
     detected_expand_tabs: ?bool = null,
     detected_tab_width: ?u8 = null,
 
-    confirm_action: enum { none, quit } = .none,
+    confirm_action: enum { none, quit, new } = .none,
     command_action: enum { open, save_as } = .open,
 
     // True between a bracketed-paste start and end marker. While set,
@@ -511,7 +511,7 @@ pub const Editor = struct {
                 if (self.modified) {
                     self.mode = .confirm;
                     self.confirm_action = .quit;
-                    self.setStatusMessage("Unsaved changes. Ctrl+Q to discard.");
+                    self.setStatusMessage("Unsaved changes. Enter or Ctrl+Q to discard, Esc to cancel.");
                     return .redraw;
                 }
                 return .quit;
@@ -571,8 +571,8 @@ pub const Editor = struct {
             'n' => {
                 if (self.modified) {
                     self.mode = .confirm;
-                    self.confirm_action = .quit; // reuse for new
-                    self.setStatusMessage("Unsaved changes.");
+                    self.confirm_action = .new;
+                    self.setStatusMessage("Unsaved changes. Enter or Ctrl+Q to discard and start new, Esc to cancel.");
                     return .redraw;
                 }
                 self.newBuffer();
@@ -726,20 +726,33 @@ pub const Editor = struct {
     }
 
     fn handleConfirmKey(self: *Editor, key: term.Key) Action {
-        switch (key) {
-            .ctrl => |c| {
-                if (c == 'q' or c == 'w') {
-                    return .force_quit;
-                }
-            },
+        const confirmed = switch (key) {
+            .enter => true,
+            .ctrl => |c| c == 'q' or c == 'w',
             .escape => {
+                self.mode = .normal;
+                self.confirm_action = .none;
+                self.status_msg_len = 0;
+                return .redraw;
+            },
+            else => false,
+        };
+        if (!confirmed) return .none;
+
+        // Dispatch based on which action asked for confirmation.
+        // Without this, Ctrl+N → Ctrl+Q used to silently force_quit
+        // because handleConfirmKey ignored confirm_action.
+        const action = self.confirm_action;
+        self.confirm_action = .none;
+        switch (action) {
+            .quit, .none => return .force_quit,
+            .new => {
+                self.newBuffer();
                 self.mode = .normal;
                 self.status_msg_len = 0;
                 return .redraw;
             },
-            else => {},
         }
-        return .none;
     }
 
     fn handleReplaceKey(self: *Editor, key: term.Key) Action {
