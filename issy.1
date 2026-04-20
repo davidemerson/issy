@@ -378,6 +378,16 @@ on startup, unless
 .B \-\-no\-config
 is given or an alternate file is specified with
 .BR \-\-config .
+.B issy
+also polls the config file's modification time once per second and
+re-reads it when it changes, so edits to
+.I ~/.issyrc
+take effect on the next frame without restarting.
+Command-line overrides from
+.B \-\-theme
+and
+.B \-\-font
+are reapplied on every reload.
 .PP
 The file format is line-oriented.
 Lines starting with

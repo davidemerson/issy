@@ -33,6 +33,23 @@ const Args = struct {
     rollback: bool = false,
 };
 
+/// Apply --theme/--font overrides on top of a freshly-loaded Config.
+/// Broken out so config auto-reload can reapply them after re-reading
+/// ~/.issyrc; otherwise a reload would silently drop CLI overrides.
+fn applyCliOverrides(cfg: *config_mod.Config, args: Args) void {
+    if (args.theme) |t| {
+        if (std.mem.eql(u8, t, "paper")) {
+            cfg.theme = config_mod.paper_theme;
+        }
+    }
+    if (args.font) |f| {
+        if (f.len <= 512) {
+            @memcpy(cfg.font_file[0..f.len], f);
+            cfg.font_file_len = f.len;
+        }
+    }
+}
+
 fn parseArgs() Args {
     var args_result = Args{};
     var args_iter = std.process.args();
@@ -124,24 +141,31 @@ pub fn main() !void {
         return;
     }
 
-    // Load config
-    var cfg = config_mod.Config.init();
+    // Resolve the config path (--config wins, otherwise default ~/.issyrc).
+    // We hold on to the path + mtime so the main loop can auto-reload
+    // when the user edits the config file in another window (or in issy
+    // itself).
+    var cfg_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var cfg_path_len: usize = 0;
+    var cfg_mtime: i128 = 0;
+
     if (!args.no_config) {
-        cfg = config_mod.load(allocator, args.config_path);
+        if (args.config_path) |p| {
+            if (p.len <= cfg_path_buf.len) {
+                @memcpy(cfg_path_buf[0..p.len], p);
+                cfg_path_len = p.len;
+            }
+        } else if (config_mod.resolveDefaultPath(cfg_path_buf[0..])) |p| {
+            cfg_path_len = p.len;
+        }
     }
 
-    // CLI overrides
-    if (args.theme) |t| {
-        if (std.mem.eql(u8, t, "paper")) {
-            cfg.theme = config_mod.paper_theme;
-        }
+    var cfg = config_mod.Config.init();
+    if (cfg_path_len > 0) {
+        cfg = config_mod.load(allocator, cfg_path_buf[0..cfg_path_len]);
+        if (config_mod.statMtime(cfg_path_buf[0..cfg_path_len])) |m| cfg_mtime = m;
     }
-    if (args.font) |f| {
-        if (f.len <= 512) {
-            @memcpy(cfg.font_file[0..f.len], f);
-            cfg.font_file_len = f.len;
-        }
-    }
+    applyCliOverrides(&cfg, args);
 
     // Init editor
     var ed = editor_mod.Editor.init(&cfg, allocator);
@@ -251,6 +275,20 @@ pub fn main() !void {
         const now = std.time.milliTimestamp();
         if (now - last_stat_check > 1000) {
             ed.checkFileChanged();
+            // Config auto-reload: if ~/.issyrc (or --config path) has a
+            // newer mtime than what we last loaded, reread it and
+            // reapply CLI overrides. Failure is silent — the editor
+            // keeps using the previous config rather than blanking it.
+            if (cfg_path_len > 0) {
+                if (config_mod.statMtime(cfg_path_buf[0..cfg_path_len])) |m| {
+                    if (m != cfg_mtime) {
+                        cfg = config_mod.load(allocator, cfg_path_buf[0..cfg_path_len]);
+                        applyCliOverrides(&cfg, args);
+                        cfg_mtime = m;
+                        ed.setStatusMessage("Config reloaded.");
+                    }
+                }
+            }
             last_stat_check = now;
         }
 

@@ -2,6 +2,8 @@
 
 issy reads its configuration from `~/.issyrc`. You can override the path with `--config`. The installer seeds a commented default `~/.issyrc` on first install.
 
+**Live reload.** issy re-reads the config file automatically when its modification time changes (checked once per second). Save your changes and you'll see `Config reloaded.` in the status bar; colors, tab width, margins, cursor shape, and other settings take effect on the next frame without restarting. `--theme` and `--font` from the command line are reapplied after every reload so they keep winning over file values.
+
 ## File Format
 
 Plain text, line-oriented:

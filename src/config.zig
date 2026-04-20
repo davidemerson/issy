@@ -142,11 +142,13 @@ fn initThemeName(comptime name: []const u8) [64]u8 {
     return buf;
 }
 
-/// Load configuration from a file. If path is null, try default path.
+/// Load configuration from a file. If `path` is null, returns the
+/// default Config unchanged; callers that want ~/.issyrc should
+/// resolve it themselves with `resolveDefaultPath` and pass it in.
 pub fn load(allocator: std.mem.Allocator, path: ?[]const u8) Config {
     var cfg = Config.init();
 
-    const actual_path = path orelse (defaultPath() orelse return cfg);
+    const actual_path = path orelse return cfg;
     _ = allocator;
 
     const file = std.fs.cwd().openFile(actual_path, .{}) catch return cfg;
@@ -305,22 +307,28 @@ pub fn parseHexColor(s: []const u8) ?Color {
     return .{ .rgb = .{ .r = r, .g = g, .b = b } };
 }
 
-/// Return default config path, or null if not available.
-pub fn defaultPath() ?[]const u8 {
-    // Try ~/.issyrc on POSIX
-    if (std.process.getEnvVarOwned(std.heap.page_allocator, "HOME")) |home| {
-        defer std.heap.page_allocator.free(home);
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const path = std.fmt.bufPrint(&buf, "{s}/.issyrc", .{home}) catch return null;
-        if (std.fs.cwd().access(path, .{})) |_| {
-            // File exists but we can't return a temp buffer
-            return null; // Caller should construct the path
-        } else |_| {
-            return null;
-        }
-    } else |_| {
-        return null;
-    }
+/// Write the default config path ($HOME/.issyrc) into `buf` and
+/// return a slice into it. Returns null if HOME is unset or the path
+/// doesn't fit in the provided buffer. Does not check whether the
+/// file actually exists — callers that need that signal should stat
+/// the returned path themselves.
+pub fn resolveDefaultPath(buf: []u8) ?[]const u8 {
+    const home = std.posix.getenv("HOME") orelse return null;
+    const suffix = "/.issyrc";
+    const needed = home.len + suffix.len;
+    if (needed > buf.len) return null;
+    @memcpy(buf[0..home.len], home);
+    @memcpy(buf[home.len..][0..suffix.len], suffix);
+    return buf[0..needed];
+}
+
+/// Stat `path` and return its mtime, or null on any error. Used by
+/// the config-reload watcher to decide when ~/.issyrc has changed.
+pub fn statMtime(path: []const u8) ?i128 {
+    const file = std.fs.cwd().openFile(path, .{}) catch return null;
+    defer file.close();
+    const s = file.stat() catch return null;
+    return s.mtime;
 }
 
 // ── Tests ──
@@ -350,6 +358,37 @@ test "parseHexColor invalid" {
     try std.testing.expectEqual(@as(?Color, null), parseHexColor("ff8800"));
     try std.testing.expectEqual(@as(?Color, null), parseHexColor("#gg0000"));
     try std.testing.expectEqual(@as(?Color, null), parseHexColor("#fff"));
+}
+
+test "resolveDefaultPath returns HOME/.issyrc when HOME is set" {
+    // std.posix.getenv reads the real environment; for a deterministic
+    // test we only assert the shape of the result when HOME is present.
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const maybe = resolveDefaultPath(&buf);
+    if (maybe) |p| {
+        try std.testing.expect(std.mem.endsWith(u8, p, "/.issyrc"));
+        try std.testing.expect(p.len > "/.issyrc".len);
+    }
+}
+
+test "resolveDefaultPath returns null for too-small buffer" {
+    var small: [3]u8 = undefined;
+    try std.testing.expectEqual(@as(?[]const u8, null), resolveDefaultPath(&small));
+}
+
+test "statMtime returns null for missing file" {
+    try std.testing.expectEqual(@as(?i128, null), statMtime("/nonexistent/path/that/should/not/exist/abc123"));
+}
+
+test "load with null path returns defaults" {
+    const cfg = load(std.testing.allocator, null);
+    try std.testing.expectEqual(@as(u8, 4), cfg.tab_width);
+    try std.testing.expectEqualSlices(u8, "default", cfg.getThemeName());
+}
+
+test "load with missing path returns defaults" {
+    const cfg = load(std.testing.allocator, "/nonexistent/issyrc");
+    try std.testing.expectEqual(@as(u8, 4), cfg.tab_width);
 }
 
 test "paper theme has light bg" {
