@@ -262,6 +262,10 @@ font_file = "/path/to/font.ttf"
 
 ---
 
+## Per-file cursor memory
+
+Quit a file and issy remembers the cursor position at `~/.cache/issy/positions.txt`; reopening the same file restores the caret automatically. Positions are keyed by absolute path, capped at 300 entries with an LRU-ish "newest on top" layout, and lose gracefully (corrupt file or missing HOME is a silent no-op). Explicit `file:line` on the command line always wins over the saved position.
+
 ## Syntax highlighting
 
 C, C++, Zig, Python, JavaScript, TypeScript, Rust, Go, Shell, HTML, CSS, JSON, YAML, TOML, Makefile, Markdown, TeX/LaTeX. Language is detected by file extension.
@@ -289,7 +293,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full flow, the cache layout, and 
 ## Architecture, testing, man page
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — tour of the source code and the major subsystems
-- `zig build test` — 769-test unit suite (gap buffer, Unicode, tokenizer, editor operations, mouse/selection, etc.)
+- `zig build test` — 789-test unit suite (gap buffer, Unicode, tokenizer, editor operations, mouse/selection, etc.)
 - `bash tests/run_tests.sh` — end-to-end integration suite via `expect`, launches the real binary in a PTY
 - `man ./issy.1` — man page
 

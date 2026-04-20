@@ -1,0 +1,105 @@
+#!/usr/bin/expect -f
+# t15_positions.exp -- per-file cursor memory round-trip
+#
+# Opens a multi-line file, moves the cursor, quits, reopens, then types
+# a marker. If cursor memory works, the marker lands where we left off.
+# Runs under a scratch HOME so the real ~/.cache/issy/positions.txt is
+# untouched.
+
+set timeout 8
+set issy [lindex $argv 0]
+set test_dir [lindex $argv 1]
+source "$test_dir/helpers.tcl"
+
+set tmpdir [exec mktemp -d]
+set testhome "$tmpdir/home"
+exec mkdir -p "$testhome"
+set env(HOME) "$testhome"
+
+# --- P1: cursor position restored across open/quit/reopen ---
+set f "$tmpdir/p1.txt"
+exec sh -c "printf 'alpha\nbeta\ngamma\ndelta\n' > $f"
+
+# First session: move cursor down twice and right twice, then quit
+# without edits. That lands it at line 2, col 2 (0-indexed) = "gamma"
+# between 'g' and 'amma' plus ... wait: down 2 from line 0 col 0 = line 2.
+# right 2 from col 0 = col 2. So cursor is in "gamma" between 'ga' and 'mma'.
+spawn $issy --no-config "$f"
+sleep 0.8
+arrow down
+arrow down
+arrow right
+arrow right
+sleep 0.2
+send "\x11"; # Ctrl+Q (clean quit)
+expect eof
+wait
+
+# Second session: reopen, immediately type a marker, save, quit. If
+# the position was restored, the marker lands at line 2 col 2.
+spawn $issy --no-config "$f"
+sleep 0.8
+send "!"
+sleep 0.2
+send "\x13"; # Ctrl+S
+sleep 0.3
+send "\x11"; # Ctrl+Q
+expect eof
+wait
+
+# Expect: "alpha\nbeta\nga!mma\ndelta\n"
+record_result [assert_file $f "alpha\nbeta\nga!mma\ndelta\n" "P1_cursor_restored_after_quit"]
+
+# --- P2: explicit :line on the command line wins over the saved pos ---
+# Cursor just above still points at line 2 col 3 (one past '!' in "ga!mma").
+# Reopen with :1 — line 1 (0-indexed 0) — and drop a marker there.
+set f2 "$tmpdir/p2.txt"
+exec sh -c "printf 'one\ntwo\nthree\n' > $f2"
+
+# Seed a position: open, move to line 3, quit.
+spawn $issy --no-config "$f2"
+sleep 0.8
+arrow down
+arrow down
+sleep 0.2
+send "\x11"
+expect eof
+wait
+
+# Reopen with :1 — should override the saved position.
+spawn $issy --no-config "$f2:1"
+sleep 0.8
+send "@"
+sleep 0.2
+send "\x13"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+
+# Line 1 (1-indexed) is "one"; marker lands at col 0 of line 1: "@one".
+record_result [assert_file $f2 "@one\ntwo\nthree\n" "P2_explicit_line_overrides_saved"]
+
+# --- P3: missing positions file is a silent no-op ---
+# Brand-new file in fresh HOME — no positions store exists yet.
+# Opening and quitting must not error.
+set testhome2 "$tmpdir/home2"
+exec mkdir -p "$testhome2"
+set env(HOME) "$testhome2"
+
+set f3 "$tmpdir/p3.txt"
+exec sh -c "printf 'x\n' > $f3"
+spawn $issy --no-config "$f3"
+sleep 0.8
+send "\x11"
+expect eof
+wait
+puts stderr "PASS P3_missing_positions_file_ok"
+record_result 1
+
+# Restore HOME
+set env(HOME) "$testhome"
+
+# Cleanup
+exec rm -rf $tmpdir
+report_results "t15_positions"

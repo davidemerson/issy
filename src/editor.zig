@@ -12,6 +12,7 @@ const syntax_mod = @import("syntax.zig");
 const config_mod = @import("config.zig");
 const term = @import("term.zig");
 const unicode = @import("unicode.zig");
+const positions_mod = @import("positions.zig");
 
 pub const Mode = enum { normal, search, command, confirm, replace, help };
 pub const Action = enum { none, quit, force_quit, redraw, prompt, export_pdf };
@@ -183,6 +184,10 @@ pub const Editor = struct {
             }
         }
 
+        // If we're replacing an existing file's buffer, remember where
+        // the cursor was so the next open of that same file restores.
+        self.persistCursor();
+
         // Missing file → open as an empty new buffer bound to that
         // filename. This makes `issy newdoc.md` behave like a "create
         // new file" rather than surfacing a FileNotFound error.
@@ -227,12 +232,50 @@ pub const Editor = struct {
             return;
         }
 
-        // Jump to line if specified
+        // An explicit file:line override wins over any remembered
+        // position; otherwise consult the positions store.
         if (goto_line) |line| {
             const max_line = if (self.buf.lineCount() > 0) self.buf.lineCount() - 1 else 0;
             self.cursor.line = @min(line, max_line);
             self.ensureCursorVisible();
+        } else {
+            self.restoreCursorFromPositions();
         }
+    }
+
+    /// Resolve `self.filename` to a canonical absolute path into `buf`
+    /// and return the slice, or null if the file can't be stat'd (e.g.
+    /// a brand-new file that hasn't been saved yet). Used for cursor-
+    /// position persistence — we key on realpath so the same file
+    /// opened via different relative paths still matches.
+    fn absFilename(self: *const Editor, buf: []u8) ?[]const u8 {
+        if (self.filename_len == 0) return null;
+        const fname = self.filename[0..self.filename_len];
+        return std.fs.cwd().realpath(fname, buf) catch null;
+    }
+
+    /// Save the current cursor's line/col under the current filename's
+    /// realpath. Called on save, on open (for the outgoing buffer), and
+    /// on quit. No-op if the file has no resolvable path yet.
+    pub fn persistCursor(self: *const Editor) void {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const abs = self.absFilename(&path_buf) orelse return;
+        positions_mod.record(abs, self.cursor.line, self.cursor.col);
+    }
+
+    fn restoreCursorFromPositions(self: *Editor) void {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const abs = self.absFilename(&path_buf) orelse return;
+        const pos = positions_mod.lookup(abs) orelse return;
+        const max_line = if (self.buf.lineCount() > 0) self.buf.lineCount() - 1 else 0;
+        self.cursor.line = @min(pos.line, max_line);
+        if (self.buf.getLine(self.cursor.line)) |info| {
+            self.cursor.col = @min(pos.col, info.len);
+        } else {
+            self.cursor.col = 0;
+        }
+        self.cursor.col_want = self.cursor.col;
+        self.ensureCursorVisible();
     }
 
     fn updateMtime(self: *Editor) void {
@@ -732,6 +775,7 @@ pub const Editor = struct {
                             };
                             self.modified = false;
                             self.updateMtime();
+                            self.persistCursor();
                             self.setStatusMessage("Saved.");
                         }
                     },
@@ -2649,6 +2693,10 @@ pub const Editor = struct {
         // Re-detect syntax from the (possibly renamed) filename so
         // `:w foo.py` after opening `foo.txt` picks up Python highlighting.
         self.language = syntax_mod.detect(self.filename[0..self.filename_len]);
+        // Refresh the positions store now that the file exists (the
+        // first save of a new file would otherwise lose its cursor
+        // state on quit since realpath would have failed earlier).
+        self.persistCursor();
         self.setStatusMessage("Saved.");
     }
 

@@ -641,11 +641,30 @@ Use
 to revert after an apply, or set
 .B notify_updates = false
 to disable the entire mechanism.
+.SH PER-FILE CURSOR MEMORY
+.B issy
+remembers where the cursor was when a file was last closed (or last
+saved) and restores that position automatically the next time the
+same file is opened.
+Positions are keyed by the file's canonical absolute path, so opening
+the same file via different relative paths still matches.
+Explicit
+.B file:line
+overrides on the command line win over the remembered position.
+The on-disk store lives at
+.I ~/.cache/issy/positions.txt
+as a plain text file with one
+.BR <path>\et<line>\et<col>
+entry per line, newest at top, capped at 300 entries.
+Corrupt or missing files are a silent no-op; the feature is
+best-effort and never blocks the editor.
 .SH ENVIRONMENT
 .TP
 .B HOME
 Used to locate the default configuration file
-.RI ( $HOME/.issyrc )
+.RI ( $HOME/.issyrc ),
+the per-file cursor memory store
+.RI ( $HOME/.cache/issy/positions.txt ),
 and the auto-update cache directory
 .RI ( $HOME/.cache/issy/ ).
 .SH FILES
@@ -665,10 +684,14 @@ and
 .I sha256sums.txt.sig
 (signed manifest),
 .I issy.staged
-(verified binary ready for apply), and
+(verified binary ready for apply),
 .I issy.prev
 (snapshot of the binary before the last apply, used by
-.BR \-\-rollback ).
+.BR \-\-rollback ),
+and
+.I positions.txt
+(per-file cursor memory \(em see
+.BR "PER-FILE CURSOR MEMORY" ).
 .SH EXIT STATUS
 .TP
 .B 0

@@ -13,6 +13,7 @@ src/
   term.zig        Raw terminal I/O abstraction
   syntax.zig      Tokenizer and language definitions
   config.zig      Configuration, themes, color constants
+  positions.zig   Per-file cursor memory (~/.cache/issy/positions.txt)
   unicode.zig     UTF-8 encode/decode utilities
   font.zig        TTF/OTF parser for PDF embedding
   print.zig       PDF 1.4 generation
@@ -101,6 +102,15 @@ Defines all settings with compile-time defaults. Includes two built-in themes (d
 - **Parser**: Reads the entire config file into a stack buffer, splits by newlines, parses `key = value` pairs. Supports `[theme.name]` sections and `#rrggbb` hex colors.
 - **Print theme**: A separate `PrintTheme` struct with colors tuned for ink on white paper. Used exclusively by `print.zig`.
 - **Live reload**: `resolveDefaultPath(buf)` resolves `$HOME/.issyrc` into a caller-provided buffer; `statMtime(path)` returns the file's current mtime. The main loop's existing 1/sec stat tick compares the config path's mtime against the one captured at startup and calls `load()` + `applyCliOverrides()` again when it changes. No file watcher — the poll is free-riding on the same tick that handles external edits to the open buffer.
+
+### positions.zig -- Per-File Cursor Memory
+
+Stores the most-recent cursor (line, col) per file path to `~/.cache/issy/positions.txt`, so reopening a file drops the caret back where you left it. Best-effort — any I/O error silently disables persistence for that call, and the feature is keyed on `realpath`'d absolute paths so the same file opened via different relative paths matches.
+
+- **File format**: one entry per line, `<abs_path>\t<line>\t<col>\n`. Newest on top. Capped at 300 entries — the oldest get dropped on the next write. Parsing splits from the right on tabs so paths that themselves contain tabs still decode correctly.
+- **Atomic write**: same `.tmp` + rename pattern `buffer.zig` uses for source saves.
+- **Integration**: `Editor.persistCursor` is called from (a) the main loop's quit branch, (b) `save` / save-as, and (c) the top of `openFile` before the outgoing buffer is replaced. `openFile` then calls `restoreCursorFromPositions` to consult the store, clamped to the loaded file's actual dimensions.
+- **Override**: an explicit `file:line` on the command line always wins over the remembered position.
 
 ### font.zig -- TTF/OTF Parser
 

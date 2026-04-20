@@ -162,3 +162,14 @@ When `auto_detect_indent` is enabled (the default), issy scans the first 100 lin
 ## Example
 
 See [examples/issyrc](examples/issyrc) for a fully commented example configuration.
+
+## Cache Files
+
+issy keeps a small cache directory at `~/.cache/issy/`:
+
+| File | Purpose |
+|------|---------|
+| `commit.txt`, `sha256sums.txt`, `sha256sums.txt.sig`, `issy.staged`, `issy.prev` | Auto-update state — see [README](README.md#auto-update). |
+| `positions.txt` | Per-file cursor memory. One `<abs_path>\t<line>\t<col>` entry per line, newest on top, capped at 300 entries. Corruption or a missing file is treated as "no saved positions" — the feature is best-effort. Delete it any time to reset. |
+
+Nothing in `~/.cache/issy/` is required for correct operation; it can be wiped without data loss.

@@ -294,7 +294,12 @@ pub fn main() !void {
 
         // Handle key
         switch (ed.handleKey(key)) {
-            .quit, .force_quit => break,
+            .quit, .force_quit => {
+                // Remember where the cursor was so the next open of
+                // this file drops the caret back in place.
+                ed.persistCursor();
+                break;
+            },
             .export_pdf => {
                 // Editor guarantees filename + font_file are populated
                 // before it returns this action. Write to
@@ -333,4 +338,5 @@ test {
     _ = @import("editor.zig");
     _ = @import("font.zig");
     _ = @import("print.zig");
+    _ = @import("positions.zig");
 }
