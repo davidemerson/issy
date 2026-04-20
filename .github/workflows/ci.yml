@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
     branches: [main]
 
@@ -242,8 +243,8 @@ jobs:
 
           # macOS is intentionally omitted: cross-compiled Mach-O from Linux
           # has no LC_CODE_SIGNATURE and is rejected by the Apple Silicon
-          # kernel. Mac users install via `brew install --HEAD davidemerson/issy/issy`
-          # or build from source with `zig build`.
+          # kernel. Mac users install via `brew install davidemerson/issy/issy`
+          # (or `--HEAD` for main) or build from source with `zig build`.
           # OpenBSD also can't be cross-compiled from Linux (Zig doesn't
           # ship OpenBSD libc headers); the binary comes from the
           # openbsd-test job's artifact, downloaded in the next step.
@@ -317,4 +318,149 @@ jobs:
 
           Installs to \`~/.local/bin/issy\`, verifies the Ed25519 signature on the release manifest, and seeds \`~/.issyrc\` with commented defaults. See the [README](https://github.com/davidemerson/issy#install) for details." \
             --latest \
+            dist/*
+
+  # Versioned release on `vX.Y.Z` tag push. Does two things the rolling
+  # `latest` release doesn't: (1) publishes a permanent, per-version GitHub
+  # release with the built binaries, and (2) bumps the Homebrew formula's
+  # stable `url` + `sha256` on main so `brew upgrade issy` picks up the new
+  # version without the uninstall+reinstall dance a head-only formula needs.
+  # Developer flow to cut a release: bump `version` in build.zig.zon, commit
+  # to main, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
+  release-tag:
+    needs: [test, openbsd-test, macos-test, homebrew-test]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Derive version from tag
+        id: ver
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          path: build
+
+      - name: Cache Zig
+        id: cache-zig
+        uses: actions/cache@v4
+        with:
+          path: ~/zig
+          key: zig-x86_64-linux-${{ env.ZIG_VERSION }}
+
+      - name: Install Zig
+        if: steps.cache-zig.outputs.cache-hit != 'true'
+        run: |
+          curl -L -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          mkdir -p ~/zig
+          tar xf zig.tar.xz -C ~/zig --strip-components=1
+
+      - name: Add Zig to PATH
+        run: echo "$HOME/zig" >> $GITHUB_PATH
+
+      - name: Build Linux targets
+        working-directory: build
+        run: |
+          mkdir -p dist
+          for target in x86_64-linux-gnu aarch64-linux-gnu; do
+            case "$target" in
+              x86_64-linux-gnu)  name=issy-linux-amd64 ;;
+              aarch64-linux-gnu) name=issy-linux-arm64 ;;
+            esac
+            echo "::group::Building $target"
+            zig build -Dtarget=$target -Doptimize=ReleaseSafe
+            cp zig-out/bin/issy "dist/$name"
+            chmod +x "dist/$name"
+            echo "::endgroup::"
+          done
+
+      - name: Download OpenBSD binary from openbsd-test job
+        uses: actions/download-artifact@v4
+        with:
+          name: issy-openbsd-amd64
+          path: build/dist/
+
+      - name: Finalize release manifest
+        working-directory: build
+        run: |
+          chmod +x dist/issy-openbsd-amd64
+          git rev-parse HEAD > dist/commit.txt
+          (cd dist && sha256sum issy-* > sha256sums.txt)
+          ls -lh dist/
+
+      - name: Sign sha256sums.txt
+        working-directory: build
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          if [ -z "${UPDATE_SIGNING_KEY:-}" ]; then
+            echo "::warning::UPDATE_SIGNING_KEY secret is not set — auto-update signature will be missing from this release."
+            exit 0
+          fi
+          tmp=$(mktemp --suffix=.pem)
+          trap 'rm -f "$tmp"' EXIT
+          printf '%s\n' "$UPDATE_SIGNING_KEY" > "$tmp"
+          openssl pkeyutl -sign -inkey "$tmp" -rawin \
+            -in dist/sha256sums.txt -out dist/sha256sums.txt.sig
+
+      - name: Stage manpage
+        working-directory: build
+        run: cp issy.1 dist/issy.1
+
+      # Hash the source tarball GitHub generates for the tag. This is what
+      # Homebrew downloads for `brew install issy`, so it must match bit-for-bit
+      # what ends up in the formula. Retry a few times — the archive endpoint
+      # can lag for a freshly-pushed tag.
+      - name: Compute source-tarball sha256
+        id: tarball
+        run: |
+          url="https://github.com/davidemerson/issy/archive/refs/tags/${TAG}.tar.gz"
+          for attempt in 1 2 3 4 5 6; do
+            if curl -fsSL "$url" -o tarball.tar.gz; then
+              break
+            fi
+            echo "attempt $attempt failed, sleeping 10s"
+            sleep 10
+          done
+          test -s tarball.tar.gz || { echo "failed to fetch $url"; exit 1; }
+          sha256=$(sha256sum tarball.tar.gz | cut -d' ' -f1)
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+          echo "tarball sha256: $sha256"
+
+      - name: Checkout main for formula bump
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: main-branch
+          token: ${{ github.token }}
+
+      - name: Bump Homebrew formula on main
+        working-directory: main-branch
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          SHA256: ${{ steps.tarball.outputs.sha256 }}
+        run: |
+          python3 .github/scripts/bump_formula.py Formula/issy.rb "$VERSION" "$SHA256"
+          if git diff --quiet Formula/issy.rb; then
+            echo "Formula/issy.rb already at v$VERSION — nothing to commit."
+            exit 0
+          fi
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "chore(formula): bump to v${VERSION}" Formula/issy.rb
+          git push origin main
+
+      - name: Create versioned GitHub release
+        working-directory: build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" \
+            --title "issy $TAG" \
+            --generate-notes \
             dist/*

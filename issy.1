@@ -633,7 +633,11 @@ On macOS,
 does not ship prebuilt binaries because cross-compiled Mach-O from
 Linux lacks a code signature and is rejected by the Apple Silicon kernel.
 The notify path still works; run
+.B "brew upgrade issy"
+(or
 .B "brew upgrade \-\-fetch\-HEAD issy"
+if installed with
+.BR \-\-HEAD )
 or rebuild from source to update.
 .PP
 Use

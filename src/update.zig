@@ -75,11 +75,12 @@ fn currentAssetName() ?[]const u8 {
             else => null,
         },
         // macOS does not ship prebuilt binaries — install via Homebrew tap
-        // (`brew install --HEAD davidemerson/issy/issy`) or from source, so
-        // auto-apply has nothing to download. The notify-only path continues
-        // to work: commit.txt comparison shows "update available" in the
-        // status bar, and users run `brew upgrade --fetch-HEAD issy` to act
-        // on it.
+        // (`brew install davidemerson/issy/issy`, or `--HEAD` for main) or
+        // from source, so auto-apply has nothing to download. The notify-only
+        // path continues to work: commit.txt comparison shows "update
+        // available" in the status bar, and users run `brew upgrade issy`
+        // (or `brew upgrade --fetch-HEAD issy` for HEAD installs) to act on
+        // it.
         .macos => null,
         .openbsd => switch (builtin.target.cpu.arch) {
             .x86_64 => "issy-openbsd-amd64",

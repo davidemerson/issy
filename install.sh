@@ -217,7 +217,7 @@ error: zig is required to build from source on $OS/$ARCH.
 
 On macOS you can also use Homebrew:
   brew tap davidemerson/issy https://github.com/davidemerson/issy
-  brew install --HEAD issy
+  brew install issy
 EOF
         exit 1
     fi

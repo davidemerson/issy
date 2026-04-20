@@ -170,9 +170,11 @@ Standalone program, built and run via `zig build keygen`. Generates a fresh Ed25
 
 ## macOS distribution
 
-macOS does not ship prebuilt binaries in GitHub releases. Cross-compiled Mach-O from Linux has no `LC_CODE_SIGNATURE` load command and the Apple Silicon kernel refuses to `execve` it. Rather than grow a cross-signing pipeline, macOS users install via a Homebrew HEAD-install formula (`Formula/issy.rb`) that depends on Zig and builds from source, producing a native host-signed binary that just works on both Intel and Apple Silicon.
+macOS does not ship prebuilt binaries in GitHub releases. Cross-compiled Mach-O from Linux has no `LC_CODE_SIGNATURE` load command and the Apple Silicon kernel refuses to `execve` it. Rather than grow a cross-signing pipeline, macOS users install via a Homebrew formula (`Formula/issy.rb`) that depends on Zig and builds from source, producing a native host-signed binary that just works on both Intel and Apple Silicon.
 
-The auto-update worker's `currentAssetName()` in `src/update.zig` returns `null` for macOS, which disables the download/verify/stage codepath on that platform. The notify-only path still runs (reads `commit.txt` from the latest release and compares against `build_info.commit_sha`), so macOS users see the "update available" notice in the footer and run `brew upgrade --fetch-HEAD issy` to act on it. CI includes a macOS cross-compile smoke test to catch compilation regressions that would break the brew build.
+The formula carries both a stable block (`url` + `sha256` pointing at a tagged source tarball) and a `head` spec. The stable block is regenerated on every `vX.Y.Z` tag push by the `release-tag` job in `.github/workflows/ci.yml`, which downloads the GitHub-generated source tarball, hashes it, and runs `.github/scripts/bump_formula.py` to rewrite the block between its `STABLE_BEGIN`/`STABLE_END` markers, then commits the result back to `main`. Upshot: `brew install issy` / `brew upgrade issy` behave like any other versioned formula, and `brew install --HEAD issy` remains available for users who want to track `main` between tags.
+
+The auto-update worker's `currentAssetName()` in `src/update.zig` returns `null` for macOS, which disables the download/verify/stage codepath on that platform. The notify-only path still runs (reads `commit.txt` from the latest release and compares against `build_info.commit_sha`), so macOS users see the "update available" notice in the footer and run `brew upgrade issy` (or `brew upgrade --fetch-HEAD issy` for HEAD installs) to act on it. CI includes a macOS cross-compile smoke test and a real-macOS homebrew-test job to catch compilation regressions that would break the brew build.
 
 ## Design Constraints
 

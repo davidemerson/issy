@@ -87,16 +87,17 @@ sh install.sh
 
 ```sh
 brew tap davidemerson/issy https://github.com/davidemerson/issy
-brew install --HEAD issy
+brew install issy
 ```
 
-**Upgrade:** `brew upgrade --fetch-HEAD issy`. Plain `brew upgrade` is a no-op for HEAD-only formulas — it only bumps versioned formulas, so without `--fetch-HEAD` you'll keep running whatever you installed first, including its older man page. If you ever see `man issy` showing stale content after an upgrade, force a full rebuild:
+**Upgrade:** `brew upgrade issy`. The formula tracks tagged releases (`vX.Y.Z`), so this is the same one-liner you'd use for any Homebrew package — no `--fetch-HEAD`, no uninstall+reinstall dance. CI maintains the formula's `url` + `sha256` automatically on every tag push (see `.github/workflows/ci.yml` → `release-tag` job).
+
+Want the bleeding edge between releases?
 
 ```sh
-brew uninstall issy && brew install --HEAD issy
+brew install --HEAD issy     # build from main
+brew upgrade --fetch-HEAD issy
 ```
-
-(`brew reinstall` does not accept `--HEAD`; the uninstall+install pair is the supported way to force a HEAD refresh.)
 
 The curl installer also works on macOS — use whichever you prefer.
 

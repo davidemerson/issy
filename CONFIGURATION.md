@@ -53,7 +53,7 @@ Blank lines and lines starting with `#` are ignored. Unknown keys are silently s
 
 Both keys are no-ops for `dev` builds (any working tree that wasn't built from a clean CI checkout). Both are also no-ops if the editor binary itself is not writable by the running user — this is the common case for distro-packaged installs at `/usr/bin/issy`, where auto-apply silently stays in notify-only mode.
 
-**macOS specifically**: `autoupdate = true` is silently a no-op because issy does not ship prebuilt macOS binaries (cross-compiled Mach-O from Linux has no code signature and is refused by the Apple Silicon kernel). `notify_updates` still works — macOS users see the "update available" notice and run `brew upgrade --fetch-HEAD issy` to actually update.
+**macOS specifically**: `autoupdate = true` is silently a no-op because issy does not ship prebuilt macOS binaries (cross-compiled Mach-O from Linux has no code signature and is refused by the Apple Silicon kernel). `notify_updates` still works — macOS users see the "update available" notice and run `brew upgrade issy` (or `brew upgrade --fetch-HEAD issy` if they installed with `--HEAD`) to actually update.
 
 The complete cache layout (all under `~/.cache/issy/`):
 
