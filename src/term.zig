@@ -533,6 +533,43 @@ pub fn write(bytes: []const u8) void {
     writeStr(bytes);
 }
 
+/// Emit an OSC 52 sequence pushing `data` onto the terminal's system
+/// clipboard. Base64-encodes `data` in-place via the output buffer —
+/// no heap allocation. No-op if the terminal isn't initialized or
+/// `data` is empty. Silently capped at 100 KB because most terminals
+/// drop longer sequences anyway (xterm's default is much smaller).
+/// The internal editor clipboard is unaffected either way.
+pub fn writeOsc52Clipboard(data: []const u8) void {
+    if (!initialized) return;
+    if (data.len == 0) return;
+
+    const max_raw: usize = 100 * 1024;
+    const capped = if (data.len > max_raw) data[0..max_raw] else data;
+
+    writeStr("\x1b]52;c;");
+
+    // Encode in 3-byte chunks so no padding appears mid-stream. The
+    // tail (0, 1, or 2 bytes) is encoded separately with padding.
+    const chunk_in: usize = 768; // multiple of 3 -> no padding
+    const chunk_out: usize = 1024;
+    var out_buf: [chunk_out]u8 = undefined;
+    const encoder = std.base64.standard.Encoder;
+
+    var i: usize = 0;
+    while (i + chunk_in <= capped.len) : (i += chunk_in) {
+        _ = encoder.encode(&out_buf, capped[i..][0..chunk_in]);
+        writeStr(&out_buf);
+    }
+    const rem = capped.len - i;
+    if (rem > 0) {
+        const enc_len = encoder.calcSize(rem);
+        _ = encoder.encode(out_buf[0..enc_len], capped[i..][0..rem]);
+        writeStr(out_buf[0..enc_len]);
+    }
+
+    writeStr("\x07");
+}
+
 fn doFlush() !void {
     if (write_pos == 0) return;
     const stdout = std.fs.File.stdout();
@@ -651,6 +688,52 @@ test "rgbTo256 known values" {
     try std.testing.expectEqual(@as(u8, 16), rgbTo256(0, 0, 0));
     const gray = rgbTo256(128, 128, 128);
     try std.testing.expect(gray >= 232 and gray <= 255);
+}
+
+test "OSC 52 clipboard emits nothing when terminal is not initialized" {
+    // Tests don't call init(), so the function is a safe no-op.
+    write_pos = 0;
+    writeOsc52Clipboard("hello");
+    try std.testing.expectEqual(@as(usize, 0), write_pos);
+}
+
+test "OSC 52 clipboard base64-encodes under a forced init" {
+    const save = initialized;
+    initialized = true;
+    defer initialized = save;
+
+    write_pos = 0;
+    writeOsc52Clipboard("Man");
+    // "Man" base64 = "TWFu" (3 bytes -> 4 bytes, no padding).
+    try std.testing.expectEqualSlices(u8, "\x1b]52;c;TWFu\x07", write_buf[0..write_pos]);
+
+    write_pos = 0;
+    writeOsc52Clipboard("M");
+    // "M" base64 = "TQ==" (1 byte -> 4 bytes with padding).
+    try std.testing.expectEqualSlices(u8, "\x1b]52;c;TQ==\x07", write_buf[0..write_pos]);
+
+    write_pos = 0;
+    writeOsc52Clipboard("");
+    try std.testing.expectEqual(@as(usize, 0), write_pos);
+}
+
+test "OSC 52 clipboard handles chunk boundary" {
+    const save = initialized;
+    initialized = true;
+    defer initialized = save;
+
+    // 768 is the chunk_in size used internally; encode exactly one
+    // chunk plus a two-byte tail so both code paths fire.
+    var big: [770]u8 = undefined;
+    for (&big, 0..) |*b, i| b.* = @intCast('a' + (i % 26));
+
+    write_pos = 0;
+    writeOsc52Clipboard(&big);
+
+    // We just care that it produced an OSC 52 wrapper with >0 payload.
+    try std.testing.expect(write_pos > 10);
+    try std.testing.expectEqualSlices(u8, "\x1b]52;c;", write_buf[0..7]);
+    try std.testing.expectEqual(@as(u8, 0x07), write_buf[write_pos - 1]);
 }
 
 test "escape sequence output" {

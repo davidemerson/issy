@@ -720,11 +720,23 @@ $ issy \-\-rollback
 .SH AUTHORS
 David Emerson
 .SH CAVEATS
+Copy and cut also emit OSC 52 so the text lands in the operating-
+system clipboard, subject to whatever the terminal allows.
+In iTerm2, Alacritty, Kitty, and modern versions of Terminal.app this
+works out of the box; in tmux, enable
+.B set -g set-clipboard on
+in
+.I ~/.tmux.conf
+for the forwarded clipboard to reach the host.
+Paste from outside
 .B issy
-uses an internal clipboard, not the system clipboard.
-Copy and paste only work within the same
+arrives through the terminal's bracketed-paste mechanism
+.RB ( Ctrl+V
+inside
 .B issy
-session.
+still reads from the internal clipboard).
+A selection larger than 100\ KB is truncated for the system push
+only; the internal clipboard keeps the full copy.
 .PP
 The
 .B auto_close_brackets

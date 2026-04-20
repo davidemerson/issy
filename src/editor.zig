@@ -2243,11 +2243,21 @@ pub const Editor = struct {
         const sel = self.getSelectionRange() orelse return;
         if (sel.len == 0) return;
 
-        if (self.clipboard) |cb| self.allocator.free(cb);
+        // Read the selection into a freshly-sized buffer. The previous
+        // implementation used a 4096-byte stack scratch here, which
+        // would overflow on selections larger than 4 KB that happened
+        // to straddle the gap.
+        const data = self.allocator.alloc(u8, sel.len) catch return;
+        const got = self.buf.contiguousSlice(sel.start, sel.len, data);
+        if (got.ptr != data.ptr) @memcpy(data, got);
 
-        var tmp: [4096]u8 = undefined;
-        const data = self.buf.contiguousSlice(sel.start, sel.len, &tmp);
-        self.clipboard = self.allocator.dupe(u8, data) catch null;
+        if (self.clipboard) |cb| self.allocator.free(cb);
+        self.clipboard = data;
+
+        // Also push to the OS clipboard via OSC 52 when the terminal
+        // is initialized. Internal paste (Ctrl+V) still reads from
+        // self.clipboard, so Cmd+V in another app now works.
+        term.writeOsc52Clipboard(data);
     }
 
     fn cutSelection(self: *Editor) void {

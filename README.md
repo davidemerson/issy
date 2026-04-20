@@ -173,9 +173,9 @@ issy --font /path/to/font.ttf --print output.pdf source.c
 | Ctrl+Q | Quit (on unsaved changes, press Enter or Ctrl+Q again to discard; Escape cancels) |
 | Ctrl+Z | Undo |
 | Ctrl+Y | Redo |
-| Ctrl+C | Copy selection |
-| Ctrl+X | Cut selection |
-| Ctrl+V | Paste |
+| Ctrl+C | Copy selection (also pushes to OS clipboard via OSC 52) |
+| Ctrl+X | Cut selection (also pushes to OS clipboard via OSC 52) |
+| Ctrl+V | Paste from internal clipboard (OS paste comes via terminal paste: Cmd+V / Ctrl+Shift+V) |
 | Ctrl+A | Select all |
 | Tab | Insert tab or spaces (per config) |
 | Enter | Newline with auto-indent |
@@ -289,7 +289,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full flow, the cache layout, and 
 ## Architecture, testing, man page
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — tour of the source code and the major subsystems
-- `zig build test` — 735-test unit suite (gap buffer, Unicode, tokenizer, editor operations, mouse/selection, etc.)
+- `zig build test` — 753-test unit suite (gap buffer, Unicode, tokenizer, editor operations, mouse/selection, etc.)
 - `bash tests/run_tests.sh` — end-to-end integration suite via `expect`, launches the real binary in a PTY
 - `man ./issy.1` — man page
 
