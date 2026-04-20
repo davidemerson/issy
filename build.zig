@@ -89,6 +89,7 @@ pub fn build(b: *std.Build) void {
         "src/print.zig",
         "src/update.zig",
         "src/update_key.zig",
+        "src/positions.zig",
         "src/main.zig",
     };
 

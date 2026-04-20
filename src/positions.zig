@@ -26,10 +26,21 @@ const max_entries: usize = 300;
 /// fit are dropped oldest-first.
 const file_cap: usize = 48 * 1024;
 
+/// Test-only: when non-null, `resolveFilePath` returns a copy of this
+/// value instead of reading HOME. Lets tests point at a scratch path
+/// without having to link libc just for setenv. Production leaves this
+/// at null. Module-local with no public setter outside of tests.
+var test_path_override: ?[]const u8 = null;
+
 /// Fill `buf` with the absolute path of the positions file
 /// ($HOME/.cache/issy/positions.txt). Returns null if HOME is unset
 /// or `buf` is too small.
 fn resolveFilePath(buf: []u8) ?[]const u8 {
+    if (test_path_override) |p| {
+        if (p.len > buf.len) return null;
+        @memcpy(buf[0..p.len], p);
+        return buf[0..p.len];
+    }
     const home = std.posix.getenv("HOME") orelse return null;
     const suffix = "/.cache/issy/positions.txt";
     const needed = home.len + suffix.len;
@@ -174,13 +185,6 @@ pub fn record(abs_path: []const u8, line: usize, col: usize) void {
     };
 }
 
-// ── Test helpers ──
-
-// std.c doesn't surface setenv/unsetenv in 0.15, so declare the C ABI
-// shims ourselves. Only used by the round-trip test below.
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;
-
 // ── Tests ──
 
 test "parseEntry happy path" {
@@ -210,31 +214,21 @@ test "lookup returns null for empty path" {
     try std.testing.expectEqual(@as(?Position, null), lookup(""));
 }
 
-test "record + lookup round-trip under a scratch HOME" {
+test "record + lookup round-trip under a scratch path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const home = try tmp.dir.realpath(".", &home_buf);
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &root_buf);
 
-    // Swap HOME for the scope of this test. std.posix.setenv hits the
-    // process environment, which is OK inside a test binary.
-    var home_z: [std.fs.max_path_bytes + 1]u8 = undefined;
-    @memcpy(home_z[0..home.len], home);
-    home_z[home.len] = 0;
+    // Build a positions.txt path inside the tmpdir and pin it via the
+    // test-only override. Avoids process-wide HOME mutation and the
+    // libc dependency setenv would otherwise pull in.
+    var pos_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const pos_path = try std.fmt.bufPrint(&pos_path_buf, "{s}/positions.txt", .{root});
 
-    const prev = std.posix.getenv("HOME");
-    _ = setenv("HOME", home_z[0..home.len :0].ptr, 1);
-    defer {
-        if (prev) |p| {
-            var prev_z: [std.fs.max_path_bytes + 1]u8 = undefined;
-            @memcpy(prev_z[0..p.len], p);
-            prev_z[p.len] = 0;
-            _ = setenv("HOME", prev_z[0..p.len :0].ptr, 1);
-        } else {
-            _ = unsetenv("HOME");
-        }
-    }
+    test_path_override = pos_path;
+    defer test_path_override = null;
 
     record("/my/file.zig", 42, 7);
     const pos = lookup("/my/file.zig") orelse return error.LookupMissed;
