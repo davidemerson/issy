@@ -152,7 +152,9 @@ expect eof
 wait
 record_result [assert_file $f "bc" "C7_delete"]
 
-# --- C8: Undo single char ---
+# --- C8: Undo coalesces a word-typing run ---
+# "abc" typed in rapid succession collapses into a single undo entry
+# (word-boundary + 500ms window), so one Ctrl+Z removes the whole word.
 set f "$tmpdir/c8.txt"
 spawn $issy --no-config
 sleep 0.8
@@ -169,7 +171,28 @@ sleep 0.3
 send "\x11"
 expect eof
 wait
-record_result [assert_file $f "ab" "C8_undo_single"]
+record_result [assert_file $f "" "C8_undo_coalesces_word"]
+
+# --- C8b: Undo breaks on whitespace ---
+# "ab cd" typed fast produces three undo entries ("ab", " ", "cd"),
+# so a single Ctrl+Z only removes "cd".
+set f "$tmpdir/c8b.txt"
+spawn $issy --no-config
+sleep 0.8
+send "ab cd"
+sleep 0.2
+send "\x1a"; # Ctrl+Z
+sleep 0.3
+send "\x13"
+sleep 0.5
+for {set i 0} {$i < 200} {incr i} { send "\x7f" }
+sleep 0.2
+send "$f\r"
+sleep 0.3
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "ab " "C8b_undo_splits_on_whitespace"]
 
 # --- C9: Undo multiple to empty ---
 set f "$tmpdir/c9.txt"

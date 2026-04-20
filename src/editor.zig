@@ -123,6 +123,16 @@ pub const Editor = struct {
     // logic so already-formatted pasted content comes in verbatim.
     in_paste: bool = false,
 
+    // Coalesced-undo state. A run of consecutive word-char inserts,
+    // each arriving within COALESCE_WINDOW_MS of the previous one at
+    // the position where the previous one ended, gets appended onto a
+    // single UndoEntry instead of pushing a new one per keystroke. A
+    // non-char key, a whitespace char, or anything else resets the run
+    // so Ctrl+Z undoes a whole word at a time instead of a letter at
+    // a time.
+    last_insert_ms: i64 = 0,
+    last_insert_was_word: bool = false,
+
     // Tab completion state
     completion_hint: [512]u8 = undefined, // grayed-out suffix for unique completion
     completion_hint_len: usize = 0,
@@ -327,6 +337,13 @@ pub const Editor = struct {
     }
 
     fn handleNormalKey(self: *Editor, key: term.Key) Action {
+        // Any non-.char event ends the current coalesced-undo run —
+        // including Enter, Tab, arrows, mouse events, Ctrl keys, and
+        // so on. insertCodepoint refreshes the run timestamp itself.
+        switch (key) {
+            .char => {},
+            else => self.last_insert_ms = 0,
+        }
         switch (key) {
             .char => |cp| {
                 self.insertCodepoint(cp);
@@ -1821,17 +1838,27 @@ pub const Editor = struct {
             // a 3-byte codepoint like ─ stepping by 1 would leave the
             // cursor on a continuation byte.
             const pos = self.cursorBytePos();
-            self.pushUndo(pos, null, len);
+            const now = std.time.milliTimestamp();
+            const this_is_word = isCodepointWordChar(cp);
+            if (!self.tryCoalesceInsert(pos, len, now, this_is_word)) {
+                self.pushUndo(pos, null, len);
+            }
             self.buf.insert(pos, enc[0..len]) catch return;
             self.cursor.col += len;
             self.cursor.col_want = self.cursor.col;
             self.modified = true;
+            self.last_insert_ms = now;
+            self.last_insert_was_word = this_is_word;
             self.ensureCursorVisible();
             self.updateBracketMatch();
             return;
         }
 
         self.multiCursorInsert(enc[0..len]);
+        // Multi-cursor edits already group themselves; they should
+        // never fold into a coalesced run.
+        self.last_insert_ms = 0;
+        self.last_insert_was_word = false;
         self.updateBracketMatch();
     }
 
@@ -2041,6 +2068,42 @@ pub const Editor = struct {
     fn nextUndoGroupId(self: *Editor) u32 {
         self.undo_group_counter += 1;
         return self.undo_group_counter;
+    }
+
+    /// Max ms between consecutive word-char inserts for them to count
+    /// as one undo run. Short enough that a pause-and-think doesn't
+    /// glue unrelated edits; long enough that normal typing coalesces.
+    const COALESCE_WINDOW_MS: i64 = 500;
+
+    fn isCodepointWordChar(cp: u21) bool {
+        return (cp >= 'a' and cp <= 'z') or
+            (cp >= 'A' and cp <= 'Z') or
+            (cp >= '0' and cp <= '9') or
+            cp == '_';
+    }
+
+    /// Try to extend the top undo entry instead of pushing a new one.
+    /// Returns true if the insert was folded into the existing entry.
+    /// Callers still need to perform the actual buf.insert afterward.
+    fn tryCoalesceInsert(self: *Editor, pos: usize, len: usize, now: i64, this_is_word: bool) bool {
+        if (!this_is_word) return false;
+        if (!self.last_insert_was_word) return false;
+        if (self.undo_stack.items.len == 0) return false;
+        if (now - self.last_insert_ms > COALESCE_WINDOW_MS) return false;
+
+        const top = &self.undo_stack.items[self.undo_stack.items.len - 1];
+        if (top.deleted != null) return false;
+        if (top.group_id != 0) return false;
+        if (top.pos + top.inserted_len != pos) return false;
+
+        top.inserted_len += len;
+
+        // A new edit invalidates the redo stack just like pushUndo does.
+        for (self.redo_stack.items) |entry| {
+            if (entry.deleted) |d| self.allocator.free(d);
+        }
+        self.redo_stack.clearRetainingCapacity();
+        return true;
     }
 
     fn pushUndo(self: *Editor, pos: usize, deleted: ?[]u8, inserted_len: usize) void {
@@ -2807,6 +2870,74 @@ test "editor undo/redo" {
     // Redo
     _ = ed.handleKey(.{ .ctrl = 'y' });
     try std.testing.expectEqual(@as(usize, 1), ed.buf.logicalLen());
+}
+
+test "editor undo coalesces consecutive word-char inserts" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    for ("abc") |c| _ = ed.handleKey(.{ .char = c });
+    try std.testing.expectEqual(@as(usize, 3), ed.buf.logicalLen());
+    // Three letters typed in one run should collapse to a single
+    // undo entry — Ctrl+Z removes the whole word at once.
+    try std.testing.expectEqual(@as(usize, 1), ed.undo_stack.items.len);
+
+    _ = ed.handleKey(.{ .ctrl = 'z' });
+    try std.testing.expectEqual(@as(usize, 0), ed.buf.logicalLen());
+}
+
+test "editor undo splits on whitespace" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    for ("ab cd") |c| _ = ed.handleKey(.{ .char = c });
+    // Three entries expected: "ab", " ", "cd".
+    try std.testing.expectEqual(@as(usize, 3), ed.undo_stack.items.len);
+
+    _ = ed.handleKey(.{ .ctrl = 'z' });
+    // First undo drops "cd"
+    try std.testing.expectEqualSlices(u8, "ab ", blk: {
+        var tmp: [16]u8 = undefined;
+        const s = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
+        break :blk s;
+    });
+
+    _ = ed.handleKey(.{ .ctrl = 'z' });
+    // Next drops the space
+    try std.testing.expectEqual(@as(usize, 2), ed.buf.logicalLen());
+
+    _ = ed.handleKey(.{ .ctrl = 'z' });
+    try std.testing.expectEqual(@as(usize, 0), ed.buf.logicalLen());
+}
+
+test "editor undo breaks run on cursor movement" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // Seed one line then type, move, type.
+    for ("ab") |c| _ = ed.handleKey(.{ .char = c });
+    _ = ed.handleKey(.left);
+    _ = ed.handleKey(.right);
+    for ("cd") |c| _ = ed.handleKey(.{ .char = c });
+
+    // The arrow keys should have broken the run — two entries, not one.
+    try std.testing.expectEqual(@as(usize, 2), ed.undo_stack.items.len);
+}
+
+test "editor undo breaks run on Enter" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    for ("ab") |c| _ = ed.handleKey(.{ .char = c });
+    _ = ed.handleKey(.enter);
+    for ("cd") |c| _ = ed.handleKey(.{ .char = c });
+
+    // ab + newline + cd = three entries.
+    try std.testing.expectEqual(@as(usize, 3), ed.undo_stack.items.len);
 }
 
 test "byteColToVisualCol expands tabs to tab stops" {

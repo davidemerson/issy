@@ -132,6 +132,11 @@ Same as
 .TP
 .B Ctrl+Z
 Undo the last editing operation.
+Consecutive word-character inserts within a 500 ms window coalesce
+into a single undo entry, so typing a word produces one undo step
+instead of one per letter.
+Whitespace, Enter, Tab, cursor movement, and deletions all break the
+run and start a fresh entry.
 Multi-cursor edits are undone as a single atomic step.
 .TP
 .B Ctrl+Y
