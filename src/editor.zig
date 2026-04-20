@@ -118,6 +118,11 @@ pub const Editor = struct {
     confirm_action: enum { none, quit } = .none,
     command_action: enum { open, save_as } = .open,
 
+    // True between a bracketed-paste start and end marker. While set,
+    // insertNewline/insertTab skip their auto-indent and tab-expansion
+    // logic so already-formatted pasted content comes in verbatim.
+    in_paste: bool = false,
+
     // Tab completion state
     completion_hint: [512]u8 = undefined, // grayed-out suffix for unique completion
     completion_hint_len: usize = 0,
@@ -168,7 +173,21 @@ pub const Editor = struct {
             }
         }
 
-        try self.buf.load(actual_path);
+        // Missing file → open as an empty new buffer bound to that
+        // filename. This makes `issy newdoc.md` behave like a "create
+        // new file" rather than surfacing a FileNotFound error.
+        var is_new_file = false;
+        self.buf.load(actual_path) catch |e| switch (e) {
+            error.FileNotFound => {
+                is_new_file = true;
+                // Reset the buffer so any previously-loaded content
+                // doesn't leak into the new-file session (Ctrl+O to a
+                // missing path would otherwise keep the old buffer).
+                self.buf.deinit();
+                self.buf = buffer_mod.Buffer.init(self.allocator) catch return error.OutOfMemory;
+            },
+            else => return e,
+        };
 
         // Store filename
         if (actual_path.len <= self.filename.len) {
@@ -180,17 +199,23 @@ pub const Editor = struct {
         self.language = syntax_mod.detect(actual_path);
 
         // Detect indent
-        if (self.config.auto_detect_indent) {
+        if (self.config.auto_detect_indent and !is_new_file) {
             self.detectIndent();
         }
 
-        // Record mtime
+        // Record mtime (no-op for a new file — updateMtime silently
+        // ignores the missing path).
         self.updateMtime();
 
         self.modified = false;
         self.cursor = .{};
         self.scroll_top = 0;
         self.scroll_left = 0;
+
+        if (is_new_file) {
+            self.setStatusMessage("New file.");
+            return;
+        }
 
         // Jump to line if specified
         if (goto_line) |line| {
@@ -462,6 +487,18 @@ pub const Editor = struct {
             },
             .help, .f1 => {
                 self.mode = .help;
+                return .redraw;
+            },
+            .paste_start => {
+                // Selection replacement happens once up front so a
+                // selection isn't re-deleted on every char of the paste.
+                if (self.sel_active) self.deleteSelection();
+                self.in_paste = true;
+                return .redraw;
+            },
+            .paste_end => {
+                self.in_paste = false;
+                self.updateBracketMatch();
                 return .redraw;
             },
             else => return .none,
@@ -1719,6 +1756,8 @@ pub const Editor = struct {
         var enc: [4]u8 = undefined;
         const len = unicode.encode(cp, &enc);
 
+        if (self.sel_active) self.deleteSelection();
+
         if (self.cursors.items.len == 0) {
             // Fast path: single cursor. cursor.col is a byte offset into
             // the line, so advance it by the encoded length, not 1 — for
@@ -1740,12 +1779,16 @@ pub const Editor = struct {
     }
 
     fn insertNewline(self: *Editor) void {
+        if (self.sel_active) self.deleteSelection();
+
         const pos = self.cursorBytePos();
         var indent_buf: [256]u8 = undefined;
         var indent_len: usize = 0;
 
-        // Auto-indent: copy leading whitespace from current line
-        if (self.config.auto_indent) {
+        // Auto-indent: copy leading whitespace from current line.
+        // Suppressed during a bracketed paste so the already-indented
+        // pasted content doesn't compound on every embedded newline.
+        if (self.config.auto_indent and !self.in_paste) {
             if (self.buf.getLine(self.cursor.line)) |line_info| {
                 var tmp: [256]u8 = undefined;
                 const data = self.buf.contiguousSlice(line_info.start, @min(line_info.len, 256), &tmp);
@@ -1778,7 +1821,21 @@ pub const Editor = struct {
     }
 
     fn insertTab(self: *Editor) void {
+        if (self.sel_active) self.deleteSelection();
+
         const pos = self.cursorBytePos();
+        // Pasted tabs should land as literal '\t' regardless of the
+        // expand-tabs setting, otherwise \t gets silently rewritten to
+        // N spaces as it streams in.
+        if (self.in_paste) {
+            self.pushUndo(pos, null, 1);
+            self.buf.insert(pos, "\t") catch return;
+            self.cursor.col += 1;
+            self.cursor.col_want = self.cursor.col;
+            self.modified = true;
+            self.ensureCursorVisible();
+            return;
+        }
         if (self.effectiveExpandTabs()) {
             const tw = self.effectiveTabWidth();
             const spaces_needed = tw - @as(u8, @intCast(self.cursor.col % tw));
@@ -2459,6 +2516,9 @@ pub const Editor = struct {
         self.modified = false;
         self.updateMtime();
         self.file_changed_on_disk = false;
+        // Re-detect syntax from the (possibly renamed) filename so
+        // `:w foo.py` after opening `foo.txt` picks up Python highlighting.
+        self.language = syntax_mod.detect(self.filename[0..self.filename_len]);
         self.setStatusMessage("Saved.");
     }
 

@@ -57,6 +57,8 @@ pub const Key = union(enum) {
     ctrl: u8,
     f1,
     help, // Ctrl+/ or Ctrl+Shift+?
+    paste_start, // DECSET 2004 — terminal is about to stream pasted bytes
+    paste_end,   // DECSET 2004 — end of the pasted block
     unknown,
     none,
 };
@@ -138,6 +140,10 @@ pub fn init() !void {
         // extended mouse format. Mode 1002 is what makes drag motion
         // arrive at all — without it the terminal only reports clicks.
         writeStr("\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+        // Enable bracketed paste (DECSET 2004): the terminal wraps
+        // pasted content in ESC[200~ … ESC[201~ so the editor can
+        // suppress auto-indent etc. during the paste.
+        writeStr("\x1b[?2004h");
         // Enter alternate screen
         writeStr("\x1b[?1049h");
         doFlush() catch {};
@@ -155,6 +161,8 @@ pub fn deinit() void {
         writeStr("\x1b[0 q");
         // Disable mouse reporting
         writeStr("\x1b[?1000l\x1b[?1002l\x1b[?1006l");
+        // Disable bracketed paste
+        writeStr("\x1b[?2004l");
         // Leave alternate screen
         writeStr("\x1b[?1049l");
         // Reset styles
@@ -368,6 +376,15 @@ fn parseEscape(buf: []const u8) Key {
 
 fn parseExtended(buf: []const u8) Key {
     if (buf.len < 4) return .unknown;
+
+    // ESC [ 200 ~ / 201 ~ = bracketed paste start/end (DECSET 2004).
+    if (buf.len >= 6 and buf[2] == '2' and buf[3] == '0' and buf[5] == '~') {
+        return switch (buf[4]) {
+            '0' => .paste_start,
+            '1' => .paste_end,
+            else => .unknown,
+        };
+    }
 
     // ESC [ 3 ~ = delete
     if (buf[2] == '3' and buf[3] == '~') return .delete;
