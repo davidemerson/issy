@@ -53,7 +53,7 @@ The core text data structure. A contiguous byte array with a "gap" (unused regio
 
 The central struct. Owns the buffer, cursor(s), mode, undo/redo stacks, clipboard, and all editing logic.
 
-- **Modes**: `normal`, `search`, `command`, `confirm`, `replace`. Each mode has its own key handler. `confirm` carries a `confirm_action` discriminator (`quit` or `new`) so Ctrl+Q after Ctrl+N creates the new buffer instead of quitting. Confirm accepts Enter, Ctrl+Q, or Ctrl+W; Escape cancels.
+- **Modes**: `normal`, `search`, `command`, `confirm`, `replace`. Each mode has its own key handler. `confirm` carries a `confirm_action` discriminator (`quit`, `new`, or `open`) so the same confirm prompt dispatches to quit, new buffer, or the open-file prompt depending on which key triggered it. Confirm accepts Enter, Ctrl+Q, or Ctrl+W; Escape cancels.
 - **Undo/redo**: Each edit pushes an `UndoEntry` with position, deleted bytes (if any), and inserted length. Undo reverses the operation and pushes the inverse to the redo stack. Replace operations (which both delete and insert) produce a single combined entry.
 - **Bracket matching**: After each cursor move, scans up to 10,000 characters in each direction for matching `()[]{}` using a nesting-depth counter.
 - **Indent detection**: Scans the first 100 lines on file open. If >60% use tabs or spaces, overrides the config's `expand_tabs` and `tab_width` for that file.

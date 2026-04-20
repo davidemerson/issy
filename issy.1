@@ -270,13 +270,21 @@ Cancel and return to normal mode.
 .TP
 .B Ctrl+O
 Open a file.
-The prompt is seeded with the current working directory.
+If the current buffer has unsaved changes, the editor prompts for
+confirmation first; press
+.B Enter
+or
+.B Ctrl+Q
+to discard and continue, or
+.B Escape
+to cancel.
+The open prompt is seeded with the current working directory.
 Type a partial path and press
 .B Tab
 to complete against the filesystem.
 Press
 .B Escape
-to cancel.
+to cancel the open prompt itself.
 .TP
 .B Ctrl+N
 Open a new empty buffer.

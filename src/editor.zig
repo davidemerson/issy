@@ -115,7 +115,7 @@ pub const Editor = struct {
     detected_expand_tabs: ?bool = null,
     detected_tab_width: ?u8 = null,
 
-    confirm_action: enum { none, quit, new } = .none,
+    confirm_action: enum { none, quit, new, open } = .none,
     command_action: enum { open, save_as } = .open,
 
     // True between a bracketed-paste start and end marker. While set,
@@ -579,18 +579,13 @@ pub const Editor = struct {
                 return .redraw;
             },
             'o' => {
-                self.mode = .command;
-                self.command_action = .open;
-                // Seed prompt with CWD
-                self.prompt_len = 0;
-                if (std.posix.getcwd(self.prompt_buf[0..])) |cwd| {
-                    self.prompt_len = cwd.len;
-                    if (self.prompt_len < 255) {
-                        self.prompt_buf[self.prompt_len] = '/';
-                        self.prompt_len += 1;
-                    }
-                } else |_| {}
-                self.updateCompletions();
+                if (self.modified) {
+                    self.mode = .confirm;
+                    self.confirm_action = .open;
+                    self.setStatusMessage("Unsaved changes. Enter or Ctrl+Q to discard and open another file, Esc to cancel.");
+                    return .redraw;
+                }
+                self.enterOpenPrompt();
                 return .redraw;
             },
             'r' => {
@@ -752,7 +747,27 @@ pub const Editor = struct {
                 self.status_msg_len = 0;
                 return .redraw;
             },
+            .open => {
+                self.enterOpenPrompt();
+                return .redraw;
+            },
         }
+    }
+
+    fn enterOpenPrompt(self: *Editor) void {
+        self.mode = .command;
+        self.command_action = .open;
+        self.status_msg_len = 0;
+        // Seed prompt with CWD so Tab-completion starts somewhere useful.
+        self.prompt_len = 0;
+        if (std.posix.getcwd(self.prompt_buf[0..])) |cwd| {
+            self.prompt_len = cwd.len;
+            if (self.prompt_len < 255) {
+                self.prompt_buf[self.prompt_len] = '/';
+                self.prompt_len += 1;
+            }
+        } else |_| {}
+        self.updateCompletions();
     }
 
     fn handleReplaceKey(self: *Editor, key: term.Key) Action {
@@ -2941,6 +2956,74 @@ test "editor quit with modifications" {
     // Second quit forces
     const action2 = ed.handleKey(.{ .ctrl = 'q' });
     try std.testing.expectEqual(Action.force_quit, action2);
+}
+
+test "editor Ctrl+N on dirty buffer confirms then newBuffer" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    _ = ed.handleKey(.{ .char = 'x' });
+    try std.testing.expect(ed.modified);
+
+    // Ctrl+N -> confirm mode
+    _ = ed.handleKey(.{ .ctrl = 'n' });
+    try std.testing.expectEqual(Mode.confirm, ed.mode);
+
+    // Enter confirms -> newBuffer() -> normal mode with clean buffer
+    _ = ed.handleKey(.enter);
+    try std.testing.expectEqual(Mode.normal, ed.mode);
+    try std.testing.expect(!ed.modified);
+    try std.testing.expectEqual(@as(usize, 0), ed.buf.logicalLen());
+}
+
+test "editor Ctrl+O on dirty buffer confirms then opens prompt" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    _ = ed.handleKey(.{ .char = 'x' });
+    try std.testing.expect(ed.modified);
+
+    // Ctrl+O -> confirm mode, not command mode
+    _ = ed.handleKey(.{ .ctrl = 'o' });
+    try std.testing.expectEqual(Mode.confirm, ed.mode);
+
+    // Enter confirms -> command mode with .open action
+    _ = ed.handleKey(.enter);
+    try std.testing.expectEqual(Mode.command, ed.mode);
+
+    // Escape cancels back to normal
+    _ = ed.handleKey(.escape);
+    try std.testing.expectEqual(Mode.normal, ed.mode);
+    // Dirty buffer preserved
+    try std.testing.expect(ed.modified);
+}
+
+test "editor Ctrl+O on clean buffer skips confirm" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // Ctrl+O -> directly to command mode
+    _ = ed.handleKey(.{ .ctrl = 'o' });
+    try std.testing.expectEqual(Mode.command, ed.mode);
+}
+
+test "editor confirm Escape restores buffer" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    _ = ed.handleKey(.{ .char = 'y' });
+    _ = ed.handleKey(.{ .ctrl = 'n' });
+    try std.testing.expectEqual(Mode.confirm, ed.mode);
+
+    _ = ed.handleKey(.escape);
+    try std.testing.expectEqual(Mode.normal, ed.mode);
+    // The dirty buffer is still there and unchanged.
+    try std.testing.expect(ed.modified);
+    try std.testing.expectEqual(@as(usize, 1), ed.buf.logicalLen());
 }
 
 test "editor detect indent - spaces" {

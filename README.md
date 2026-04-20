@@ -218,7 +218,7 @@ Typing, Tab, or Enter while a selection is active replaces the selection. Termin
 
 | Key | Action |
 |---|---|
-| Ctrl+O | Open file (prompts for path) |
+| Ctrl+O | Open file (on unsaved changes, prompts for confirmation) |
 | Ctrl+N | New empty buffer (on unsaved changes, prompts for confirmation) |
 | Ctrl+P | Export to PDF (requires `font_file` in config or `--font`) |
 | Ctrl+R | Reload file from disk |
@@ -288,7 +288,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full flow, the cache layout, and 
 ## Architecture, testing, man page
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — tour of the source code and the major subsystems
-- `zig build test` — 678-test unit suite (gap buffer, Unicode, tokenizer, editor operations, mouse/selection, etc.)
+- `zig build test` — 694-test unit suite (gap buffer, Unicode, tokenizer, editor operations, mouse/selection, etc.)
 - `bash tests/run_tests.sh` — end-to-end integration suite via `expect`, launches the real binary in a PTY
 - `man ./issy.1` — man page
 
