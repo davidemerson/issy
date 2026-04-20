@@ -190,6 +190,7 @@ Typing, Tab, or Enter while a selection is active replaces the selection. Termin
 | Ctrl+Left / Ctrl+Right | Jump by word |
 | Home / End | Start / end of line |
 | Page Up / Down | Scroll by page |
+| Ctrl+L | Go to line (prompt for a line number) |
 | Mouse scroll | Scroll viewport (cursor stays) |
 | Mouse click | Position cursor |
 | Double-click | Select word |
@@ -288,7 +289,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full flow, the cache layout, and 
 ## Architecture, testing, man page
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — tour of the source code and the major subsystems
-- `zig build test` — 694-test unit suite (gap buffer, Unicode, tokenizer, editor operations, mouse/selection, etc.)
+- `zig build test` — 710-test unit suite (gap buffer, Unicode, tokenizer, editor operations, mouse/selection, etc.)
 - `bash tests/run_tests.sh` — end-to-end integration suite via `expect`, launches the real binary in a PTY
 - `man ./issy.1` — man page
 

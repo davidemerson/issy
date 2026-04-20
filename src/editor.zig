@@ -116,7 +116,7 @@ pub const Editor = struct {
     detected_tab_width: ?u8 = null,
 
     confirm_action: enum { none, quit, new, open } = .none,
-    command_action: enum { open, save_as } = .open,
+    command_action: enum { open, save_as, goto_line } = .open,
 
     // True between a bracketed-paste start and end marker. While set,
     // insertNewline/insertTab skip their auto-indent and tab-expansion
@@ -538,6 +538,16 @@ pub const Editor = struct {
                 self.findNext();
                 return .redraw;
             },
+            'l' => {
+                // Goto-line. Enter an empty command prompt; the enter
+                // handler parses the digits and jumps.
+                self.mode = .command;
+                self.command_action = .goto_line;
+                self.prompt_len = 0;
+                self.completion_match_count = 0;
+                self.completion_hint_len = 0;
+                return .redraw;
+            },
             'z' => {
                 self.undo();
                 return .redraw;
@@ -658,6 +668,10 @@ pub const Editor = struct {
     }
 
     fn handleCommandKey(self: *Editor, key: term.Key) Action {
+        // Filesystem tab-completion only fires for path-shaped prompts.
+        // Goto-line takes digits, not paths, so it skips that whole
+        // machinery — prevents a stray directory listing from the tab key.
+        const is_path_prompt = self.command_action == .open or self.command_action == .save_as;
         switch (key) {
             .char => |cp| {
                 if (self.prompt_len < 255) {
@@ -668,16 +682,16 @@ pub const Editor = struct {
                     @memcpy(self.prompt_buf[self.prompt_len..][0..copy_len], enc_buf[0..copy_len]);
                     self.prompt_len += copy_len;
                 }
-                self.updateCompletions();
+                if (is_path_prompt) self.updateCompletions();
                 return .redraw;
             },
             .backspace => {
                 if (self.prompt_len > 0) self.prompt_len -= 1;
-                self.updateCompletions();
+                if (is_path_prompt) self.updateCompletions();
                 return .redraw;
             },
             .tab => {
-                self.applyTabCompletion();
+                if (is_path_prompt) self.applyTabCompletion();
                 return .redraw;
             },
             .enter => {
@@ -702,6 +716,21 @@ pub const Editor = struct {
                             self.modified = false;
                             self.updateMtime();
                             self.setStatusMessage("Saved.");
+                        }
+                    },
+                    .goto_line => {
+                        const trimmed = std.mem.trim(u8, path, " \t");
+                        if (std.fmt.parseInt(usize, trimmed, 10)) |n| {
+                            // 1-indexed input; clamp into the buffer.
+                            const last = if (self.buf.lineCount() > 0) self.buf.lineCount() - 1 else 0;
+                            const target = if (n == 0) 0 else @min(n - 1, last);
+                            self.sel_active = false;
+                            self.cursor.line = target;
+                            self.cursor.col = 0;
+                            self.cursor.col_want = 0;
+                            self.ensureCursorVisible();
+                        } else |_| {
+                            if (trimmed.len > 0) self.setStatusMessage("Not a line number.");
                         }
                     },
                 }
@@ -3008,6 +3037,75 @@ test "editor Ctrl+O on clean buffer skips confirm" {
     // Ctrl+O -> directly to command mode
     _ = ed.handleKey(.{ .ctrl = 'o' });
     try std.testing.expectEqual(Mode.command, ed.mode);
+}
+
+test "editor Ctrl+L goto-line jumps to line" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // Seed 5 lines
+    ed.buf.insert(0, "a\nb\nc\nd\ne\n") catch unreachable;
+
+    // Ctrl+L -> command mode, goto_line action
+    _ = ed.handleKey(.{ .ctrl = 'l' });
+    try std.testing.expectEqual(Mode.command, ed.mode);
+
+    // Type "3" and Enter -> jump to line 3 (0-indexed: 2)
+    _ = ed.handleKey(.{ .char = '3' });
+    _ = ed.handleKey(.enter);
+    try std.testing.expectEqual(Mode.normal, ed.mode);
+    try std.testing.expectEqual(@as(usize, 2), ed.cursor.line);
+    try std.testing.expectEqual(@as(usize, 0), ed.cursor.col);
+}
+
+test "editor goto-line clamps past-end to last line" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    ed.buf.insert(0, "a\nb\nc\n") catch unreachable;
+
+    _ = ed.handleKey(.{ .ctrl = 'l' });
+    _ = ed.handleKey(.{ .char = '9' });
+    _ = ed.handleKey(.{ .char = '9' });
+    _ = ed.handleKey(.enter);
+
+    // Line count is 4 (including trailing empty line). Last index = 3.
+    try std.testing.expectEqual(@as(usize, ed.buf.lineCount() - 1), ed.cursor.line);
+}
+
+test "editor goto-line Escape cancels" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    ed.buf.insert(0, "a\nb\nc\n") catch unreachable;
+    ed.cursor.line = 1;
+
+    _ = ed.handleKey(.{ .ctrl = 'l' });
+    _ = ed.handleKey(.{ .char = '3' });
+    _ = ed.handleKey(.escape);
+
+    // Back to normal mode with cursor unchanged
+    try std.testing.expectEqual(Mode.normal, ed.mode);
+    try std.testing.expectEqual(@as(usize, 1), ed.cursor.line);
+}
+
+test "editor goto-line ignores non-numeric input" {
+    var cfg = config_mod.Config.init();
+    var ed = Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    ed.buf.insert(0, "a\nb\nc\n") catch unreachable;
+    ed.cursor.line = 2;
+
+    _ = ed.handleKey(.{ .ctrl = 'l' });
+    _ = ed.handleKey(.{ .char = 'x' });
+    _ = ed.handleKey(.enter);
+
+    try std.testing.expectEqual(Mode.normal, ed.mode);
+    try std.testing.expectEqual(@as(usize, 2), ed.cursor.line);
 }
 
 test "editor confirm Escape restores buffer" {

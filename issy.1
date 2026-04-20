@@ -211,6 +211,17 @@ Clears any active selection.
 .TP
 .BR "Page Up" ", " "Page Down"
 Move the cursor by one screenfull minus two lines.
+.TP
+.B Ctrl+L
+Go to a specific line.
+Opens a prompt; type a 1-indexed line number and press
+.B Enter
+to jump the cursor to the start of that line.
+Numbers past the end of the file clamp to the last line.
+Non-numeric input is ignored and reported in the status bar.
+Press
+.B Escape
+to cancel without moving.
 .SS Selection
 Selection extends a highlighted region from an anchor point to the
 cursor.
