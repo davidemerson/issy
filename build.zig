@@ -1,4 +1,21 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+// Issy targets the Zig 0.15.x series. 0.16.0 moved most of `std.fs` under
+// `std.Io.Dir` with a threaded `io` argument and removed `std.fs.cwd()`,
+// which breaks every file op in this codebase. The check runs at comptime
+// so it fires before `writeBuildInfo` (which uses std.fs.cwd) is analyzed —
+// otherwise the user sees a cryptic stdlib error instead of this message.
+comptime {
+    const max_zig_version = std.SemanticVersion{ .major = 0, .minor = 16, .patch = 0 };
+    if (builtin.zig_version.order(max_zig_version) != .lt) {
+        @compileError(
+            "issy requires Zig < 0.16.0 (CI pins 0.15.2). On macOS with Homebrew, " ++
+                "install the keg-only formula and put it on PATH: " ++
+                "`brew install zig@0.15 && export PATH=\"/opt/homebrew/opt/zig@0.15/bin:$PATH\"`.",
+        );
+    }
+}
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
