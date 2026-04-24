@@ -10,6 +10,9 @@ const editor_mod = @import("editor.zig");
 const config_mod = @import("config.zig");
 const font_mod = @import("font.zig");
 const syntax_mod = @import("syntax.zig");
+const unicode = @import("unicode.zig");
+
+const MAX_WRAP_BREAKS = editor_mod.Editor.MAX_WRAP_BREAKS;
 
 const PdfWriter = struct {
     out: std.ArrayList(u8),
@@ -183,6 +186,14 @@ pub fn toPdf(ed: *editor_mod.Editor, output_path: []const u8) !void {
     const margin_top = cfg.print_margin_top;
     const margin_bottom = cfg.print_margin_bottom;
     const margin_left = cfg.print_margin_left;
+    const margin_right = cfg.print_margin_right;
+
+    // Content width in points and continuation indent (2 spaces, mirrors TUI).
+    const space_w: f32 = @max(fnt.charWidth(' ', font_size), font_size * 0.25);
+    const content_w: f32 = @max(page_w - margin_left - margin_right, space_w);
+    const cont_indent_pts: f32 = space_w * 2;
+    const cont_w: f32 = @max(content_w - cont_indent_pts, space_w);
+    const tw = ed.effectiveTabWidth();
 
     var y: f32 = page_h - margin_top;
     var page_lines: std.ArrayList(u8) = .{};
@@ -190,6 +201,7 @@ pub fn toPdf(ed: *editor_mod.Editor, output_path: []const u8) !void {
 
     const total_lines = ed.buf.lineCount();
     var line_num: usize = 0;
+    var sub_start_idx: usize = 0; // resume index when a line wraps across a page
 
     while (line_num < total_lines) {
         // Start a new page content stream
@@ -200,59 +212,52 @@ pub fn toPdf(ed: *editor_mod.Editor, output_path: []const u8) !void {
         appendFmt(&page_lines, ed.allocator, "BT\n/F1 {d:.1} Tf\n", .{font_size});
         appendFmt(&page_lines, ed.allocator, "{d:.1} {d:.1} Td\n", .{ margin_left, y });
 
+        // Set color once per page (cheaper than per line).
+        const pt = config_mod.print_theme;
+        writeColor(&page_lines, ed.allocator, pt.fg);
+        page_lines.appendSlice(ed.allocator, " rg\n") catch {};
+
+        // Track the x origin of the current line matrix so we can compute
+        // the relative dx for the next Td when indenting continuations.
+        var last_origin_x: f32 = margin_left;
+
         while (line_num < total_lines and y > margin_bottom) {
             const line_info = ed.buf.getLine(line_num) orelse {
                 line_num += 1;
+                sub_start_idx = 0;
                 continue;
             };
             var line_tmp: [4096]u8 = undefined;
             const line_data = ed.buf.contiguousSlice(line_info.start, @min(line_info.len, 4096), &line_tmp);
 
-            // Render line as hex-encoded glyph IDs
-            appendFmt(&page_lines, ed.allocator, "0 {d:.1} Td\n", .{-line_height});
+            var breaks: [MAX_WRAP_BREAKS]usize = undefined;
+            const break_count = computePdfWrapBreaks(&fnt, font_size, line_data, content_w, cont_w, tw, &breaks);
 
-            // Set color to fg
-            const pt = config_mod.print_theme;
-            writeColor(&page_lines, ed.allocator, pt.fg);
-            page_lines.appendSlice(ed.allocator, " rg\n") catch {};
+            var si: usize = sub_start_idx;
+            while (si < break_count and y > margin_bottom) : (si += 1) {
+                const sub_start = breaks[si];
+                const sub_end = if (si + 1 < break_count) breaks[si + 1] else line_data.len;
 
-            // Encode text as hex glyph IDs (decode UTF-8 properly)
-            page_lines.appendSlice(ed.allocator, "<") catch {};
-            var bi: usize = 0;
-            while (bi < line_data.len) {
-                const b0 = line_data[bi];
-                if (b0 == '\n' or b0 == '\r') {
-                    bi += 1;
-                    continue;
-                }
-                var cp: u21 = undefined;
-                var byte_len: usize = 1;
-                if (b0 < 0x80) {
-                    cp = b0;
-                } else if (b0 < 0xE0 and bi + 1 < line_data.len) {
-                    cp = (@as(u21, b0 & 0x1F) << 6) | @as(u21, line_data[bi + 1] & 0x3F);
-                    byte_len = 2;
-                } else if (b0 < 0xF0 and bi + 2 < line_data.len) {
-                    cp = (@as(u21, b0 & 0x0F) << 12) | (@as(u21, line_data[bi + 1] & 0x3F) << 6) | @as(u21, line_data[bi + 2] & 0x3F);
-                    byte_len = 3;
-                } else if (bi + 3 < line_data.len) {
-                    cp = (@as(u21, b0 & 0x07) << 18) | (@as(u21, line_data[bi + 1] & 0x3F) << 12) | (@as(u21, line_data[bi + 2] & 0x3F) << 6) | @as(u21, line_data[bi + 3] & 0x3F);
-                    byte_len = 4;
-                } else {
-                    cp = 0xFFFD;
-                }
-                const gid = fnt.glyphId(cp);
-                var hex_buf: [4]u8 = undefined;
-                _ = std.fmt.bufPrint(&hex_buf, "{X:0>4}", .{gid}) catch {
-                    bi += byte_len;
-                    continue;
-                };
-                page_lines.appendSlice(ed.allocator, &hex_buf) catch {};
-                bi += byte_len;
+                const target_x: f32 = if (si == 0) margin_left else margin_left + cont_indent_pts;
+                const dx = target_x - last_origin_x;
+                appendFmt(&page_lines, ed.allocator, "{d:.2} {d:.2} Td\n", .{ dx, -line_height });
+                last_origin_x = target_x;
+
+                // Encode text as hex glyph IDs (decode UTF-8 properly; tabs expand to spaces).
+                page_lines.appendSlice(ed.allocator, "<") catch {};
+                encodeGlyphs(&page_lines, ed.allocator, &fnt, line_data[sub_start..sub_end], tw);
+                page_lines.appendSlice(ed.allocator, "> Tj\n") catch {};
+
+                y -= line_height;
             }
-            page_lines.appendSlice(ed.allocator, "> Tj\n") catch {};
 
-            y -= line_height;
+            if (si < break_count) {
+                // Out of vertical space — resume this line on the next page.
+                sub_start_idx = si;
+                break;
+            }
+
+            sub_start_idx = 0;
             line_num += 1;
         }
 
@@ -345,6 +350,166 @@ fn appendFmt(list: *std.ArrayList(u8), allocator: Allocator, comptime fmt: []con
     var buf: [512]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
     list.appendSlice(allocator, s) catch {};
+}
+
+fn isBreakAfter(ch: u8) bool {
+    return switch (ch) {
+        ',', ';', ')', ']', '}', '.', ':', '-', '/', '\\', '|', '&', '+', '=', '>' => true,
+        else => false,
+    };
+}
+
+/// Decode the next UTF-8 codepoint at `data[i]`, returning codepoint and byte length.
+fn nextCodepoint(data: []const u8, i: usize) struct { cp: u21, len: usize } {
+    const b0 = data[i];
+    if (b0 < 0x80) return .{ .cp = b0, .len = 1 };
+    if (b0 < 0xE0 and i + 1 < data.len) {
+        return .{
+            .cp = (@as(u21, b0 & 0x1F) << 6) | @as(u21, data[i + 1] & 0x3F),
+            .len = 2,
+        };
+    }
+    if (b0 < 0xF0 and i + 2 < data.len) {
+        return .{
+            .cp = (@as(u21, b0 & 0x0F) << 12) | (@as(u21, data[i + 1] & 0x3F) << 6) | @as(u21, data[i + 2] & 0x3F),
+            .len = 3,
+        };
+    }
+    if (i + 3 < data.len) {
+        return .{
+            .cp = (@as(u21, b0 & 0x07) << 18) | (@as(u21, data[i + 1] & 0x3F) << 12) | (@as(u21, data[i + 2] & 0x3F) << 6) | @as(u21, data[i + 3] & 0x3F),
+            .len = 4,
+        };
+    }
+    return .{ .cp = 0xFFFD, .len = 1 };
+}
+
+/// Compute wrap break points for a single buffer line, measuring in real
+/// font points. Mirrors editor.zig's computeWrapBreaks typesetting rules:
+/// prefer last space, then last break-after punctuation, only accept a
+/// candidate past the 60% threshold, fall back to a hard break, and
+/// guarantee forward progress on runs of unbreakable glyphs.
+fn computePdfWrapBreaks(
+    fnt: *const font_mod.Font,
+    font_size: f32,
+    data: []const u8,
+    first_w: f32,
+    cont_w: f32,
+    tab_width: u8,
+    breaks: *[MAX_WRAP_BREAKS]usize,
+) usize {
+    breaks[0] = 0;
+    const space_w = fnt.charWidth(' ', font_size);
+    var count: usize = 1;
+    var pos: usize = 0;
+    var first = true;
+
+    while (pos < data.len and count < MAX_WRAP_BREAKS) {
+        const avail = if (first) first_w else cont_w;
+        first = false;
+
+        var width_so_far: f32 = 0;
+        var visual_col: usize = 0;
+        var i: usize = pos;
+        var last_space_byte: ?usize = null;
+        var last_space_width: f32 = 0;
+        var last_punct_byte: ?usize = null;
+        var last_punct_width: f32 = 0;
+
+        while (i < data.len) {
+            const b = data[i];
+            if (b == '\n' or b == '\r') break;
+
+            var cp_width: f32 = 0;
+            var cp_visual: usize = 1;
+            var byte_len: usize = 1;
+
+            if (b == '\t') {
+                const advance = tab_width - @as(u8, @intCast(visual_col % tab_width));
+                cp_width = space_w * @as(f32, @floatFromInt(advance));
+                cp_visual = advance;
+                byte_len = 1;
+            } else {
+                const dec = nextCodepoint(data, i);
+                cp_width = fnt.charWidth(dec.cp, font_size);
+                byte_len = dec.len;
+            }
+
+            if (width_so_far + cp_width > avail) break;
+
+            width_so_far += cp_width;
+            visual_col += cp_visual;
+            i += byte_len;
+
+            if (b == ' ' or b == '\t') {
+                last_space_byte = i;
+                last_space_width = width_so_far;
+            } else if (isBreakAfter(b)) {
+                last_punct_byte = i;
+                last_punct_width = width_so_far;
+            }
+        }
+
+        if (i >= data.len or data[i] == '\n' or data[i] == '\r') break;
+
+        const min_width = avail * 3.0 / 5.0;
+        var break_at: usize = i;
+        if (last_space_byte) |bp| {
+            if (last_space_width >= min_width) break_at = bp;
+        } else if (last_punct_byte) |bp| {
+            if (last_punct_width >= min_width) break_at = bp;
+        }
+
+        // Forward-progress guard for runs of unbreakable codepoints wider than avail.
+        if (break_at <= pos) {
+            const blen = @max(@as(usize, unicode.utf8Len(data[pos])), 1);
+            break_at = pos + blen;
+        }
+
+        breaks[count] = break_at;
+        count += 1;
+        pos = break_at;
+    }
+
+    return count;
+}
+
+/// Encode a byte slice as hex glyph IDs into `list`. Tabs expand to
+/// `tab_width` space glyphs so they don't render as .notdef. CR/LF
+/// terminators (if present) are skipped.
+fn encodeGlyphs(
+    list: *std.ArrayList(u8),
+    allocator: Allocator,
+    fnt: *const font_mod.Font,
+    data: []const u8,
+    tab_width: u8,
+) void {
+    const space_gid = fnt.glyphId(' ');
+    var bi: usize = 0;
+    while (bi < data.len) {
+        const b0 = data[bi];
+        if (b0 == '\n' or b0 == '\r') {
+            bi += 1;
+            continue;
+        }
+        if (b0 == '\t') {
+            var k: u8 = 0;
+            while (k < tab_width) : (k += 1) {
+                var hex_buf: [4]u8 = undefined;
+                const s = std.fmt.bufPrint(&hex_buf, "{X:0>4}", .{space_gid}) catch break;
+                list.appendSlice(allocator, s) catch {};
+            }
+            bi += 1;
+            continue;
+        }
+        const dec = nextCodepoint(data, bi);
+        const gid = fnt.glyphId(dec.cp);
+        var hex_buf: [4]u8 = undefined;
+        if (std.fmt.bufPrint(&hex_buf, "{X:0>4}", .{gid})) |s| {
+            list.appendSlice(allocator, s) catch {};
+        } else |_| {}
+        bi += dec.len;
+    }
 }
 
 /// Send the current editor buffer to the system default printer.
