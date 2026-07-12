@@ -65,6 +65,13 @@ const max_manifest_size: usize = 16 * 1024;
 const max_sig_size: usize = 256;
 const max_binary_size: usize = 32 * 1024 * 1024;
 
+// Signed-manifest header lines written by CI (inside the signed
+// content, so they can't be forged without the signing key):
+//   `# issy-commit: <sha>`          binds the manifest to its release
+//   `# issy-manifest-epoch: <ts>`   monotonic anti-rollback counter
+const commit_header = "# issy-commit:";
+const epoch_header = "# issy-manifest-epoch:";
+
 /// Returns the GitHub release asset name for the current build target,
 /// or null if this platform doesn't ship a prebuilt binary.
 fn currentAssetName() ?[]const u8 {
@@ -226,7 +233,7 @@ fn doWork(
 
     if (std.mem.eql(u8, commit_body[0..40], build_info.commit_sha[0..40])) return;
 
-    downloadAndStage(&client, allocator, cache_dir, asset_name) catch return;
+    downloadAndStage(&client, allocator, cache_dir, asset_name, commit_body[0..40]) catch return;
 }
 
 fn downloadAndStage(
@@ -234,6 +241,7 @@ fn downloadAndStage(
     allocator: std.mem.Allocator,
     cache_dir: []const u8,
     asset_name: []const u8,
+    latest_commit: []const u8,
 ) !void {
     // 2. Fetch sha256sums.txt and its signature.
     const manifest = httpGet(client, allocator, sums_url, max_manifest_size) orelse return error.ManifestFetchFailed;
@@ -244,6 +252,25 @@ fn downloadAndStage(
 
     // 3. Verify Ed25519 signature.
     try verifyManifestSignature(manifest, sig_bytes);
+
+    // 3a. Bind the manifest to the release we believe we're updating to.
+    // A signed manifest naming a different commit than the fetched
+    // commit.txt means the two files came from different releases.
+    if (manifestHeaderField(manifest, commit_header)) |mc| {
+        if (mc.len < 40 or !std.mem.eql(u8, mc[0..40], latest_commit)) {
+            return error.ManifestCommitMismatch;
+        }
+    }
+
+    // 3b. Anti-rollback: a signed manifest with an epoch older than the
+    // newest epoch we've ever accepted is a replayed old release —
+    // authentic, but stale. Once an epoch has been seen, every future
+    // manifest must carry one that is >= it.
+    const epoch_path = try std.fmt.allocPrint(allocator, "{s}/manifest_epoch.txt", .{cache_dir});
+    defer allocator.free(epoch_path);
+    const new_epoch = manifestEpoch(manifest);
+    const cached_epoch = readCachedEpoch(epoch_path);
+    if (!epochAllows(cached_epoch, new_epoch)) return error.RollbackDetected;
 
     // 4. Find the expected SHA-256 for our platform.
     const expected_hex = findAssetHash(manifest, asset_name) orelse return error.AssetNotInManifest;
@@ -273,7 +300,62 @@ fn downloadAndStage(
         defer f.close();
         try f.writeAll(binary);
     }
+
+    // Persist the verified manifest + signature so apply() can re-verify
+    // the staged binary immediately before the swap (the staged file may
+    // sit in the user-writable cache for days), then record the epoch
+    // high-water mark and finally publish the staged binary.
+    const manifest_path = try std.fmt.allocPrint(allocator, "{s}/sha256sums.txt", .{cache_dir});
+    defer allocator.free(manifest_path);
+    const sig_path = try std.fmt.allocPrint(allocator, "{s}/sha256sums.txt.sig", .{cache_dir});
+    defer allocator.free(sig_path);
+    try writeAtomic(manifest_path, manifest);
+    try writeAtomic(sig_path, sig_bytes);
+    if (new_epoch) |ne| {
+        var epoch_buf: [32]u8 = undefined;
+        const epoch_str = std.fmt.bufPrint(&epoch_buf, "{d}", .{ne}) catch unreachable;
+        try writeAtomic(epoch_path, epoch_str);
+    }
+
     try std.fs.cwd().rename(tmp_path, final_path);
+}
+
+/// Return the trimmed value following a `key` header line in the
+/// manifest, or null when absent.
+fn manifestHeaderField(manifest: []const u8, key: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, manifest, '\n');
+    while (lines.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, t, key)) {
+            return std.mem.trim(u8, t[key.len..], " \t");
+        }
+    }
+    return null;
+}
+
+fn manifestEpoch(manifest: []const u8) ?u64 {
+    const v = manifestHeaderField(manifest, epoch_header) orelse return null;
+    return std.fmt.parseInt(u64, v, 10) catch null;
+}
+
+/// Anti-rollback decision: with no cached epoch anything is accepted
+/// (first contact, or a pre-epoch release history). Once an epoch has
+/// been cached, an incoming manifest must carry an epoch >= it —
+/// including the case where the incoming manifest has no epoch at all,
+/// which is exactly what a replayed pre-epoch release looks like.
+fn epochAllows(cached: ?u64, incoming: ?u64) bool {
+    const ce = cached orelse return true;
+    const ne = incoming orelse return false;
+    return ne >= ce;
+}
+
+fn readCachedEpoch(path: []const u8) ?u64 {
+    const file = std.fs.cwd().openFile(path, .{}) catch return null;
+    defer file.close();
+    var buf: [64]u8 = undefined;
+    const n = file.readAll(&buf) catch return null;
+    const trimmed = std.mem.trim(u8, buf[0..n], " \t\r\n");
+    return std.fmt.parseInt(u64, trimmed, 10) catch null;
 }
 
 fn verifyManifestSignature(manifest: []const u8, sig_bytes: []const u8) !void {
@@ -430,6 +512,15 @@ pub fn apply(
     if (staged_stat.kind != .file) return ApplyError.NoStagedBinary;
     if (staged_stat.size < 1024) return ApplyError.NoStagedBinary;
 
+    // Re-verify the staged binary against the cached signed manifest at
+    // the moment of use, not just at stage time — the file may have sat
+    // in the user-writable cache for days. A failure deletes the staged
+    // binary so a fresh worker run can re-download it.
+    verifyStagedBinary(allocator, cache_dir, staged_path) catch {
+        std.fs.cwd().deleteFile(staged_path) catch {};
+        return ApplyError.NoStagedBinary;
+    };
+
     // Write resume file before touching the binary, so if anything goes
     // wrong we haven't broken the running instance.
     const now_ns = std.time.nanoTimestamp();
@@ -439,8 +530,10 @@ pub fn apply(
     writeResumeFile(resume_path, ed, now_ns) catch return ApplyError.ResumeWriteFailed;
 
     // Snapshot the currently-running binary so --rollback has something to
-    // restore. Best-effort: a failure here doesn't block the apply.
+    // restore, plus its checksum so rollback can refuse a tampered
+    // snapshot. Best-effort: a failure here doesn't block the apply.
     copyFileBestEffort(argv0, prev_path);
+    writePrevChecksum(allocator, cache_dir, argv0);
 
     // Atomic binary swap. From this point the next execve call is the only
     // reasonable way forward — the current in-memory image is out of sync
@@ -503,6 +596,54 @@ fn copyFileBestEffort(src: []const u8, dst: []const u8) void {
     std.fs.cwd().copyFile(src, std.fs.cwd(), dst, .{}) catch {};
 }
 
+/// Verify the staged binary's SHA-256 against the cached signed
+/// manifest. Any failure (missing manifest, bad signature, hash
+/// mismatch) rejects the staged binary.
+fn verifyStagedBinary(
+    allocator: std.mem.Allocator,
+    cache_dir: []const u8,
+    staged_path: []const u8,
+) !void {
+    const manifest_path = try std.fmt.allocPrint(allocator, "{s}/sha256sums.txt", .{cache_dir});
+    defer allocator.free(manifest_path);
+    const sig_path = try std.fmt.allocPrint(allocator, "{s}/sha256sums.txt.sig", .{cache_dir});
+    defer allocator.free(sig_path);
+
+    const manifest = try std.fs.cwd().readFileAlloc(allocator, manifest_path, max_manifest_size);
+    defer allocator.free(manifest);
+    const sig_bytes = try std.fs.cwd().readFileAlloc(allocator, sig_path, max_sig_size);
+    defer allocator.free(sig_bytes);
+
+    try verifyManifestSignature(manifest, sig_bytes);
+
+    const asset_name = currentAssetName() orelse return error.NoAssetForPlatform;
+    const expected_hex = findAssetHash(manifest, asset_name) orelse return error.AssetNotInManifest;
+    var expected_hash: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&expected_hash, expected_hex) catch return error.BadHexHash;
+
+    const staged = try std.fs.cwd().readFileAlloc(allocator, staged_path, max_binary_size);
+    defer allocator.free(staged);
+    var actual_hash: [32]u8 = undefined;
+    Sha256.hash(staged, &actual_hash, .{});
+    if (!std.mem.eql(u8, &actual_hash, &expected_hash)) return error.HashMismatch;
+}
+
+/// Record the SHA-256 of the binary snapshotted to issy.prev so
+/// --rollback can validate it later. Best-effort.
+fn writePrevChecksum(allocator: std.mem.Allocator, cache_dir: []const u8, src: []const u8) void {
+    const sha_path = std.fmt.allocPrint(allocator, "{s}/issy.prev.sha256", .{cache_dir}) catch return;
+    defer allocator.free(sha_path);
+
+    const data = std.fs.cwd().readFileAlloc(allocator, src, max_binary_size) catch return;
+    defer allocator.free(data);
+
+    var hash: [32]u8 = undefined;
+    Sha256.hash(data, &hash, .{});
+    var hex_buf: [64]u8 = undefined;
+    const hex = std.fmt.bufPrint(&hex_buf, "{x}", .{&hash}) catch return;
+    writeAtomic(sha_path, hex) catch {};
+}
+
 /// Reads a resume file written by `apply` and restores the editor's
 /// cursor position for the currently-open file. Called once at startup
 /// from main() when `--resume <path>` is present on argv.
@@ -557,7 +698,9 @@ pub fn tryResume(
 
     const max_line = if (ed.buf.lineCount() > 0) ed.buf.lineCount() - 1 else 0;
     ed.cursor.line = @min(saved_line, max_line);
-    ed.cursor.col = saved_col;
+    const line_len = if (ed.buf.getLine(ed.cursor.line)) |info| info.len else 0;
+    ed.cursor.col = @min(saved_col, line_len);
+    ed.cursor.col_want = ed.cursor.col;
     ed.ensureCursorVisible();
 
     var msg_buf: [128]u8 = undefined;
@@ -581,6 +724,24 @@ pub fn rollback(allocator: std.mem.Allocator) !void {
 
     std.posix.access(argv0, std.posix.W_OK) catch return error.NotWritable;
     _ = std.fs.cwd().statFile(prev_path) catch return error.NoPreviousBinary;
+
+    // If apply() recorded a checksum for the snapshot, require it to
+    // still match — a tampered issy.prev must not be swapped in. A
+    // missing checksum file (pre-checksum snapshots) skips the check.
+    const sha_path = try std.fmt.allocPrint(allocator, "{s}/issy.prev.sha256", .{cache_dir});
+    defer allocator.free(sha_path);
+    if (std.fs.cwd().readFileAlloc(allocator, sha_path, 128)) |expected_hex_raw| {
+        defer allocator.free(expected_hex_raw);
+        const expected_hex = std.mem.trim(u8, expected_hex_raw, " \t\r\n");
+        var expected_hash: [32]u8 = undefined;
+        if (std.fmt.hexToBytes(&expected_hash, expected_hex)) |_| {
+            const data = try std.fs.cwd().readFileAlloc(allocator, prev_path, max_binary_size);
+            defer allocator.free(data);
+            var actual: [32]u8 = undefined;
+            Sha256.hash(data, &actual, .{});
+            if (!std.mem.eql(u8, &actual, &expected_hash)) return error.PreviousBinaryCorrupt;
+        } else |_| {}
+    } else |_| {}
 
     try std.fs.cwd().rename(prev_path, argv0);
 }
@@ -648,7 +809,7 @@ test "canAutoApply rejects when buffer is modified" {
     var cfg = config_mod.Config.init();
     cfg.autoupdate = true;
 
-    var ed = editor_mod.Editor.init(&cfg, std.testing.allocator);
+    var ed = try editor_mod.Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     var state = UpdateState{ .status = .staged };
@@ -680,4 +841,34 @@ test "update_key is bootstrapped" {
     // silently refuse to stage any binary until it's regenerated via
     // `zig build keygen`.
     try std.testing.expect(update_key.isConfigured());
+}
+
+test "manifest header parsing" {
+    const manifest =
+        "# issy-commit: 0123456789abcdef0123456789abcdef01234567\n" ++
+        "# issy-manifest-epoch: 1750000000\n" ++
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789  issy-linux-amd64\n";
+
+    try std.testing.expectEqualStrings(
+        "0123456789abcdef0123456789abcdef01234567",
+        manifestHeaderField(manifest, commit_header).?,
+    );
+    try std.testing.expectEqual(@as(?u64, 1750000000), manifestEpoch(manifest));
+    // Header lines must not confuse the asset-hash parser.
+    try std.testing.expect(findAssetHash(manifest, "issy-linux-amd64") != null);
+    // Manifests without headers parse as absent.
+    try std.testing.expectEqual(@as(?u64, null), manifestEpoch("just  hashes\n"));
+}
+
+test "epoch anti-rollback decisions" {
+    // First contact: anything goes.
+    try std.testing.expect(epochAllows(null, null));
+    try std.testing.expect(epochAllows(null, 100));
+    // Once an epoch is cached, equal or newer is fine…
+    try std.testing.expect(epochAllows(100, 100));
+    try std.testing.expect(epochAllows(100, 101));
+    // …older is a replay, and "no epoch at all" is what a replayed
+    // pre-epoch release looks like.
+    try std.testing.expect(!epochAllows(100, 99));
+    try std.testing.expect(!epochAllows(100, null));
 }

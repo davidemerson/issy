@@ -17,13 +17,13 @@ key = "value with spaces"
 color_key = "#rrggbb"
 ```
 
-Blank lines and lines starting with `#` are ignored. Unknown keys are silently skipped. Malformed lines are ignored.
+Blank lines and lines starting with `#` are ignored. Unknown keys are silently skipped. Malformed lines are ignored — and so are out-of-range values (the key keeps its previous value; validation ranges are listed per key below).
 
 ## Editor Settings
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `tab_width` | integer | `4` | Number of spaces per tab stop |
+| `tab_width` | integer | `4` | Number of spaces per tab stop. Valid range 1–8; values outside it are ignored. |
 | `expand_tabs` | bool | `true` | Insert spaces instead of tab characters |
 | `line_numbers` | bool | `true` | Show line numbers in the gutter |
 | `word_wrap` | bool | `true` | Soft-wrap long lines at the right margin. Continuation lines are indented 2 spaces. The buffer is not modified. |
@@ -32,14 +32,14 @@ Blank lines and lines starting with `#` are ignored. Unknown keys are silently s
 | `auto_detect_indent` | bool | `true` | Scan file on open to detect tabs vs spaces and width |
 | `trailing_whitespace` | bool | `true` | Faintly highlight trailing spaces/tabs on non-empty lines |
 | `indent_mismatch` | bool | `true` | Faintly highlight leading indent that doesn't match the detected file style |
-| `scroll_margin` | integer | `5` | Minimum lines between cursor and screen edge before scrolling |
+| `scroll_margin` | integer | `5` | Minimum lines between cursor and screen edge before scrolling. Valid range 0–100. |
 
 ## Visual Design
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `gutter_padding` | integer | `3` | Spaces between line numbers and code |
-| `left_padding` | integer | `2` | Spaces before line numbers |
+| `gutter_padding` | integer | `3` | Spaces between line numbers and code. Valid range 0–32. |
+| `left_padding` | integer | `2` | Spaces before line numbers. Valid range 0–32. |
 | `right_margin` | integer | `100` | Soft right margin -- code stops here, rest is empty background. `0` fills the terminal width. |
 | `cursor_line_bg` | bool | `true` | Subtle full-width highlight on the current line |
 | `cursor_style` | string | `bar` | Terminal cursor shape: `bar`, `block`, or `underline` |
@@ -49,18 +49,19 @@ Blank lines and lines starting with `#` are ignored. Unknown keys are silently s
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `notify_updates` | bool | `true` | On startup, check whether a newer release exists and show `update available: <sha>` in the status bar. Set to `false` to disable the check (and the background network fetch that refreshes its cache) entirely. |
-| `autoupdate` | bool | `false` | Opt into automatic download, signature verification, and in-session apply. When on, the editor downloads the signed `sha256sums.txt` manifest from the latest release, verifies it against the Ed25519 public key committed to `src/update_key.zig`, downloads the matching platform binary, hashes it, stages it at `~/.cache/issy/issy.staged`, and — when the buffer is clean and the editor has been idle for 60 seconds — atomic-renames it into place and re-execs. |
+| `autoupdate` | bool | `false` | Opt into automatic download, signature verification, and in-session apply. When on, the editor downloads the signed `sha256sums.txt` manifest from the latest release, verifies it against the Ed25519 public key committed to `src/update_key.zig`, checks the manifest's embedded commit + monotonic epoch against the cached high-water mark (rejecting replayed older releases), downloads the matching platform binary, hashes it, stages it at `~/.cache/issy/issy.staged`, and — when the buffer is clean and the editor has been idle for 60 seconds — re-verifies the staged binary against the cached signed manifest, atomic-renames it into place, and re-execs. |
 
-Both keys are no-ops for `dev` builds (any working tree that wasn't built from a clean CI checkout). Both are also no-ops if the editor binary itself is not writable by the running user — this is the common case for distro-packaged installs at `/usr/bin/issy`, where auto-apply silently stays in notify-only mode.
+Both keys are no-ops for `dev` builds (any working tree that wasn't built from a clean CI checkout). When the editor binary itself is not writable by the running user — the common case for distro-packaged installs at `/usr/bin/issy` — the background worker still fetches, verifies, and stages the update in the cache, but the in-session apply is silently skipped, so the editor effectively stays in notify-only mode.
 
 **macOS specifically**: `autoupdate = true` is silently a no-op because issy does not ship prebuilt macOS binaries (cross-compiled Mach-O from Linux has no code signature and is refused by the Apple Silicon kernel). `notify_updates` still works — macOS users see the "update available" notice and run `brew upgrade issy` (or `brew upgrade --fetch-HEAD issy` if they installed with `--HEAD`) to actually update.
 
 The complete cache layout (all under `~/.cache/issy/`):
 
 - `commit.txt` — latest-release commit SHA
-- `sha256sums.txt` / `sha256sums.txt.sig` — signed manifest + signature
+- `sha256sums.txt` / `sha256sums.txt.sig` — verified signed manifest + signature; used to re-verify `issy.staged` at apply time
+- `manifest_epoch.txt` — highest manifest epoch ever accepted (anti-rollback high-water mark)
 - `issy.staged` — verified replacement binary, waiting to be applied
-- `issy.prev` — pre-apply snapshot for `issy --rollback`
+- `issy.prev` / `issy.prev.sha256` — pre-apply snapshot for `issy --rollback`, plus its checksum (rollback refuses a snapshot that no longer matches)
 - `resume.<ts>.txt` — one-shot cursor snapshot used by the new instance to restore position after re-exec
 
 See the [Auto-update section of README.md](README.md#auto-update) for the full flow, including the bootstrap procedure for forks that want to sign their own releases.
@@ -70,11 +71,13 @@ See the [Auto-update section of README.md](README.md#auto-update) for the full f
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `font_file` | string | (none) | Path to a TTF or OTF font file for PDF output. Required for Ctrl+P and `--print`. |
-| `font_size` | float | `10.0` | Font size in points for PDF output |
-| `print_margin_top` | float | `72.0` | Top margin in points (72 = 1 inch) |
-| `print_margin_bottom` | float | `72.0` | Bottom margin in points |
-| `print_margin_left` | float | `108.0` | Left margin in points (108 = 1.5 inches) |
-| `print_margin_right` | float | `72.0` | Right margin in points |
+| `font_size` | float | `10.0` | Font size in points for PDF output. Valid range 4–144. |
+| `print_margin_top` | float | `72.0` | Top margin in points (72 = 1 inch). Must be ≥ 0. |
+| `print_margin_bottom` | float | `72.0` | Bottom margin in points. Must be ≥ 0. |
+| `print_margin_left` | float | `108.0` | Left margin in points (108 = 1.5 inches). Must be ≥ 0. |
+| `print_margin_right` | float | `72.0` | Right margin in points. Must be ≥ 0. |
+
+Margins that leave no usable content area (top + bottom taller than the page, or left + right wider than it) make PDF export fail with a `MarginsTooLarge` error rather than emitting a broken document. Page headers are drawn only when the top margin leaves room for one (roughly ≥ 2 line heights).
 
 ## Themes
 
@@ -169,7 +172,7 @@ issy keeps a small cache directory at `~/.cache/issy/`:
 
 | File | Purpose |
 |------|---------|
-| `commit.txt`, `sha256sums.txt`, `sha256sums.txt.sig`, `issy.staged`, `issy.prev` | Auto-update state — see [README](README.md#auto-update). |
+| `commit.txt`, `sha256sums.txt`, `sha256sums.txt.sig`, `manifest_epoch.txt`, `issy.staged`, `issy.prev`, `issy.prev.sha256` | Auto-update state — see [README](README.md#auto-update). |
 | `positions.txt` | Per-file cursor memory. One `<abs_path>\t<line>\t<col>` entry per line, newest on top, capped at 300 entries. Corruption or a missing file is treated as "no saved positions" — the feature is best-effort. Delete it any time to reset. |
 
 Nothing in `~/.cache/issy/` is required for correct operation; it can be wiped without data loss.

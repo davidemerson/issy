@@ -7,6 +7,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const unicode = @import("unicode.zig");
 
 /// Terminal color specification.
 pub const Color = union(enum) {
@@ -58,7 +59,7 @@ pub const Key = union(enum) {
     f1,
     help, // Ctrl+/ or Ctrl+Shift+?
     paste_start, // DECSET 2004 — terminal is about to stream pasted bytes
-    paste_end,   // DECSET 2004 — end of the pasted block
+    paste_end, // DECSET 2004 — end of the pasted block
     unknown,
     none,
 };
@@ -179,6 +180,27 @@ pub fn deinit() void {
     initialized = false;
 }
 
+/// Restore the terminal from a crash path (panic handler or fatal
+/// signal). Writes the restore sequences with a direct blocking write —
+/// bypassing the buffered writer, whose state may be arbitrary — and
+/// restores the saved termios. Safe to call at any time; a no-op when
+/// init() hasn't run.
+pub fn emergencyRestore() void {
+    if (!initialized) return;
+    initialized = false;
+    if (is_posix) {
+        const seq = "\x1b[0 q" ++ // default cursor shape
+            "\x1b[?1000l\x1b[?1002l\x1b[?1006l" ++ // mouse off
+            "\x1b[?2004l" ++ // bracketed paste off
+            "\x1b[?1049l" ++ // leave alternate screen
+            "\x1b[0m" ++ // reset styles
+            "\x1b[?25h"; // show cursor
+        std.fs.File.stdout().writeAll(seq) catch {};
+        const stdin_fd = std.fs.File.stdin().handle;
+        posix.tcsetattr(stdin_fd, .FLUSH, orig_termios) catch {};
+    }
+}
+
 fn updateSize() void {
     if (is_posix) {
         const stdin_fd = std.fs.File.stdin().handle;
@@ -209,6 +231,13 @@ fn fillReadBuf() void {
     if (read_start >= read_end) {
         read_start = 0;
         read_end = 0;
+    } else if (read_end == READ_BUF_SIZE and read_start > 0) {
+        // Compact pending bytes to the front so an in-flight escape
+        // sequence at the tail of the buffer has room to complete.
+        const n = read_end - read_start;
+        std.mem.copyForwards(u8, read_buf[0..n], read_buf[read_start..read_end]);
+        read_start = 0;
+        read_end = n;
     }
     const stdin = std.fs.File.stdin();
     const n = stdin.read(read_buf[read_end..]) catch 0;
@@ -268,20 +297,23 @@ fn readKeyPosix() !Key {
 
     // Escape sequences
     if (b == 0x1b) {
-        if (readBufAvailable() == 1) {
-            // Only ESC in buffer — try to read more
+        while (true) {
+            const avail = readBufAvailable();
+            if (parseEscape(readBufSlice(0, avail))) |r| {
+                readBufConsume(r.len);
+                return r.key;
+            }
+            // Valid-but-incomplete sequence (e.g. "ESC [" split across
+            // reads over a slow connection). Try to pull more bytes —
+            // fillReadBuf waits up to the 100ms termios timeout once.
             fillReadBuf();
-            if (readBufAvailable() == 1) {
+            if (readBufAvailable() == avail) {
+                // Nothing more arrived — treat as a bare Escape key and
+                // leave any following bytes for the next readKey call.
                 readBufConsume(1);
                 return .escape;
             }
         }
-        const avail = readBufAvailable();
-        const result = parseEscape(readBufSlice(0, avail));
-        // Consume the escape sequence bytes
-        const consumed = escapeLen(readBufSlice(0, avail));
-        readBufConsume(consumed);
-        return result;
     }
 
     // UTF-8 decode
@@ -290,67 +322,70 @@ fn readKeyPosix() !Key {
         return .{ .char = @intCast(b) };
     }
 
-    // Multi-byte UTF-8
-    const expected: usize = if (b < 0xC0) 1 else if (b < 0xE0) 2 else if (b < 0xF0) 3 else 4;
-    if (expected <= readBufAvailable()) {
-        const cp = decodeUtf8(readBufSlice(0, expected));
-        readBufConsume(expected);
-        return .{ .char = cp };
+    // Multi-byte UTF-8. If the sequence is split across reads, try one
+    // refill before decoding; unicode.decode validates continuation
+    // bytes and rejects overlong/surrogate encodings, yielding U+FFFD
+    // (len 1) for malformed input so we always make progress.
+    const expected: usize = unicode.utf8Len(b);
+    if (expected > readBufAvailable()) {
+        fillReadBuf();
     }
-    readBufConsume(1);
-    return .unknown;
+    const take = @min(expected, readBufAvailable());
+    const r = unicode.decode(readBufSlice(0, take));
+    readBufConsume(r.len);
+    return .{ .char = r.codepoint };
 }
 
-fn escapeLen(buf: []const u8) usize {
-    // Determine how many bytes the escape sequence consumed
-    if (buf.len < 2) return 1;
-    // ESC O P/Q/R/S = F1-F4 (SS3 sequences) — consume 3 bytes
-    if (buf[1] == 'O' and buf.len >= 3) return 3;
-    // Only consume the next byte if it starts a CSI sequence
-    // Otherwise treat ESC as standalone — don't eat the following character
-    if (buf[1] != '[') return 1;
+const EscParse = struct { key: Key, len: usize };
 
-    // CSI sequence: ESC [ ... <letter>
-    var i: usize = 2;
-    while (i < buf.len) {
-        const c = buf[i];
-        if ((c >= 0x40 and c <= 0x7E) and c != '[') {
-            return i + 1; // include the terminator
-        }
-        i += 1;
-    }
-    return buf.len; // consume everything if no terminator found
-}
+/// Maximum CSI parameter bytes before we declare the sequence malformed
+/// and flush it, rather than waiting forever for a terminator.
+const max_csi_len = 32;
 
-fn decodeUtf8(bytes: []const u8) u21 {
-    if (bytes.len == 0) return 0xFFFD;
-    const b0 = bytes[0];
-    if (b0 < 0x80) return @intCast(b0);
-    if (bytes.len >= 2 and b0 >= 0xC0 and b0 < 0xE0) {
-        return (@as(u21, b0 & 0x1F) << 6) | @as(u21, bytes[1] & 0x3F);
-    }
-    if (bytes.len >= 3 and b0 >= 0xE0 and b0 < 0xF0) {
-        return (@as(u21, b0 & 0x0F) << 12) | (@as(u21, bytes[1] & 0x3F) << 6) | @as(u21, bytes[2] & 0x3F);
-    }
-    if (bytes.len >= 4 and b0 >= 0xF0) {
-        return (@as(u21, b0 & 0x07) << 18) | (@as(u21, bytes[1] & 0x3F) << 12) | (@as(u21, bytes[2] & 0x3F) << 6) | @as(u21, bytes[3] & 0x3F);
-    }
-    return 0xFFFD;
-}
+/// Parse one escape sequence from the front of `buf` (buf[0] must be ESC).
+/// Returns the decoded key plus the number of bytes consumed, or null when
+/// the bytes so far form a valid but incomplete sequence — the caller
+/// should read more input and retry. A bare ESC followed by a byte that
+/// doesn't start a known sequence is returned as .escape consuming only
+/// the ESC, so the following character is not swallowed.
+fn parseEscape(buf: []const u8) ?EscParse {
+    if (buf.len < 2) return null;
 
-fn parseEscape(buf: []const u8) Key {
-    if (buf.len < 2) return .escape;
-
-    // SS3 sequences: ESC O P = F1, etc.
-    if (buf[1] == 'O' and buf.len >= 3) {
-        return switch (buf[2]) {
+    // SS3 sequences: ESC O <final> (F1-F4).
+    if (buf[1] == 'O') {
+        if (buf.len < 3) return null;
+        const key: Key = switch (buf[2]) {
             'P' => .f1,
             else => .unknown,
         };
+        return .{ .key = key, .len = 3 };
     }
 
-    if (buf[1] != '[') return .escape;
-    if (buf.len < 3) return .escape;
+    if (buf[1] != '[') {
+        // Not CSI/SS3 — standalone ESC; don't eat the following byte.
+        return .{ .key = .escape, .len = 1 };
+    }
+
+    // CSI: ESC [ <params/intermediates> <final 0x40..0x7E>. '[' is
+    // excluded as a terminator so linux-console "ESC [ [ A" F-keys
+    // don't truncate early.
+    var i: usize = 2;
+    while (i < buf.len) : (i += 1) {
+        const c = buf[i];
+        if (c >= 0x40 and c <= 0x7E and c != '[') {
+            return .{ .key = parseCsi(buf[0 .. i + 1]), .len = i + 1 };
+        }
+        if (i >= max_csi_len) {
+            // Runaway parameter bytes — malformed; flush what we have.
+            return .{ .key = .unknown, .len = i + 1 };
+        }
+    }
+    return null; // incomplete — no terminator yet
+}
+
+/// Decode a complete CSI sequence (ESC [ ... final).
+fn parseCsi(buf: []const u8) Key {
+    if (buf.len < 3) return .unknown;
 
     // SGR mouse: ESC [ < ...
     if (buf[2] == '<') {
@@ -477,9 +512,14 @@ fn parseSgrMouse(buf: []const u8) Key {
         if (c == 'm') break;
     }
 
-    // Scroll wheel
-    if (button == 64) return .scroll_up;
-    if (button == 65) return .scroll_down;
+    // Scroll wheel. SGR encodes modifiers on the button value
+    // (shift=4, meta=8, ctrl=16), so shift+scroll arrives as 68/69 and
+    // ctrl+scroll as 80/81. Strip the modifier bits — a modified scroll
+    // should still scroll rather than being silently dropped. Values
+    // 96+ carry the motion bit (32) and are wheel-drag noise.
+    if (button >= 64 and button < 96) {
+        return if (button & 1 == 0) .scroll_up else .scroll_down;
+    }
 
     const row: u16 = if (cy > 0) cy - 1 else 0;
     const col: u16 = if (cx > 0) cx - 1 else 0;
@@ -533,18 +573,22 @@ pub fn write(bytes: []const u8) void {
     writeStr(bytes);
 }
 
+/// Maximum raw bytes accepted for the system clipboard via OSC 52. Most
+/// terminals drop longer sequences anyway (xterm's default is much
+/// smaller). Data over the cap is refused outright — silently sending
+/// a truncated clipboard would be worse than not sending one.
+pub const osc52_max_bytes: usize = 100 * 1024;
+
 /// Emit an OSC 52 sequence pushing `data` onto the terminal's system
 /// clipboard. Base64-encodes `data` in-place via the output buffer —
-/// no heap allocation. No-op if the terminal isn't initialized or
-/// `data` is empty. Silently capped at 100 KB because most terminals
-/// drop longer sequences anyway (xterm's default is much smaller).
+/// no heap allocation. No-op if the terminal isn't initialized,
+/// `data` is empty, or `data` exceeds `osc52_max_bytes`.
 /// The internal editor clipboard is unaffected either way.
 pub fn writeOsc52Clipboard(data: []const u8) void {
     if (!initialized) return;
-    if (data.len == 0) return;
+    if (data.len == 0 or data.len > osc52_max_bytes) return;
 
-    const max_raw: usize = 100 * 1024;
-    const capped = if (data.len > max_raw) data[0..max_raw] else data;
+    const capped = data;
 
     writeStr("\x1b]52;c;");
 
@@ -750,25 +794,62 @@ test "escape sequence output" {
     try std.testing.expectEqualSlices(u8, "\x1b[49m", write_buf[0..write_pos]);
 }
 
+fn parseKey(seq: []const u8) Key {
+    const r = parseEscape(seq) orelse return .none;
+    return r.key;
+}
+
 test "key parsing - arrows and special keys" {
-    try std.testing.expectEqual(Key.up, parseEscape("\x1b[A"));
-    try std.testing.expectEqual(Key.down, parseEscape("\x1b[B"));
-    try std.testing.expectEqual(Key.right, parseEscape("\x1b[C"));
-    try std.testing.expectEqual(Key.left, parseEscape("\x1b[D"));
-    try std.testing.expectEqual(Key.home, parseEscape("\x1b[H"));
-    try std.testing.expectEqual(Key.end, parseEscape("\x1b[F"));
-    try std.testing.expectEqual(Key.delete, parseEscape("\x1b[3~"));
-    try std.testing.expectEqual(Key.page_up, parseEscape("\x1b[5~"));
-    try std.testing.expectEqual(Key.page_down, parseEscape("\x1b[6~"));
+    try std.testing.expectEqual(Key.up, parseKey("\x1b[A"));
+    try std.testing.expectEqual(Key.down, parseKey("\x1b[B"));
+    try std.testing.expectEqual(Key.right, parseKey("\x1b[C"));
+    try std.testing.expectEqual(Key.left, parseKey("\x1b[D"));
+    try std.testing.expectEqual(Key.home, parseKey("\x1b[H"));
+    try std.testing.expectEqual(Key.end, parseKey("\x1b[F"));
+    try std.testing.expectEqual(Key.delete, parseKey("\x1b[3~"));
+    try std.testing.expectEqual(Key.page_up, parseKey("\x1b[5~"));
+    try std.testing.expectEqual(Key.page_down, parseKey("\x1b[6~"));
+}
+
+test "key parsing - incomplete sequences signal for more input" {
+    // A CSI with no terminator yet must return null (read more), not a
+    // bare escape — this is the split-read-over-SSH case.
+    try std.testing.expectEqual(@as(?EscParse, null), parseEscape("\x1b"));
+    try std.testing.expectEqual(@as(?EscParse, null), parseEscape("\x1b["));
+    try std.testing.expectEqual(@as(?EscParse, null), parseEscape("\x1b[1;2"));
+    try std.testing.expectEqual(@as(?EscParse, null), parseEscape("\x1bO"));
+
+    // Once the terminator arrives the whole sequence parses.
+    const r = parseEscape("\x1b[1;2C").?;
+    try std.testing.expectEqual(Key.shift_right, r.key);
+    try std.testing.expectEqual(@as(usize, 6), r.len);
+}
+
+test "key parsing - bare ESC before a plain char consumes only ESC" {
+    const r = parseEscape("\x1bx").?;
+    try std.testing.expectEqual(Key.escape, r.key);
+    try std.testing.expectEqual(@as(usize, 1), r.len);
+}
+
+test "key parsing - runaway CSI is flushed as unknown" {
+    const seq = "\x1b[" ++ "1;" ** 30;
+    const r = parseEscape(seq).?;
+    try std.testing.expectEqual(Key.unknown, r.key);
+    try std.testing.expect(r.len > 2);
 }
 
 test "key parsing - SGR mouse scroll" {
-    try std.testing.expectEqual(Key.scroll_up, parseEscape("\x1b[<64;1;1M"));
-    try std.testing.expectEqual(Key.scroll_down, parseEscape("\x1b[<65;1;1M"));
+    try std.testing.expectEqual(Key.scroll_up, parseKey("\x1b[<64;1;1M"));
+    try std.testing.expectEqual(Key.scroll_down, parseKey("\x1b[<65;1;1M"));
+    // Modified scroll (shift=+4, ctrl=+16) still scrolls.
+    try std.testing.expectEqual(Key.scroll_up, parseKey("\x1b[<68;1;1M"));
+    try std.testing.expectEqual(Key.scroll_down, parseKey("\x1b[<69;1;1M"));
+    try std.testing.expectEqual(Key.scroll_up, parseKey("\x1b[<80;1;1M"));
+    try std.testing.expectEqual(Key.scroll_down, parseKey("\x1b[<81;1;1M"));
 }
 
 test "key parsing - SGR mouse click" {
-    const result = parseEscape("\x1b[<0;10;5M");
+    const result = parseKey("\x1b[<0;10;5M");
     switch (result) {
         .mouse_click => |pos| {
             try std.testing.expectEqual(@as(u16, 4), pos.row);
@@ -779,16 +860,16 @@ test "key parsing - SGR mouse click" {
 }
 
 test "key parsing - shift+arrow keys" {
-    try std.testing.expectEqual(Key.shift_up, parseEscape("\x1b[1;2A"));
-    try std.testing.expectEqual(Key.shift_down, parseEscape("\x1b[1;2B"));
-    try std.testing.expectEqual(Key.shift_right, parseEscape("\x1b[1;2C"));
-    try std.testing.expectEqual(Key.shift_left, parseEscape("\x1b[1;2D"));
-    try std.testing.expectEqual(Key.shift_home, parseEscape("\x1b[1;2H"));
-    try std.testing.expectEqual(Key.shift_end, parseEscape("\x1b[1;2F"));
+    try std.testing.expectEqual(Key.shift_up, parseKey("\x1b[1;2A"));
+    try std.testing.expectEqual(Key.shift_down, parseKey("\x1b[1;2B"));
+    try std.testing.expectEqual(Key.shift_right, parseKey("\x1b[1;2C"));
+    try std.testing.expectEqual(Key.shift_left, parseKey("\x1b[1;2D"));
+    try std.testing.expectEqual(Key.shift_home, parseKey("\x1b[1;2H"));
+    try std.testing.expectEqual(Key.shift_end, parseKey("\x1b[1;2F"));
 }
 
 test "key parsing - SGR mouse drag" {
-    const result = parseEscape("\x1b[<32;15;7M");
+    const result = parseKey("\x1b[<32;15;7M");
     switch (result) {
         .mouse_drag => |pos| {
             try std.testing.expectEqual(@as(u16, 6), pos.row);
@@ -799,7 +880,7 @@ test "key parsing - SGR mouse drag" {
 }
 
 test "key parsing - SGR mouse release" {
-    const result = parseEscape("\x1b[<0;10;5m");
+    const result = parseKey("\x1b[<0;10;5m");
     switch (result) {
         .mouse_release => |pos| {
             try std.testing.expectEqual(@as(u16, 4), pos.row);

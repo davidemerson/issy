@@ -6,7 +6,7 @@
 
 # ── Editing ──
 
-# Number of spaces per tab stop
+# Number of spaces per tab stop (valid range 1-8)
 # tab_width = 4
 
 # Insert spaces instead of tab characters
@@ -68,9 +68,10 @@
 # Opt into automatic download, Ed25519 signature verification, and
 # in-session re-exec when a newer release is available. When on, the
 # editor downloads the signed manifest, verifies it against the public
-# key embedded in src/update_key.zig, hashes the downloaded binary, and
-# stages it at ~/.cache/issy/issy.staged. It is then applied the next
-# time the buffer is clean and the editor has been idle for 60s.
+# key embedded in src/update_key.zig, rejects replayed older releases
+# (anti-rollback epoch), hashes the downloaded binary, and stages it at
+# ~/.cache/issy/issy.staged. It is then re-verified and applied the
+# next time the buffer is clean and the editor has been idle for 60s.
 # Rollback the swap any time with: issy --rollback
 # autoupdate = false
 

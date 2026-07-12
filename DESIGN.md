@@ -8,9 +8,9 @@ issy is a text editor that looks like a printed page, not a terminal application
 
 2. **Barely there.** Every UI element earns its place by being nearly invisible. Line numbers are dim. The status bar has no background color. Comments are faint. The cursor line highlight is a 3-5% bg shift. Prompts appear with no labels or decoration.
 
-3. **Two colors pop, the rest recede.** Syntax highlighting uses many defined colors, but most are near-fg luminance. Only keywords and strings get real chromatic contrast. The eye parses structure through gentle luminance shifts, not a rainbow.
+3. **A few colors pop, the rest recede.** Syntax highlighting defines many colors, but numbers and function names stay at body-text luminance. Keywords and strings carry the strongest chromatic contrast; types, operators, and preprocessor directives get lighter cyan/gold accents. The eye parses structure through gentle shifts, not a rainbow.
 
-4. **No chrome.** No borders, no box-drawing characters, no decorative separators, no splash screen, no help overlay. The empty state is an empty screen with a cursor.
+4. **No chrome.** No borders, no box-drawing characters, no decorative separators, no splash screen. The empty state is an empty screen with a cursor. The one exception is the on-demand help overlay (`Ctrl+/`), which appears only when asked for and vanishes on the next keypress.
 
 5. **Prompts are ghosts.** Search, command, and confirm prompts appear on the last row with no label, no box, no prefix. The user types and the text appears. When done, it vanishes.
 

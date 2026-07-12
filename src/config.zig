@@ -36,24 +36,24 @@ pub const Theme = struct {
 /// Paper theme — Solarized Light.
 pub const paper_theme = Theme{
     // Solarized base colors
-    .bg = .{ .rgb = .{ .r = 0xfd, .g = 0xf6, .b = 0xe3 } },           // base3
-    .fg = .{ .rgb = .{ .r = 0x65, .g = 0x7b, .b = 0x83 } },           // base00
-    .comment = .{ .rgb = .{ .r = 0x93, .g = 0xa1, .b = 0xa1 } },      // base1
-    .keyword = .{ .rgb = .{ .r = 0x6c, .g = 0x71, .b = 0xc4 } },      // violet
-    .string = .{ .rgb = .{ .r = 0x2a, .g = 0xa1, .b = 0x98 } },       // cyan
-    .number = .{ .rgb = .{ .r = 0xd3, .g = 0x36, .b = 0x82 } },       // magenta
-    .typ = .{ .rgb = .{ .r = 0xb5, .g = 0x89, .b = 0x00 } },          // yellow
-    .function = .{ .rgb = .{ .r = 0x26, .g = 0x8b, .b = 0xd2 } },     // blue
-    .operator = .{ .rgb = .{ .r = 0x65, .g = 0x7b, .b = 0x83 } },     // base00
+    .bg = .{ .rgb = .{ .r = 0xfd, .g = 0xf6, .b = 0xe3 } }, // base3
+    .fg = .{ .rgb = .{ .r = 0x65, .g = 0x7b, .b = 0x83 } }, // base00
+    .comment = .{ .rgb = .{ .r = 0x93, .g = 0xa1, .b = 0xa1 } }, // base1
+    .keyword = .{ .rgb = .{ .r = 0x6c, .g = 0x71, .b = 0xc4 } }, // violet
+    .string = .{ .rgb = .{ .r = 0x2a, .g = 0xa1, .b = 0x98 } }, // cyan
+    .number = .{ .rgb = .{ .r = 0xd3, .g = 0x36, .b = 0x82 } }, // magenta
+    .typ = .{ .rgb = .{ .r = 0xb5, .g = 0x89, .b = 0x00 } }, // yellow
+    .function = .{ .rgb = .{ .r = 0x26, .g = 0x8b, .b = 0xd2 } }, // blue
+    .operator = .{ .rgb = .{ .r = 0x65, .g = 0x7b, .b = 0x83 } }, // base00
     .preprocessor = .{ .rgb = .{ .r = 0xcb, .g = 0x4b, .b = 0x16 } }, // orange
-    .line_number = .{ .rgb = .{ .r = 0xee, .g = 0xe8, .b = 0xd5 } },  // base2 (very faint)
+    .line_number = .{ .rgb = .{ .r = 0xee, .g = 0xe8, .b = 0xd5 } }, // base2 (very faint)
     .line_number_active = .{ .rgb = .{ .r = 0x93, .g = 0xa1, .b = 0xa1 } }, // base1
-    .cursor_line_bg = .{ .rgb = .{ .r = 0xee, .g = 0xe8, .b = 0xd5 } },    // base2
-    .status_bg = .{ .rgb = .{ .r = 0xfd, .g = 0xf6, .b = 0xe3 } },    // base3 (same as bg)
-    .status_fg = .{ .rgb = .{ .r = 0x93, .g = 0xa1, .b = 0xa1 } },    // base1
-    .cursor = .{ .rgb = .{ .r = 0x58, .g = 0x6e, .b = 0x75 } },       // base01
-    .selection = .{ .rgb = .{ .r = 0xee, .g = 0xe8, .b = 0xd5 } },    // base2
-    .trailing_ws = .{ .rgb = .{ .r = 0xf0, .g = 0xe0, .b = 0xd0 } },  // warm tint on cream
+    .cursor_line_bg = .{ .rgb = .{ .r = 0xee, .g = 0xe8, .b = 0xd5 } }, // base2
+    .status_bg = .{ .rgb = .{ .r = 0xfd, .g = 0xf6, .b = 0xe3 } }, // base3 (same as bg)
+    .status_fg = .{ .rgb = .{ .r = 0x93, .g = 0xa1, .b = 0xa1 } }, // base1
+    .cursor = .{ .rgb = .{ .r = 0x58, .g = 0x6e, .b = 0x75 } }, // base01
+    .selection = .{ .rgb = .{ .r = 0xee, .g = 0xe8, .b = 0xd5 } }, // base2
+    .trailing_ws = .{ .rgb = .{ .r = 0xf0, .g = 0xe0, .b = 0xd0 } }, // warm tint on cream
     .wrap_indicator = .{ .rgb = .{ .r = 0xee, .g = 0xe8, .b = 0xd5 } }, // base2
     .indent_mismatch = .{ .rgb = .{ .r = 0xf0, .g = 0xe0, .b = 0xd0 } },
 };
@@ -110,8 +110,8 @@ pub const Config = struct {
     theme_name_len: usize = 7,
 
     // Auto-update
-    notify_updates: bool = true,   // show status-bar notice when a newer build exists
-    autoupdate: bool = false,      // opt-in: download and apply updates in-session (Phase 2+)
+    notify_updates: bool = true, // show status-bar notice when a newer build exists
+    autoupdate: bool = false, // opt-in: download and apply updates in-session (Phase 2+)
 
     // Font / print
     font_file: [512]u8 = std.mem.zeroes([512]u8),
@@ -145,11 +145,10 @@ fn initThemeName(comptime name: []const u8) [64]u8 {
 /// Load configuration from a file. If `path` is null, returns the
 /// default Config unchanged; callers that want ~/.issyrc should
 /// resolve it themselves with `resolveDefaultPath` and pass it in.
-pub fn load(allocator: std.mem.Allocator, path: ?[]const u8) Config {
+pub fn load(path: ?[]const u8) Config {
     var cfg = Config.init();
 
     const actual_path = path orelse return cfg;
-    _ = allocator;
 
     const file = std.fs.cwd().openFile(actual_path, .{}) catch return cfg;
     defer file.close();
@@ -205,9 +204,19 @@ pub fn load(allocator: std.mem.Allocator, path: ?[]const u8) Config {
     return cfg;
 }
 
+// Validation bounds. Out-of-range values are ignored (the key keeps its
+// previous value) rather than clamped, matching the "malformed lines are
+// ignored" contract of the rest of the parser.
+const max_tab_width = 8; // insertTab expands into a fixed 8-byte buffer
+const max_padding = 32;
+const max_scroll_margin = 100;
+const min_font_size = 4.0;
+const max_font_size = 144.0;
+
 fn parseConfigKey(cfg: *Config, key: []const u8, val: []const u8) void {
     if (std.mem.eql(u8, key, "tab_width")) {
-        cfg.tab_width = std.fmt.parseInt(u8, val, 10) catch return;
+        const v = std.fmt.parseInt(u8, val, 10) catch return;
+        if (v >= 1 and v <= max_tab_width) cfg.tab_width = v;
     } else if (std.mem.eql(u8, key, "expand_tabs")) {
         cfg.expand_tabs = parseBool(val);
     } else if (std.mem.eql(u8, key, "line_numbers")) {
@@ -225,19 +234,20 @@ fn parseConfigKey(cfg: *Config, key: []const u8, val: []const u8) void {
     } else if (std.mem.eql(u8, key, "indent_mismatch")) {
         cfg.indent_mismatch = parseBool(val);
     } else if (std.mem.eql(u8, key, "scroll_margin")) {
-        cfg.scroll_margin = std.fmt.parseInt(u8, val, 10) catch return;
+        const v = std.fmt.parseInt(u8, val, 10) catch return;
+        if (v <= max_scroll_margin) cfg.scroll_margin = v;
     } else if (std.mem.eql(u8, key, "gutter_padding")) {
-        cfg.gutter_padding = std.fmt.parseInt(u8, val, 10) catch return;
+        const v = std.fmt.parseInt(u8, val, 10) catch return;
+        if (v <= max_padding) cfg.gutter_padding = v;
     } else if (std.mem.eql(u8, key, "left_padding")) {
-        cfg.left_padding = std.fmt.parseInt(u8, val, 10) catch return;
+        const v = std.fmt.parseInt(u8, val, 10) catch return;
+        if (v <= max_padding) cfg.left_padding = v;
     } else if (std.mem.eql(u8, key, "right_margin")) {
         cfg.right_margin = std.fmt.parseInt(u16, val, 10) catch return;
     } else if (std.mem.eql(u8, key, "cursor_line_bg")) {
         cfg.cursor_line_bg = parseBool(val);
     } else if (std.mem.eql(u8, key, "cursor_style")) {
-        if (std.mem.eql(u8, val, "bar")) cfg.cursor_style = .bar
-        else if (std.mem.eql(u8, val, "block")) cfg.cursor_style = .block
-        else if (std.mem.eql(u8, val, "underline")) cfg.cursor_style = .underline;
+        if (std.mem.eql(u8, val, "bar")) cfg.cursor_style = .bar else if (std.mem.eql(u8, val, "block")) cfg.cursor_style = .block else if (std.mem.eql(u8, val, "underline")) cfg.cursor_style = .underline;
     } else if (std.mem.eql(u8, key, "notify_updates")) {
         cfg.notify_updates = parseBool(val);
     } else if (std.mem.eql(u8, key, "autoupdate")) {
@@ -248,18 +258,19 @@ fn parseConfigKey(cfg: *Config, key: []const u8, val: []const u8) void {
             cfg.font_file_len = val.len;
         }
     } else if (std.mem.eql(u8, key, "font_size")) {
-        cfg.font_size = std.fmt.parseFloat(f32, val) catch return;
+        const v = std.fmt.parseFloat(f32, val) catch return;
+        if (std.math.isFinite(v) and v >= min_font_size and v <= max_font_size) cfg.font_size = v;
     } else if (std.mem.eql(u8, key, "print_margin_top")) {
-        cfg.print_margin_top = std.fmt.parseFloat(f32, val) catch return;
+        if (parseMargin(val)) |v| cfg.print_margin_top = v;
     } else if (std.mem.eql(u8, key, "print_margin_bottom")) {
-        cfg.print_margin_bottom = std.fmt.parseFloat(f32, val) catch return;
+        if (parseMargin(val)) |v| cfg.print_margin_bottom = v;
     } else if (std.mem.eql(u8, key, "print_margin_left")) {
-        cfg.print_margin_left = std.fmt.parseFloat(f32, val) catch return;
+        if (parseMargin(val)) |v| cfg.print_margin_left = v;
     } else if (std.mem.eql(u8, key, "print_margin_right")) {
-        cfg.print_margin_right = std.fmt.parseFloat(f32, val) catch return;
+        if (parseMargin(val)) |v| cfg.print_margin_right = v;
     }
     // Theme color keys
-    else if (std.mem.startsWith(u8, key, "bg")) {
+    else if (std.mem.eql(u8, key, "bg")) {
         if (parseHexColor(val)) |c| cfg.theme.bg = c;
     } else if (std.mem.eql(u8, key, "fg")) {
         if (parseHexColor(val)) |c| cfg.theme.fg = c;
@@ -292,6 +303,14 @@ fn parseConfigKey(cfg: *Config, key: []const u8, val: []const u8) void {
     } else if (std.mem.eql(u8, key, "indent_mismatch_color")) {
         if (parseHexColor(val)) |c| cfg.theme.indent_mismatch = c;
     }
+}
+
+/// Print margins must be finite and non-negative; toPdf additionally
+/// verifies the four margins leave usable space on the page.
+fn parseMargin(val: []const u8) ?f32 {
+    const v = std.fmt.parseFloat(f32, val) catch return null;
+    if (!std.math.isFinite(v) or v < 0) return null;
+    return v;
 }
 
 fn parseBool(val: []const u8) bool {
@@ -381,14 +400,59 @@ test "statMtime returns null for missing file" {
 }
 
 test "load with null path returns defaults" {
-    const cfg = load(std.testing.allocator, null);
+    const cfg = load(null);
     try std.testing.expectEqual(@as(u8, 4), cfg.tab_width);
     try std.testing.expectEqualSlices(u8, "default", cfg.getThemeName());
 }
 
 test "load with missing path returns defaults" {
-    const cfg = load(std.testing.allocator, "/nonexistent/issyrc");
+    const cfg = load("/nonexistent/issyrc");
     try std.testing.expectEqual(@as(u8, 4), cfg.tab_width);
+}
+
+test "out-of-range numeric values are ignored" {
+    var cfg = Config.init();
+
+    // tab_width outside 1..8 keeps the default (a 16-wide tab used to
+    // overflow insertTab's fixed 8-byte expansion buffer and crash).
+    parseConfigKey(&cfg, "tab_width", "16");
+    try std.testing.expectEqual(@as(u8, 4), cfg.tab_width);
+    parseConfigKey(&cfg, "tab_width", "0");
+    try std.testing.expectEqual(@as(u8, 4), cfg.tab_width);
+    parseConfigKey(&cfg, "tab_width", "8");
+    try std.testing.expectEqual(@as(u8, 8), cfg.tab_width);
+
+    // font_size outside 4..144 (or non-finite) keeps the default.
+    parseConfigKey(&cfg, "font_size", "0");
+    try std.testing.expectEqual(@as(f32, 10.0), cfg.font_size);
+    parseConfigKey(&cfg, "font_size", "nan");
+    try std.testing.expectEqual(@as(f32, 10.0), cfg.font_size);
+    parseConfigKey(&cfg, "font_size", "12");
+    try std.testing.expectEqual(@as(f32, 12.0), cfg.font_size);
+
+    // Negative print margins are rejected.
+    parseConfigKey(&cfg, "print_margin_top", "-5");
+    try std.testing.expectEqual(@as(f32, 72.0), cfg.print_margin_top);
+
+    // Padding caps.
+    parseConfigKey(&cfg, "left_padding", "200");
+    try std.testing.expectEqual(@as(u8, 2), cfg.left_padding);
+}
+
+test "bg key requires exact match" {
+    var cfg = Config.init();
+    // A key that merely starts with "bg" must not set the background.
+    parseConfigKey(&cfg, "bgus_key", "#ff0000");
+    const c = cfg.theme.bg;
+    switch (c) {
+        .rgb => |rgb| try std.testing.expectEqual(@as(u8, 0x00), rgb.r),
+        else => return error.TestUnexpectedResult,
+    }
+    parseConfigKey(&cfg, "bg", "#ff0000");
+    switch (cfg.theme.bg) {
+        .rgb => |rgb| try std.testing.expectEqual(@as(u8, 0xff), rgb.r),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "paper theme has light bg" {

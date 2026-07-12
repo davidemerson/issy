@@ -3,12 +3,25 @@
 //! The core data structure for text editing. Uses a gap buffer for efficient
 //! insert and delete operations near the cursor. Supports loading and saving
 //! files, line-based access, and full content extraction.
+//!
+//! Line access is O(1) via a lazily-rebuilt line index: an array of byte
+//! offsets, one per line start. Any edit invalidates the index; the next
+//! line query rebuilds it with a single memchr-style scan over the two gap
+//! segments. This keeps per-frame rendering O(visible rows) instead of
+//! O(visible rows × file size).
+//!
+//! Files whose lines all end in CRLF are normalized to LF in memory on
+//! load and written back with CRLF on save, so Windows-authored files
+//! round-trip without the editor showing stray carriage returns. Files
+//! with mixed endings are left byte-for-byte untouched.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const initial_capacity = 4096;
 const min_gap = 64;
+
+pub const LineEnding = enum { lf, crlf };
 
 /// A gap buffer for efficient text editing operations.
 pub const Buffer = struct {
@@ -17,7 +30,17 @@ pub const Buffer = struct {
     gap_end: usize,
     allocator: Allocator,
     dirty: bool,
-    line_count_cache: ?usize,
+    /// Detected on load; save() re-applies it. Pure-CRLF files are
+    /// normalized to LF in memory.
+    line_ending: LineEnding,
+    /// Byte offset of the start of each line. items[0] is always 0.
+    /// Rebuilt lazily after any edit.
+    line_index: std.ArrayList(usize),
+    line_index_valid: bool,
+    /// Smallest byte position touched by an edit since the last call to
+    /// takeDirtyMinPos(). Consumed by the renderer to invalidate its
+    /// per-line syntax-state cache.
+    dirty_min_pos: ?usize,
 
     /// Create a new empty buffer with initial capacity 4096.
     pub fn init(allocator: Allocator) !Buffer {
@@ -28,16 +51,22 @@ pub const Buffer = struct {
             .gap_end = initial_capacity,
             .allocator = allocator,
             .dirty = false,
-            .line_count_cache = 1,
+            .line_ending = .lf,
+            .line_index = .{},
+            .line_index_valid = false,
+            .dirty_min_pos = null,
         };
     }
 
     /// Free all resources owned by this buffer.
     pub fn deinit(self: *Buffer) void {
         self.allocator.free(self.data);
+        self.line_index.deinit(self.allocator);
     }
 
     /// Load file contents into the buffer, replacing any existing content.
+    /// Allocates the replacement backing array before freeing the old one,
+    /// so an allocation failure leaves the buffer untouched.
     pub fn load(self: *Buffer, path: []const u8) !void {
         const file = try std.fs.cwd().openFile(path, .{});
         defer file.close();
@@ -46,47 +75,98 @@ pub const Buffer = struct {
         const file_size: usize = @intCast(stat.size);
 
         const capacity = @max(file_size + min_gap, initial_capacity);
-        self.allocator.free(self.data);
-        self.data = try self.allocator.alloc(u8, capacity);
+        const new_data = try self.allocator.alloc(u8, capacity);
+        errdefer self.allocator.free(new_data);
 
-        const bytes_read = try file.readAll(self.data[0..file_size]);
-        self.gap_start = bytes_read;
+        const bytes_read = try file.readAll(new_data[0..file_size]);
+
+        self.allocator.free(self.data);
+        self.data = new_data;
+
+        var content_len = bytes_read;
+        self.line_ending = .lf;
+        if (isPureCrlf(new_data[0..content_len])) {
+            content_len = stripCrBeforeLf(new_data[0..content_len]);
+            self.line_ending = .crlf;
+        }
+
+        self.gap_start = content_len;
         self.gap_end = capacity;
         self.dirty = false;
-        self.line_count_cache = null;
+        self.invalidateFrom(0);
     }
 
     /// Save buffer contents to a file atomically (write .tmp then rename).
+    /// Follows symlinks so saving through a link rewrites the target file
+    /// instead of replacing the link itself, preserves the original file's
+    /// permission bits, and fsyncs before the rename so a crash can't
+    /// leave a truncated file behind. CRLF line endings detected at load
+    /// time are re-applied on the way out.
     pub fn save(self: *Buffer, path: []const u8) !void {
-        // Build tmp path: path ++ ".tmp"
-        var tmp_buf: [4096]u8 = undefined;
-        if (path.len + 4 > tmp_buf.len) return error.PathTooLong;
-        @memcpy(tmp_buf[0..path.len], path);
-        @memcpy(tmp_buf[path.len..][0..4], ".tmp");
-        const tmp_path = tmp_buf[0 .. path.len + 4];
+        var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const target = resolveSymlinks(path, &link_buf);
 
-        // Determine the directory for the file.
+        // Build tmp path: target ++ ".tmp"
+        var tmp_buf: [std.fs.max_path_bytes + 4]u8 = undefined;
+        if (target.len + 4 > tmp_buf.len) return error.PathTooLong;
+        @memcpy(tmp_buf[0..target.len], target);
+        @memcpy(tmp_buf[target.len..][0..4], ".tmp");
+        const tmp_path = tmp_buf[0 .. target.len + 4];
+
         const dir = std.fs.cwd();
 
+        // Capture the original permission bits (if the file exists) so the
+        // rename doesn't silently reset them to the umask default.
+        const orig_mode: ?std.fs.File.Mode = blk: {
+            const st = dir.statFile(target) catch break :blk null;
+            break :blk st.mode;
+        };
+
         const tmp_file = try dir.createFile(tmp_path, .{});
+        var tmp_open = true;
         errdefer {
-            tmp_file.close();
+            if (tmp_open) tmp_file.close();
             dir.deleteFile(tmp_path) catch {};
         }
 
-        // Write content before gap.
-        if (self.gap_start > 0) {
-            try tmp_file.writeAll(self.data[0..self.gap_start]);
+        if (orig_mode) |m| {
+            std.posix.fchmod(tmp_file.handle, @intCast(m & 0o7777)) catch {};
         }
-        // Write content after gap.
-        if (self.gap_end < self.data.len) {
-            try tmp_file.writeAll(self.data[self.gap_end..]);
-        }
+
+        try self.writeContents(tmp_file);
+        // Flush file data to disk before the rename; on some filesystems a
+        // crash between rename and writeback would otherwise leave a
+        // zero-length file where the original used to be.
+        tmp_file.sync() catch {};
         tmp_file.close();
+        tmp_open = false;
 
         // Atomic rename.
-        try dir.rename(tmp_path, path);
+        try dir.rename(tmp_path, target);
         self.dirty = false;
+    }
+
+    fn writeContents(self: *const Buffer, file: std.fs.File) !void {
+        if (self.line_ending == .lf) {
+            if (self.gap_start > 0) try file.writeAll(self.data[0..self.gap_start]);
+            if (self.gap_end < self.data.len) try file.writeAll(self.data[self.gap_end..]);
+            return;
+        }
+        try writeSegmentCrlf(file, self.data[0..self.gap_start]);
+        try writeSegmentCrlf(file, self.data[self.gap_end..]);
+    }
+
+    fn writeSegmentCrlf(file: std.fs.File, seg: []const u8) !void {
+        var i: usize = 0;
+        while (i < seg.len) {
+            const nl = std.mem.indexOfScalarPos(u8, seg, i, '\n') orelse {
+                try file.writeAll(seg[i..]);
+                return;
+            };
+            if (nl > i) try file.writeAll(seg[i..nl]);
+            try file.writeAll("\r\n");
+            i = nl + 1;
+        }
     }
 
     /// Insert text at the given byte position.
@@ -99,7 +179,7 @@ pub const Buffer = struct {
         @memcpy(self.data[self.gap_start..][0..text.len], text);
         self.gap_start += text.len;
         self.dirty = true;
-        self.line_count_cache = null;
+        self.invalidateFrom(pos);
     }
 
     /// Delete `len` bytes starting at `pos`.
@@ -113,7 +193,7 @@ pub const Buffer = struct {
             self.gap_end = self.data.len;
         }
         self.dirty = true;
-        self.line_count_cache = null;
+        self.invalidateFrom(pos);
     }
 
     /// Return the byte at the given logical position.
@@ -126,56 +206,92 @@ pub const Buffer = struct {
         return self.data.len - (self.gap_end - self.gap_start);
     }
 
-    /// Count newlines + 1. Caches the result; cache is invalidated on edit.
+    /// Number of lines (newline count + 1). O(1) via the line index.
     pub fn lineCount(self: *Buffer) usize {
-        if (self.line_count_cache) |cached| return cached;
-
-        var count: usize = 1;
-        const len = self.logicalLen();
-        for (0..len) |i| {
-            if (self.byteAt(i) == '\n') count += 1;
-        }
-        self.line_count_cache = count;
-        return count;
+        self.ensureLineIndex();
+        return self.line_index.items.len;
     }
 
-    /// Return byte offset and length of the nth line (0-indexed).
+    /// Return byte offset and length of the nth line (0-indexed),
+    /// excluding the trailing newline. O(1) via the line index.
     pub fn getLine(self: *Buffer, n: usize) ?struct { start: usize, len: usize } {
-        const total = self.logicalLen();
-        var line: usize = 0;
-        var line_start: usize = 0;
+        self.ensureLineIndex();
+        const items = self.line_index.items;
+        if (n >= items.len) return null;
+        const start = items[n];
+        const end = if (n + 1 < items.len) items[n + 1] - 1 else self.logicalLen();
+        return .{ .start = start, .len = end - start };
+    }
 
-        if (n == 0) {
-            // Find end of first line.
-            for (0..total) |i| {
-                if (self.byteAt(i) == '\n') {
-                    return .{ .start = 0, .len = i };
-                }
-            }
-            return .{ .start = 0, .len = total };
+    /// Return the 0-indexed line containing byte position `pos`.
+    /// Positions at or past the end map to the last line. O(log lines).
+    pub fn lineOfPos(self: *Buffer, pos: usize) usize {
+        self.ensureLineIndex();
+        const items = self.line_index.items;
+        // Binary search: first index with items[i] > pos, minus one.
+        var lo: usize = 0;
+        var hi: usize = items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (items[mid] <= pos) lo = mid + 1 else hi = mid;
+        }
+        return if (lo == 0) 0 else lo - 1;
+    }
+
+    /// Return and clear the smallest byte position edited since the last
+    /// call. Used by the renderer's syntax-state cache.
+    pub fn takeDirtyMinPos(self: *Buffer) ?usize {
+        const p = self.dirty_min_pos;
+        self.dirty_min_pos = null;
+        return p;
+    }
+
+    /// Find the first occurrence of `pattern` at or after logical position
+    /// `from`. Searches the two gap segments directly (no per-byte calls)
+    /// plus a small stitched window across the gap boundary. Patterns
+    /// longer than 256 bytes are only matched when they don't straddle
+    /// the gap. With `ignore_case`, matching is ASCII case-insensitive.
+    pub fn find(self: *const Buffer, pattern: []const u8, from: usize, ignore_case: bool) ?usize {
+        const m = pattern.len;
+        if (m == 0) return null;
+        const total = self.logicalLen();
+        if (from + m > total) return null;
+
+        const pre = self.data[0..self.gap_start];
+        const post = self.data[self.gap_end..];
+
+        // 1. Fully inside the pre-gap segment.
+        if (from < pre.len) {
+            if (indexOfPos(pre, from, pattern, ignore_case)) |idx| return idx;
         }
 
-        for (0..total) |i| {
-            if (self.byteAt(i) == '\n') {
-                line += 1;
-                if (line == n) {
-                    line_start = i + 1;
-                    // Find end of this line.
-                    var j = line_start;
-                    while (j < total) : (j += 1) {
-                        if (self.byteAt(j) == '\n') {
-                            return .{ .start = line_start, .len = j - line_start };
-                        }
-                    }
-                    return .{ .start = line_start, .len = total - line_start };
+        // 2. Straddling the gap boundary.
+        if (m > 1 and m <= 256 and pre.len > 0 and post.len > 0) {
+            const k = @min(m - 1, pre.len);
+            const tail = @min(m - 1, post.len);
+            var stitched: [510]u8 = undefined;
+            @memcpy(stitched[0..k], pre[pre.len - k ..]);
+            @memcpy(stitched[k..][0..tail], post[0..tail]);
+            const win_start = pre.len - k; // logical offset of stitched[0]
+            const search_from = if (from > win_start) from - win_start else 0;
+            if (search_from < k) {
+                if (indexOfPos(stitched[0 .. k + tail], search_from, pattern, ignore_case)) |idx| {
+                    if (idx < k) return win_start + idx;
                 }
             }
+        }
+
+        // 3. Fully inside the post-gap segment.
+        const post_from = if (from > pre.len) from - pre.len else 0;
+        if (indexOfPos(post, post_from, pattern, ignore_case)) |idx| {
+            return pre.len + idx;
         }
         return null;
     }
 
     /// If the range does not cross the gap, return a direct slice (zero-copy).
-    /// If it crosses the gap, copy into tmp and return that.
+    /// If it crosses the gap, copy into tmp and return that. When the range
+    /// crosses the gap, `tmp` must be at least `len` bytes.
     pub fn contiguousSlice(self: *const Buffer, start: usize, len: usize, tmp: []u8) []const u8 {
         if (len == 0) return self.data[0..0];
 
@@ -183,6 +299,7 @@ pub const Buffer = struct {
         // The range crosses the gap if it straddles gap_start.
         if (start < self.gap_start and end > self.gap_start) {
             // Crosses gap — copy into tmp.
+            std.debug.assert(len <= tmp.len);
             const pre = self.gap_start - start;
             @memcpy(tmp[0..pre], self.data[start..self.gap_start]);
             const post = end - self.gap_start;
@@ -214,6 +331,35 @@ pub const Buffer = struct {
     }
 
     // --- Private helpers ---
+
+    fn invalidateFrom(self: *Buffer, pos: usize) void {
+        self.line_index_valid = false;
+        self.dirty_min_pos = if (self.dirty_min_pos) |p| @min(p, pos) else pos;
+    }
+
+    fn ensureLineIndex(self: *Buffer) void {
+        if (self.line_index_valid) return;
+        self.line_index.clearRetainingCapacity();
+        // On allocation failure we bail with whatever fit; the flag stays
+        // false so the next call retries.
+        self.line_index.append(self.allocator, 0) catch return;
+
+        const pre = self.data[0..self.gap_start];
+        var i: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, pre, i, '\n')) |nl| {
+            self.line_index.append(self.allocator, nl + 1) catch return;
+            i = nl + 1;
+        }
+
+        const post = self.data[self.gap_end..];
+        i = 0;
+        while (std.mem.indexOfScalarPos(u8, post, i, '\n')) |nl| {
+            // Physical gap_end + nl → logical gap_start + nl.
+            self.line_index.append(self.allocator, self.gap_start + nl + 1) catch return;
+            i = nl + 1;
+        }
+        self.line_index_valid = true;
+    }
 
     fn logicalToPhysical(self: *const Buffer, pos: usize) usize {
         if (pos < self.gap_start) return pos;
@@ -268,6 +414,74 @@ pub const Buffer = struct {
         self.gap_end = new_capacity - post_gap;
     }
 };
+
+fn indexOfPos(haystack: []const u8, start: usize, needle: []const u8, ignore_case: bool) ?usize {
+    if (start >= haystack.len) return null;
+    if (ignore_case) {
+        const idx = std.ascii.indexOfIgnoreCase(haystack[start..], needle) orelse return null;
+        return start + idx;
+    }
+    return std.mem.indexOfPos(u8, haystack, start, needle);
+}
+
+/// True if the content contains at least one newline and every newline is
+/// preceded by a carriage return (i.e., the file is uniformly CRLF).
+fn isPureCrlf(content: []const u8) bool {
+    var found = false;
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, content, i, '\n')) |nl| {
+        if (nl == 0 or content[nl - 1] != '\r') return false;
+        found = true;
+        i = nl + 1;
+    }
+    return found;
+}
+
+/// Remove every '\r' that directly precedes a '\n', in place.
+/// Returns the new length.
+fn stripCrBeforeLf(buf: []u8) usize {
+    var w: usize = 0;
+    var r: usize = 0;
+    while (r < buf.len) : (r += 1) {
+        if (buf[r] == '\r' and r + 1 < buf.len and buf[r + 1] == '\n') continue;
+        buf[w] = buf[r];
+        w += 1;
+    }
+    return w;
+}
+
+/// Follow up to 8 symlink hops and return the final target path (copied
+/// into `out`). Relative link targets resolve against the link's own
+/// directory. On any error (not a link, too many hops, path too long)
+/// returns the deepest path resolved so far. Uses readlink(2) directly
+/// instead of realpath, which is not portable to OpenBSD without libc.
+fn resolveSymlinks(path: []const u8, out: *[std.fs.max_path_bytes]u8) []const u8 {
+    var bufs: [2][std.fs.max_path_bytes]u8 = undefined;
+    var scratch: [std.fs.max_path_bytes]u8 = undefined;
+    var cur: []const u8 = path;
+    var flip: u1 = 0;
+    var hops: u8 = 0;
+    while (hops < 8) : (hops += 1) {
+        const target = std.fs.cwd().readLink(cur, &scratch) catch break;
+        if (target.len == 0) break;
+        const dst = &bufs[flip];
+        var n: usize = 0;
+        if (target[0] != '/') {
+            if (std.mem.lastIndexOfScalar(u8, cur, '/')) |de| {
+                if (de + 1 > dst.len) break;
+                @memcpy(dst[0 .. de + 1], cur[0 .. de + 1]);
+                n = de + 1;
+            }
+        }
+        if (n + target.len > dst.len) break;
+        @memcpy(dst[n..][0..target.len], target);
+        cur = dst[0 .. n + target.len];
+        flip +%= 1;
+    }
+    if (cur.ptr == path.ptr) return path;
+    @memcpy(out[0..cur.len], cur);
+    return out[0..cur.len];
+}
 
 // =============================================================================
 // Tests
@@ -437,6 +651,72 @@ test "getLine with trailing newline" {
     try std.testing.expectEqual(@as(usize, 0), l1.len);
 }
 
+test "getLine stays correct while the gap moves" {
+    var buf = try Buffer.init(std.testing.allocator);
+    defer buf.deinit();
+
+    try buf.insert(0, "aaa\nbb\nccccc");
+    // Move the gap into the middle by editing there.
+    try buf.insert(4, "X");
+    buf.delete(4, 1);
+
+    const l1 = buf.getLine(1).?;
+    try std.testing.expectEqual(@as(usize, 4), l1.start);
+    try std.testing.expectEqual(@as(usize, 2), l1.len);
+    try std.testing.expectEqual(@as(usize, 3), buf.lineCount());
+}
+
+test "lineOfPos" {
+    var buf = try Buffer.init(std.testing.allocator);
+    defer buf.deinit();
+
+    try buf.insert(0, "aaa\nbb\nccccc");
+    try std.testing.expectEqual(@as(usize, 0), buf.lineOfPos(0));
+    try std.testing.expectEqual(@as(usize, 0), buf.lineOfPos(3)); // the newline itself
+    try std.testing.expectEqual(@as(usize, 1), buf.lineOfPos(4));
+    try std.testing.expectEqual(@as(usize, 2), buf.lineOfPos(7));
+    try std.testing.expectEqual(@as(usize, 2), buf.lineOfPos(999)); // past end → last line
+}
+
+test "takeDirtyMinPos tracks the smallest edited position" {
+    var buf = try Buffer.init(std.testing.allocator);
+    defer buf.deinit();
+
+    try buf.insert(0, "hello world");
+    _ = buf.takeDirtyMinPos();
+    try buf.insert(6, "X");
+    buf.delete(2, 1);
+    try std.testing.expectEqual(@as(?usize, 2), buf.takeDirtyMinPos());
+    try std.testing.expectEqual(@as(?usize, null), buf.takeDirtyMinPos());
+}
+
+test "find in pre-gap, post-gap, and across the gap" {
+    var buf = try Buffer.init(std.testing.allocator);
+    defer buf.deinit();
+
+    try buf.insert(0, "abc needle def needle ghi");
+    // Park the gap between the two needles (inside " def ").
+    try buf.insert(12, "X");
+    buf.delete(12, 1);
+
+    try std.testing.expectEqual(@as(?usize, 4), buf.find("needle", 0, false));
+    try std.testing.expectEqual(@as(?usize, 15), buf.find("needle", 5, false));
+    try std.testing.expectEqual(@as(?usize, null), buf.find("needle", 16, false));
+    try std.testing.expectEqual(@as(?usize, null), buf.find("missing", 0, false));
+
+    // Pattern straddling the gap: gap sits at 12, "def" spans 11..14.
+    try std.testing.expectEqual(@as(?usize, 11), buf.find("def", 0, false));
+}
+
+test "find case-insensitive" {
+    var buf = try Buffer.init(std.testing.allocator);
+    defer buf.deinit();
+
+    try buf.insert(0, "Hello World");
+    try std.testing.expectEqual(@as(?usize, 6), buf.find("world", 0, true));
+    try std.testing.expectEqual(@as(?usize, null), buf.find("world", 0, false));
+}
+
 test "contiguousSlice no gap crossing" {
     var buf = try Buffer.init(std.testing.allocator);
     defer buf.deinit();
@@ -520,6 +800,119 @@ test "load and save round-trip" {
     const saved = try saved_file.readToEndAlloc(std.testing.allocator, 1024 * 1024);
     defer std.testing.allocator.free(saved);
     try std.testing.expectEqualStrings("NEW: line one\nline two\nline three\n", saved);
+}
+
+test "CRLF file normalizes on load and round-trips on save" {
+    var buf = try Buffer.init(std.testing.allocator);
+    defer buf.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const file = try tmp_dir.dir.createFile("dos.txt", .{});
+    try file.writeAll("one\r\ntwo\r\nthree\r\n");
+    file.close();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = try std.posix.getcwd(&path_buf);
+    const rel = try std.fmt.bufPrint(
+        path_buf[cwd.len..],
+        "/.zig-cache/tmp/{s}/dos.txt",
+        .{&tmp_dir.sub_path},
+    );
+    const full = path_buf[0 .. cwd.len + rel.len];
+
+    try buf.load(full);
+    try std.testing.expectEqual(LineEnding.crlf, buf.line_ending);
+
+    // In memory: LF only.
+    const c = try buf.contents(std.testing.allocator);
+    defer std.testing.allocator.free(c);
+    try std.testing.expectEqualStrings("one\ntwo\nthree\n", c);
+    try std.testing.expectEqual(@as(usize, 4), buf.lineCount());
+
+    // Edit and save: CRLF comes back.
+    try buf.insert(0, "zero\n");
+    try buf.save(full);
+
+    const saved_file = try tmp_dir.dir.openFile("dos.txt", .{});
+    defer saved_file.close();
+    const saved = try saved_file.readToEndAlloc(std.testing.allocator, 1024);
+    defer std.testing.allocator.free(saved);
+    try std.testing.expectEqualStrings("zero\r\none\r\ntwo\r\nthree\r\n", saved);
+}
+
+test "mixed line endings are left untouched" {
+    try std.testing.expect(!isPureCrlf("a\r\nb\nc\r\n"));
+    try std.testing.expect(!isPureCrlf("plain\nlf\n"));
+    try std.testing.expect(isPureCrlf("a\r\nb\r\n"));
+    try std.testing.expect(!isPureCrlf("no newline at all"));
+}
+
+test "save preserves permission bits" {
+    var buf = try Buffer.init(std.testing.allocator);
+    defer buf.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const file = try tmp_dir.dir.createFile("exec.sh", .{ .mode = 0o755 });
+    try file.writeAll("#!/bin/sh\n");
+    file.close();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = try std.posix.getcwd(&path_buf);
+    const rel = try std.fmt.bufPrint(
+        path_buf[cwd.len..],
+        "/.zig-cache/tmp/{s}/exec.sh",
+        .{&tmp_dir.sub_path},
+    );
+    const full = path_buf[0 .. cwd.len + rel.len];
+
+    try buf.load(full);
+    try buf.insert(buf.logicalLen(), "echo hi\n");
+    try buf.save(full);
+
+    const st = try tmp_dir.dir.statFile("exec.sh");
+    try std.testing.expectEqual(@as(u32, 0o755), @as(u32, @intCast(st.mode & 0o7777)));
+}
+
+test "save through a symlink rewrites the target, not the link" {
+    var buf = try Buffer.init(std.testing.allocator);
+    defer buf.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const file = try tmp_dir.dir.createFile("real.txt", .{});
+    try file.writeAll("original\n");
+    file.close();
+    try tmp_dir.dir.symLink("real.txt", "link.txt", .{});
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = try std.posix.getcwd(&path_buf);
+    const rel = try std.fmt.bufPrint(
+        path_buf[cwd.len..],
+        "/.zig-cache/tmp/{s}/link.txt",
+        .{&tmp_dir.sub_path},
+    );
+    const full = path_buf[0 .. cwd.len + rel.len];
+
+    try buf.load(full);
+    try buf.insert(0, "edited ");
+    try buf.save(full);
+
+    // The link must still be a symlink…
+    var lbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const target = try tmp_dir.dir.readLink("link.txt", &lbuf);
+    try std.testing.expectEqualStrings("real.txt", target);
+
+    // …and the target must hold the new content.
+    const real = try tmp_dir.dir.openFile("real.txt", .{});
+    defer real.close();
+    const saved = try real.readToEndAlloc(std.testing.allocator, 1024);
+    defer std.testing.allocator.free(saved);
+    try std.testing.expectEqualStrings("edited original\n", saved);
 }
 
 test "insert/delete sequence" {

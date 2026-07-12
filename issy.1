@@ -1,4 +1,4 @@
-.TH ISSY 1 "April 20, 2026" "issy 1.0.0" "General Commands Manual"
+.TH ISSY 1 "July 11, 2026" "issy 1.1.0" "General Commands Manual"
 .SH NAME
 issy \- a text editor that looks like a printed page
 .SH SYNOPSIS
@@ -24,9 +24,10 @@ syntax highlighting, undo/redo, incremental search, search and replace,
 multi-cursor editing, keyboard and mouse selection, bracket matching,
 and PDF export with real TTF/OTF font embedding.
 .PP
-The visual design is deliberately restrained: only two or three token
-types get real chromatic contrast; the eye parses structure through
-gentle luminance shifts rather than a full-spectrum rainbow.
+The visual design is deliberately restrained: keywords and strings
+carry the strongest chromatic contrast, a few token types get lighter
+accents, and the rest sit at body-text luminance \(em the eye parses
+structure through gentle shifts rather than a full-spectrum rainbow.
 Two built-in themes are provided:
 .B default
 (dark) and
@@ -111,9 +112,12 @@ Multi-byte input is handled as UTF-8.
 .TP
 .B Ctrl+S
 Save the current buffer.
-If the buffer has no filename, the status bar shows an error; use
-.B Ctrl+O
-to open or name a file first.
+If the buffer has no filename yet, a save-as prompt opens, seeded with
+the current working directory; type a path (with
+.B Tab
+completion) and press
+.B Enter
+to save.
 .TP
 .B Ctrl+Q
 Quit.
@@ -251,9 +255,18 @@ Clear the selection and all extra cursors.
 .TP
 .B Ctrl+F
 Enter incremental search mode.
-Each keystroke re-runs the search and jumps the cursor to the first
-match.
+Each keystroke re-runs the search from the position where search mode
+was entered and jumps the cursor to the first match at or after it.
+Every visible match is highlighted while the prompt is open, and a
+.I current/total
+match counter is shown after the pattern.
+Search is smart-case: an all-lowercase pattern matches
+case-insensitively; any uppercase letter makes the match exact.
 Press
+.B Down
+to jump to the next match,
+.B Up
+to jump to the previous one,
 .B Enter
 to confirm the cursor position, or
 .B Escape
@@ -277,7 +290,7 @@ again to switch back), then:
 Replace the current match and advance to the next.
 .TP
 .B Ctrl+A
-Replace all occurrences and return to normal mode.
+Replace all occurrences (a single undo step) and return to normal mode.
 .TP
 .B Escape
 Cancel and return to normal mode.
@@ -324,12 +337,13 @@ or
 .BR \-\-font .
 .TP
 .B Ctrl+R
-Reload the file from disk.
-Only takes effect when
-.B issy
-has detected that the file's modification time has changed since it was
-last read.
-The file's mtime is polled once per second.
+Reload the file from disk, discarding the buffer contents and undo
+history.
+If the buffer has unsaved changes, the editor prompts for confirmation
+first.
+The file's mtime is polled once per second (even while idle); when it
+changes externally, the status bar shows
+.I File changed on disk. Ctrl+R to reload.
 .SS Multi-cursor
 .TP
 .B Ctrl+D
@@ -415,6 +429,7 @@ in the source tree for a complete annotated example.
 .TP
 .BR tab_width " (default: 4)"
 Number of columns per tab stop.
+Valid range 1\(en8; out-of-range values are ignored.
 .TP
 .BR expand_tabs " (default: true)"
 Insert spaces instead of literal tab characters.
@@ -505,6 +520,7 @@ and
 .TP
 .BR font_size " (default: 10.0)"
 Font size in points for PDF output.
+Valid range 4\(en144.
 .TP
 .BR print_margin_top " (default: 72.0)"
 Top page margin in points (72\ points = 1\ inch).
@@ -552,15 +568,22 @@ The available color keys are:
 and
 .BR indent_mismatch_color .
 .SH SYNTAX HIGHLIGHTING
-Language is detected by file extension.
+Language is detected by file extension or well-known filename
+(Makefile, Dockerfile, Gemfile, Rakefile, shell dotfiles such as
+.IR .bashrc ).
 The following languages are supported:
-C, C++, Zig, Python, JavaScript, TypeScript, Rust, Go, Shell (sh/bash),
-HTML, CSS, JSON, YAML, TOML, Makefile, Markdown, and TeX/LaTeX.
+C, C++, Zig, Python, JavaScript (including
+.IR .jsx ),
+TypeScript, Rust, Go, Ruby, Java, Shell (sh/bash/zsh/ksh),
+HTML, CSS, JSON, YAML, TOML, Makefile, Dockerfile, Markdown, and
+TeX/LaTeX.
 .PP
 Tokenization is performed line by line using a state machine with no
 allocations in the hot path.
-Multi-line constructs such as block comments are tracked across lines
-via persistent state.
+Multi-line constructs \(em block comments, Python triple-quoted
+strings, JavaScript/TypeScript template literals \(em are tracked
+across lines via persistent state, and highlight correctly even when
+their opening delimiter is scrolled above the viewport.
 .SH PDF EXPORT
 .B Ctrl+P
 exports the current buffer to a PDF\ 1.4 file alongside the source
@@ -575,8 +598,11 @@ in the configuration or
 .B \-\-font
 on the command line.
 .PP
-PDF output uses a dedicated print theme with colors tuned for ink on
-white paper; it never inherits the TUI theme.
+PDF output uses a dedicated print theme with per-token syntax colors
+tuned for ink on white paper; it never inherits the TUI theme.
+Each page carries a filename and page-number header when the top
+margin leaves room for one, and text copied out of the PDF extracts as
+real characters.
 The PDF writer is implemented entirely in Zig with no external
 dependencies \(em no intermediate PostScript, no system libraries.
 Output includes syntax highlighting, line numbers, a header with the
@@ -603,13 +629,18 @@ and
 verifies the Ed25519 signature against the public key embedded at build
 time
 .RI ( src/update_key.zig ),
-hashes the downloaded binary against the signed manifest, and stages it
-at
+checks the manifest's embedded release commit and monotonic epoch
+against the cached high-water mark (rejecting a replayed older release
+as a downgrade), hashes the downloaded binary against the signed
+manifest, and stages it at
 .IR ~/.cache/issy/issy.staged .
 .PP
 When the buffer is clean (no unsaved changes) and the editor has been
-idle for 60\ seconds, the running binary is snapshotted to
-.IR issy.prev ,
+idle for 60\ seconds, the staged binary is re-verified against the
+cached signed manifest, the running binary is snapshotted to
+.I issy.prev
+(with its checksum recorded in
+.IR issy.prev.sha256 ),
 the staged binary is atomically renamed into place, and the editor
 re-execs itself with an internal
 .B \-\-resume
@@ -650,8 +681,9 @@ to disable the entire mechanism.
 remembers where the cursor was when a file was last closed (or last
 saved) and restores that position automatically the next time the
 same file is opened.
-Positions are keyed by the file's canonical absolute path, so opening
-the same file via different relative paths still matches.
+Positions are keyed by the file's absolute path (relative paths are
+resolved against the working directory; symlinks are not followed), so
+opening the same file via different relative paths still matches.
 Explicit
 .B file:line
 overrides on the command line win over the remembered position.
@@ -686,11 +718,15 @@ Contains:
 .I sha256sums.txt
 and
 .I sha256sums.txt.sig
-(signed manifest),
+(verified signed manifest, re-checked at apply time),
+.I manifest_epoch.txt
+(anti-rollback high-water mark),
 .I issy.staged
 (verified binary ready for apply),
 .I issy.prev
-(snapshot of the binary before the last apply, used by
+and
+.I issy.prev.sha256
+(snapshot of the binary before the last apply and its checksum, used by
 .BR \-\-rollback ),
 and
 .I positions.txt

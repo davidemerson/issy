@@ -33,5 +33,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 ./zig-out/bin/issy --no-config --font "$FONT" --print "$TMP/export.pdf" "$INPUT"
 pdftoppm -png -r 150 -f 1 -l 1 "$TMP/export.pdf" "$TMP/page"
-cp "$TMP/page-01.png" "$OUT"
+# poppler pads the page number differently across versions
+# (page-01.png vs page-001.png) — glob instead of hardcoding.
+cp "$TMP"/page-*.png "$OUT"
 echo "Wrote $OUT"

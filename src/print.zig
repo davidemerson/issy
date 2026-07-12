@@ -1,8 +1,9 @@
 //! Print and PDF export.
 //!
-//! Generates PDF 1.4 output from the editor buffer with font embedding.
-//! Uses white paper with its own color mapping tuned for ink — never
-//! inherits the dark TUI theme.
+//! Generates PDF 1.4 output from the editor buffer with font embedding,
+//! per-token syntax colors from the print theme, page headers, and
+//! automatic page breaks. Uses white paper with its own color mapping
+//! tuned for ink — never inherits the dark TUI theme.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -13,6 +14,10 @@ const syntax_mod = @import("syntax.zig");
 const unicode = @import("unicode.zig");
 
 const MAX_WRAP_BREAKS = editor_mod.Editor.MAX_WRAP_BREAKS;
+
+/// Longest line (in bytes) rendered to the PDF; the tail of longer lines
+/// is dropped. Matches the TUI renderer's per-line cap.
+const max_line_bytes = 8192;
 
 const PdfWriter = struct {
     out: std.ArrayList(u8),
@@ -33,25 +38,25 @@ const PdfWriter = struct {
         self.offsets.deinit(self.allocator);
     }
 
-    fn beginObj(self: *PdfWriter) usize {
+    fn beginObj(self: *PdfWriter) !usize {
         self.obj_count += 1;
-        self.offsets.append(self.allocator, self.out.items.len) catch {};
-        self.writeFmt("{d} 0 obj\n", .{self.obj_count});
+        try self.offsets.append(self.allocator, self.out.items.len);
+        try self.writeFmt("{d} 0 obj\n", .{self.obj_count});
         return self.obj_count;
     }
 
-    fn endObj(self: *PdfWriter) void {
-        self.writeRaw("endobj\n");
+    fn endObj(self: *PdfWriter) !void {
+        try self.writeRaw("endobj\n");
     }
 
-    fn writeRaw(self: *PdfWriter, data: []const u8) void {
-        self.out.appendSlice(self.allocator, data) catch {};
+    fn writeRaw(self: *PdfWriter, data: []const u8) !void {
+        try self.out.appendSlice(self.allocator, data);
     }
 
-    fn writeFmt(self: *PdfWriter, comptime fmt: []const u8, args: anytype) void {
+    fn writeFmt(self: *PdfWriter, comptime fmt: []const u8, args: anytype) !void {
         var buf: [1024]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
-        self.writeRaw(s);
+        const s = try std.fmt.bufPrint(&buf, fmt, args);
+        try self.writeRaw(s);
     }
 };
 
@@ -65,120 +70,23 @@ pub fn toPdf(ed: *editor_mod.Editor, output_path: []const u8) !void {
     var pdf = PdfWriter.init(ed.allocator);
     defer pdf.deinit();
 
-    // Sanitize font name for PDF Name objects (no spaces allowed)
+    // Sanitize the font name for PDF Name objects: only a conservative
+    // charset survives; anything else (spaces, delimiters like '/', '(',
+    // '#') would corrupt PDF object syntax.
     var pdf_font_name: [256]u8 = undefined;
     const raw_name = fnt.familyName();
     var name_len: usize = 0;
     for (raw_name) |c| {
-        if (name_len >= 256) break;
-        pdf_font_name[name_len] = if (c == ' ') '-' else c;
+        if (name_len >= pdf_font_name.len) break;
+        const ok = (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or
+            (c >= '0' and c <= '9') or c == '.' or c == '_';
+        pdf_font_name[name_len] = if (ok) c else '-';
         name_len += 1;
     }
-    const font_name = pdf_font_name[0..name_len];
+    const font_name: []const u8 = if (name_len > 0) pdf_font_name[0..name_len] else "EmbeddedFont";
 
-    // Header
-    pdf.writeRaw("%PDF-1.4\n%\xc3\xa4\xc3\xbc\xc3\xb6\xc3\x9f\n");
-
-    // Obj 1: Catalog
-    _ = pdf.beginObj();
-    pdf.writeRaw("<< /Type /Catalog /Pages 2 0 R >>\n");
-    pdf.endObj();
-
-    // Reserve obj 2 for Pages — written at the end once we know the page list.
-    // Just increment the counter and add a placeholder offset.
-    pdf.obj_count += 1;
-    pdf.offsets.append(pdf.allocator, 0) catch {}; // will be overwritten
-
-    // Obj 3: FontDescriptor
-    _ = pdf.beginObj();
-    const scale = @as(f32, 1000.0) / @as(f32, @floatFromInt(fnt.units_per_em));
-    pdf.writeRaw("<< /Type /FontDescriptor\n");
-    pdf.writeFmt("/FontName /{s}\n", .{font_name});
-    pdf.writeRaw("/Flags 37\n");
-    pdf.writeFmt("/FontBBox [{d} {d} {d} {d}]\n", .{
-        @as(i32, @intFromFloat(@as(f32, @floatFromInt(fnt.x_min)) * scale)),
-        @as(i32, @intFromFloat(@as(f32, @floatFromInt(fnt.y_min)) * scale)),
-        @as(i32, @intFromFloat(@as(f32, @floatFromInt(fnt.x_max)) * scale)),
-        @as(i32, @intFromFloat(@as(f32, @floatFromInt(fnt.y_max)) * scale)),
-    });
-    pdf.writeRaw("/ItalicAngle 0\n");
-    pdf.writeFmt("/Ascent {d}\n", .{@as(i32, @intFromFloat(@as(f32, @floatFromInt(fnt.ascender)) * scale))});
-    pdf.writeFmt("/Descent {d}\n", .{@as(i32, @intFromFloat(@as(f32, @floatFromInt(fnt.descender)) * scale))});
-    pdf.writeFmt("/CapHeight {d}\n", .{@as(i32, @intFromFloat(@as(f32, @floatFromInt(fnt.cap_height)) * scale))});
-    pdf.writeRaw("/StemV 80\n");
-    if (fnt.is_otf) {
-        pdf.writeRaw("/FontFile3 4 0 R\n");
-    } else {
-        pdf.writeRaw("/FontFile2 4 0 R\n");
-    }
-    pdf.writeRaw(">>\n");
-    pdf.endObj();
-
-    // Obj 4: Font file stream
-    _ = pdf.beginObj();
-    pdf.writeFmt("<< /Length {d}", .{fnt.data.len});
-    if (fnt.is_otf) {
-        pdf.writeRaw(" /Subtype /OpenType");
-    }
-    pdf.writeRaw(" >>\nstream\n");
-    pdf.writeRaw(fnt.data);
-    pdf.writeRaw("\nendstream\n");
-    pdf.endObj();
-
-    // Obj 5: CIDFont
-    _ = pdf.beginObj();
-    pdf.writeRaw("<< /Type /Font\n");
-    if (fnt.is_otf) {
-        pdf.writeRaw("/Subtype /CIDFontType0\n");
-    } else {
-        pdf.writeRaw("/Subtype /CIDFontType2\n");
-    }
-    pdf.writeFmt("/BaseFont /{s}\n", .{font_name});
-    pdf.writeRaw("/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >>\n");
-    pdf.writeRaw("/FontDescriptor 3 0 R\n");
-    // Default width
-    pdf.writeFmt("/DW {d}\n", .{@as(i32, @intFromFloat(@as(f32, @floatFromInt(if (fnt.glyph_widths.len > 0) fnt.glyph_widths[0] else 500)) * scale))});
-    pdf.writeRaw(">>\n");
-    pdf.endObj();
-
-    // Obj 6: ToUnicode CMap (simplified)
-    _ = pdf.beginObj();
-    const cmap_str =
-        "/CIDInit /ProcSet findresource begin\n" ++
-        "12 dict begin\n" ++
-        "begincmap\n" ++
-        "/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> def\n" ++
-        "/CMapName /Adobe-Identity-UCS def\n" ++
-        "/CMapType 2 def\n" ++
-        "1 begincodespacerange\n" ++
-        "<0000> <FFFF>\n" ++
-        "endcodespacerange\n" ++
-        "1 beginbfrange\n" ++
-        "<0000> <FFFF> <0000>\n" ++
-        "endbfrange\n" ++
-        "endcmap\n" ++
-        "CMapName currentdict /CMap defineresource pop\n" ++
-        "end\n" ++
-        "end\n";
-    pdf.writeFmt("<< /Length {d} >>\nstream\n", .{cmap_str.len});
-    pdf.writeRaw(cmap_str);
-    pdf.writeRaw("\nendstream\n");
-    pdf.endObj();
-
-    // Obj 7: Type0 font
-    _ = pdf.beginObj();
-    pdf.writeRaw("<< /Type /Font /Subtype /Type0\n");
-    pdf.writeFmt("/BaseFont /{s}\n", .{font_name});
-    pdf.writeRaw("/Encoding /Identity-H\n");
-    pdf.writeRaw("/DescendantFonts [5 0 R]\n");
-    pdf.writeRaw("/ToUnicode 6 0 R\n");
-    pdf.writeRaw(">>\n");
-    pdf.endObj();
-
-    // Generate pages
-    var page_obj_ids: std.ArrayList(usize) = .{};
-    defer page_obj_ids.deinit(ed.allocator);
-
+    // Layout geometry + margin sanity. Margins that leave no usable
+    // content area would otherwise loop forever emitting empty pages.
     const font_size = cfg.font_size;
     const line_height = fnt.lineHeight(font_size) * 1.3;
     const page_w: f32 = 612.0;
@@ -187,6 +95,167 @@ pub fn toPdf(ed: *editor_mod.Editor, output_path: []const u8) !void {
     const margin_bottom = cfg.print_margin_bottom;
     const margin_left = cfg.print_margin_left;
     const margin_right = cfg.print_margin_right;
+    if (page_h - margin_top - margin_bottom < line_height or
+        page_w - margin_left - margin_right < font_size)
+    {
+        return error.MarginsTooLarge;
+    }
+
+    // Header
+    try pdf.writeRaw("%PDF-1.4\n%\xc3\xa4\xc3\xbc\xc3\xb6\xc3\x9f\n");
+
+    // Obj 1: Catalog
+    _ = try pdf.beginObj();
+    try pdf.writeRaw("<< /Type /Catalog /Pages 2 0 R >>\n");
+    try pdf.endObj();
+
+    // Reserve obj 2 for Pages — written at the end once we know the page list.
+    // Just increment the counter and add a placeholder offset.
+    pdf.obj_count += 1;
+    try pdf.offsets.append(pdf.allocator, 0); // will be overwritten
+
+    // Obj 3: FontDescriptor
+    _ = try pdf.beginObj();
+    const scale = @as(f32, 1000.0) / @as(f32, @floatFromInt(fnt.units_per_em));
+    try pdf.writeRaw("<< /Type /FontDescriptor\n");
+    try pdf.writeFmt("/FontName /{s}\n", .{font_name});
+    try pdf.writeRaw("/Flags 37\n");
+    try pdf.writeFmt("/FontBBox [{d} {d} {d} {d}]\n", .{
+        @as(i32, @intFromFloat(@as(f32, @floatFromInt(fnt.x_min)) * scale)),
+        @as(i32, @intFromFloat(@as(f32, @floatFromInt(fnt.y_min)) * scale)),
+        @as(i32, @intFromFloat(@as(f32, @floatFromInt(fnt.x_max)) * scale)),
+        @as(i32, @intFromFloat(@as(f32, @floatFromInt(fnt.y_max)) * scale)),
+    });
+    try pdf.writeRaw("/ItalicAngle 0\n");
+    try pdf.writeFmt("/Ascent {d}\n", .{@as(i32, @intFromFloat(@as(f32, @floatFromInt(fnt.ascender)) * scale))});
+    try pdf.writeFmt("/Descent {d}\n", .{@as(i32, @intFromFloat(@as(f32, @floatFromInt(fnt.descender)) * scale))});
+    try pdf.writeFmt("/CapHeight {d}\n", .{@as(i32, @intFromFloat(@as(f32, @floatFromInt(fnt.cap_height)) * scale))});
+    try pdf.writeRaw("/StemV 80\n");
+    if (fnt.is_otf) {
+        try pdf.writeRaw("/FontFile3 4 0 R\n");
+    } else {
+        try pdf.writeRaw("/FontFile2 4 0 R\n");
+    }
+    try pdf.writeRaw(">>\n");
+    try pdf.endObj();
+
+    // Obj 4: Font file stream
+    _ = try pdf.beginObj();
+    try pdf.writeFmt("<< /Length {d}", .{fnt.data.len});
+    if (fnt.is_otf) {
+        try pdf.writeRaw(" /Subtype /OpenType");
+    }
+    try pdf.writeRaw(" >>\nstream\n");
+    try pdf.writeRaw(fnt.data);
+    try pdf.writeRaw("\nendstream\n");
+    try pdf.endObj();
+
+    // Obj 5: CIDFont with a real /W widths array. Relying on /DW alone
+    // mis-spaced every proportional font (and /DW came from glyph 0,
+    // the .notdef width).
+    _ = try pdf.beginObj();
+    try pdf.writeRaw("<< /Type /Font\n");
+    if (fnt.is_otf) {
+        try pdf.writeRaw("/Subtype /CIDFontType0\n");
+    } else {
+        try pdf.writeRaw("/Subtype /CIDFontType2\n");
+    }
+    try pdf.writeFmt("/BaseFont /{s}\n", .{font_name});
+    try pdf.writeRaw("/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >>\n");
+    try pdf.writeRaw("/FontDescriptor 3 0 R\n");
+    try pdf.writeFmt("/DW {d}\n", .{@as(i32, @intFromFloat(fnt.charWidth(' ', 1000.0)))});
+    if (fnt.glyph_widths.len > 0) {
+        try pdf.writeRaw("/W [ ");
+        var g: usize = 0;
+        while (g < fnt.glyph_widths.len) {
+            const w = fnt.glyph_widths[g];
+            var e = g;
+            while (e + 1 < fnt.glyph_widths.len and fnt.glyph_widths[e + 1] == w) e += 1;
+            try pdf.writeFmt("{d} {d} {d} ", .{
+                g,
+                e,
+                @as(i32, @intFromFloat(@as(f32, @floatFromInt(w)) * scale)),
+            });
+            g = e + 1;
+        }
+        try pdf.writeRaw("]\n");
+    }
+    try pdf.writeRaw(">>\n");
+    try pdf.endObj();
+
+    // Obj 6: ToUnicode CMap. Built from the font's actual glyph→Unicode
+    // reverse mapping so text extraction / copy-paste from the PDF
+    // yields real characters (the old identity map produced garbage).
+    _ = try pdf.beginObj();
+    {
+        var cmap_body: std.ArrayList(u8) = .{};
+        defer cmap_body.deinit(ed.allocator);
+
+        try cmap_body.appendSlice(ed.allocator, "/CIDInit /ProcSet findresource begin\n" ++
+            "12 dict begin\n" ++
+            "begincmap\n" ++
+            "/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> def\n" ++
+            "/CMapName /Adobe-Identity-UCS def\n" ++
+            "/CMapType 2 def\n" ++
+            "1 begincodespacerange\n" ++
+            "<0000> <FFFF>\n" ++
+            "endcodespacerange\n");
+
+        if (fnt.num_glyphs > 0 and fnt.cmap.len == 65536) {
+            const rev = try ed.allocator.alloc(u21, fnt.num_glyphs);
+            defer ed.allocator.free(rev);
+            @memset(rev, 0);
+            for (fnt.cmap, 0..) |gid, cp| {
+                if (gid != 0 and gid < rev.len and rev[gid] == 0) rev[gid] = @intCast(cp);
+            }
+
+            // Gather mapped glyphs, then emit bfchar blocks of at most
+            // 100 entries (spec limit), each declaring its exact count.
+            var mapped: std.ArrayList(u16) = .{};
+            defer mapped.deinit(ed.allocator);
+            for (rev, 0..) |cp, gid| {
+                if (cp != 0) try mapped.append(ed.allocator, @intCast(gid));
+            }
+
+            var fmt_buf: [32]u8 = undefined;
+            var idx: usize = 0;
+            while (idx < mapped.items.len) {
+                const chunk = @min(@as(usize, 100), mapped.items.len - idx);
+                const hdr = try std.fmt.bufPrint(&fmt_buf, "{d} beginbfchar\n", .{chunk});
+                try cmap_body.appendSlice(ed.allocator, hdr);
+                for (mapped.items[idx .. idx + chunk]) |gid| {
+                    const s = try std.fmt.bufPrint(&fmt_buf, "<{X:0>4}> <{X:0>4}>\n", .{ gid, rev[gid] });
+                    try cmap_body.appendSlice(ed.allocator, s);
+                }
+                try cmap_body.appendSlice(ed.allocator, "endbfchar\n");
+                idx += chunk;
+            }
+        }
+
+        try cmap_body.appendSlice(ed.allocator, "endcmap\n" ++
+            "CMapName currentdict /CMap defineresource pop\n" ++
+            "end\n" ++
+            "end\n");
+
+        try pdf.writeFmt("<< /Length {d} >>\nstream\n", .{cmap_body.items.len});
+        try pdf.writeRaw(cmap_body.items);
+        try pdf.writeRaw("\nendstream\n");
+    }
+    try pdf.endObj();
+
+    // Obj 7: Type0 font
+    _ = try pdf.beginObj();
+    try pdf.writeRaw("<< /Type /Font /Subtype /Type0\n");
+    try pdf.writeFmt("/BaseFont /{s}\n", .{font_name});
+    try pdf.writeRaw("/Encoding /Identity-H\n");
+    try pdf.writeRaw("/DescendantFonts [5 0 R]\n");
+    try pdf.writeRaw("/ToUnicode 6 0 R\n");
+    try pdf.writeRaw(">>\n");
+    try pdf.endObj();
+
+    // Generate pages
+    var page_obj_ids: std.ArrayList(usize) = .{};
+    defer page_obj_ids.deinit(ed.allocator);
 
     // Content width in points and continuation indent (2 spaces, mirrors TUI).
     const space_w: f32 = @max(fnt.charWidth(' ', font_size), font_size * 0.25);
@@ -194,28 +263,70 @@ pub fn toPdf(ed: *editor_mod.Editor, output_path: []const u8) !void {
     const cont_indent_pts: f32 = space_w * 2;
     const cont_w: f32 = @max(content_w - cont_indent_pts, space_w);
     const tw = ed.effectiveTabWidth();
+    const pt = config_mod.print_theme;
+
+    // Header text: basename of the file, page number on the right.
+    const full_name = ed.getFilename();
+    const header_name = if (std.mem.lastIndexOfScalar(u8, full_name, '/')) |s|
+        full_name[s + 1 ..]
+    else
+        full_name;
+    const header_size = font_size * 0.8;
+    // Draw headers only when the top margin has room for one.
+    const draw_header = margin_top >= line_height * 1.8;
 
     var y: f32 = page_h - margin_top;
     var page_lines: std.ArrayList(u8) = .{};
     defer page_lines.deinit(ed.allocator);
 
+    // Tokenization state carried across the whole document. Tokens for
+    // the current line are cached so a line resuming on the next page
+    // isn't tokenized twice (which would advance the state twice).
+    var tok_buf: [256]syntax_mod.Token = undefined;
+    var tokens: []syntax_mod.Token = &.{};
+    var tokens_line: ?usize = null;
+    var syn_state: syntax_mod.State = .normal;
+
     const total_lines = ed.buf.lineCount();
     var line_num: usize = 0;
     var sub_start_idx: usize = 0; // resume index when a line wraps across a page
+    var page_num: usize = 1;
 
     while (line_num < total_lines) {
         // Start a new page content stream
         page_lines.clearRetainingCapacity();
         y = page_h - margin_top;
 
-        // Content
-        appendFmt(&page_lines, ed.allocator, "BT\n/F1 {d:.1} Tf\n", .{font_size});
-        appendFmt(&page_lines, ed.allocator, "{d:.1} {d:.1} Td\n", .{ margin_left, y });
+        // Header (its own BT/ET block, in the line-number gray).
+        if (draw_header) {
+            const header_y = page_h - margin_top + line_height;
+            try appendFmt(&page_lines, ed.allocator, "BT\n/F1 {d:.1} Tf\n", .{header_size});
+            try writeColor(&page_lines, ed.allocator, pt.line_number);
+            try page_lines.appendSlice(ed.allocator, " rg\n");
+            try appendFmt(&page_lines, ed.allocator, "{d:.1} {d:.1} Td\n", .{ margin_left, header_y });
+            try page_lines.appendSlice(ed.allocator, "<");
+            var hdr_visual: usize = 0;
+            try encodeGlyphs(&page_lines, ed.allocator, &fnt, header_name, tw, &hdr_visual);
+            try page_lines.appendSlice(ed.allocator, "> Tj\nET\n");
 
-        // Set color once per page (cheaper than per line).
-        const pt = config_mod.print_theme;
-        writeColor(&page_lines, ed.allocator, pt.fg);
-        page_lines.appendSlice(ed.allocator, " rg\n") catch {};
+            var pg_buf: [32]u8 = undefined;
+            const pg_str = try std.fmt.bufPrint(&pg_buf, "page {d}", .{page_num});
+            const pg_w = fnt.stringWidth(pg_str, header_size);
+            try appendFmt(&page_lines, ed.allocator, "BT\n/F1 {d:.1} Tf\n", .{header_size});
+            try appendFmt(&page_lines, ed.allocator, "{d:.1} {d:.1} Td\n", .{ page_w - margin_right - pg_w, header_y });
+            try page_lines.appendSlice(ed.allocator, "<");
+            var pg_visual: usize = 0;
+            try encodeGlyphs(&page_lines, ed.allocator, &fnt, pg_str, tw, &pg_visual);
+            try page_lines.appendSlice(ed.allocator, "> Tj\nET\n");
+        }
+
+        // Content
+        try appendFmt(&page_lines, ed.allocator, "BT\n/F1 {d:.1} Tf\n", .{font_size});
+        try appendFmt(&page_lines, ed.allocator, "{d:.1} {d:.1} Td\n", .{ margin_left, y });
+
+        try writeColor(&page_lines, ed.allocator, pt.fg);
+        try page_lines.appendSlice(ed.allocator, " rg\n");
+        var last_color: config_mod.Color = pt.fg;
 
         // Track the x origin of the current line matrix so we can compute
         // the relative dx for the next Td when indenting continuations.
@@ -227,8 +338,17 @@ pub fn toPdf(ed: *editor_mod.Editor, output_path: []const u8) !void {
                 sub_start_idx = 0;
                 continue;
             };
-            var line_tmp: [4096]u8 = undefined;
-            const line_data = ed.buf.contiguousSlice(line_info.start, @min(line_info.len, 4096), &line_tmp);
+            var line_tmp: [max_line_bytes]u8 = undefined;
+            const line_data = ed.buf.contiguousSlice(line_info.start, @min(line_info.len, max_line_bytes), &line_tmp);
+
+            // Tokenize once per buffer line, carrying multi-line state.
+            if (tokens_line != line_num) {
+                tokens = if (ed.language) |lang|
+                    syntax_mod.tokenizeLine(lang, line_data, &syn_state, &tok_buf)
+                else
+                    tok_buf[0..0];
+                tokens_line = line_num;
+            }
 
             var breaks: [MAX_WRAP_BREAKS]usize = undefined;
             const break_count = computePdfWrapBreaks(&fnt, font_size, line_data, content_w, cont_w, tw, &breaks);
@@ -240,13 +360,34 @@ pub fn toPdf(ed: *editor_mod.Editor, output_path: []const u8) !void {
 
                 const target_x: f32 = if (si == 0) margin_left else margin_left + cont_indent_pts;
                 const dx = target_x - last_origin_x;
-                appendFmt(&page_lines, ed.allocator, "{d:.2} {d:.2} Td\n", .{ dx, -line_height });
+                try appendFmt(&page_lines, ed.allocator, "{d:.2} {d:.2} Td\n", .{ dx, -line_height });
                 last_origin_x = target_x;
 
-                // Encode text as hex glyph IDs (decode UTF-8 properly; tabs expand to spaces).
-                page_lines.appendSlice(ed.allocator, "<") catch {};
-                encodeGlyphs(&page_lines, ed.allocator, &fnt, line_data[sub_start..sub_end], tw);
-                page_lines.appendSlice(ed.allocator, "> Tj\n") catch {};
+                // Visual column at the start of this sub-line, so tab
+                // stops keep their document-relative alignment.
+                var visual_col: usize = visualColAt(line_data, sub_start, tw);
+
+                // Emit color-run chunks: consecutive bytes sharing a
+                // token color become one hex string.
+                var bi: usize = sub_start;
+                while (bi < sub_end) {
+                    const color = printTokenColor(tokens, bi, &pt);
+                    var run_end = bi;
+                    while (run_end < sub_end and
+                        colorPtrEq(printTokenColor(tokens, run_end, &pt), color)) run_end += 1;
+
+                    if (!colorPtrEq(color, last_color)) {
+                        try writeColor(&page_lines, ed.allocator, color);
+                        try page_lines.appendSlice(ed.allocator, " rg\n");
+                        last_color = color;
+                    }
+                    try page_lines.appendSlice(ed.allocator, "<");
+                    try encodeGlyphs(&page_lines, ed.allocator, &fnt, line_data[bi..run_end], tw, &visual_col);
+                    try page_lines.appendSlice(ed.allocator, "> Tj\n");
+                    bi = run_end;
+                }
+                // Blank sub-lines draw nothing — the Td above already
+                // advanced the baseline.
 
                 y -= line_height;
             }
@@ -261,67 +402,68 @@ pub fn toPdf(ed: *editor_mod.Editor, output_path: []const u8) !void {
             line_num += 1;
         }
 
-        page_lines.appendSlice(ed.allocator, "ET\n") catch {};
+        try page_lines.appendSlice(ed.allocator, "ET\n");
 
         // Content stream object
-        const content_obj = pdf.beginObj();
-        pdf.writeFmt("<< /Length {d} >>\nstream\n", .{page_lines.items.len});
-        pdf.writeRaw(page_lines.items);
-        pdf.writeRaw("\nendstream\n");
-        pdf.endObj();
+        const content_obj = try pdf.beginObj();
+        try pdf.writeFmt("<< /Length {d} >>\nstream\n", .{page_lines.items.len});
+        try pdf.writeRaw(page_lines.items);
+        try pdf.writeRaw("\nendstream\n");
+        try pdf.endObj();
 
         // Page object
-        const page_obj = pdf.beginObj();
-        pdf.writeRaw("<< /Type /Page /Parent 2 0 R\n");
-        pdf.writeFmt("/MediaBox [0 0 {d:.0} {d:.0}]\n", .{ page_w, page_h });
-        pdf.writeFmt("/Contents {d} 0 R\n", .{content_obj});
-        pdf.writeRaw("/Resources << /Font << /F1 7 0 R >> >>\n");
-        pdf.writeRaw(">>\n");
-        pdf.endObj();
+        const page_obj = try pdf.beginObj();
+        try pdf.writeRaw("<< /Type /Page /Parent 2 0 R\n");
+        try pdf.writeFmt("/MediaBox [0 0 {d:.0} {d:.0}]\n", .{ page_w, page_h });
+        try pdf.writeFmt("/Contents {d} 0 R\n", .{content_obj});
+        try pdf.writeRaw("/Resources << /Font << /F1 7 0 R >> >>\n");
+        try pdf.writeRaw(">>\n");
+        try pdf.endObj();
 
-        page_obj_ids.append(ed.allocator, page_obj) catch {};
+        try page_obj_ids.append(ed.allocator, page_obj);
+        page_num += 1;
     }
 
     // If no pages were generated, create one empty page
     if (page_obj_ids.items.len == 0) {
-        const content_obj = pdf.beginObj();
-        pdf.writeRaw("<< /Length 0 >>\nstream\n\nendstream\n");
-        pdf.endObj();
+        const content_obj = try pdf.beginObj();
+        try pdf.writeRaw("<< /Length 0 >>\nstream\n\nendstream\n");
+        try pdf.endObj();
 
-        const page_obj = pdf.beginObj();
-        pdf.writeRaw("<< /Type /Page /Parent 2 0 R\n");
-        pdf.writeFmt("/MediaBox [0 0 {d:.0} {d:.0}]\n", .{ page_w, page_h });
-        pdf.writeFmt("/Contents {d} 0 R\n", .{content_obj});
-        pdf.writeRaw("/Resources << /Font << /F1 7 0 R >> >>\n");
-        pdf.writeRaw(">>\n");
-        pdf.endObj();
+        const page_obj = try pdf.beginObj();
+        try pdf.writeRaw("<< /Type /Page /Parent 2 0 R\n");
+        try pdf.writeFmt("/MediaBox [0 0 {d:.0} {d:.0}]\n", .{ page_w, page_h });
+        try pdf.writeFmt("/Contents {d} 0 R\n", .{content_obj});
+        try pdf.writeRaw("/Resources << /Font << /F1 7 0 R >> >>\n");
+        try pdf.writeRaw(">>\n");
+        try pdf.endObj();
 
-        page_obj_ids.append(ed.allocator, page_obj) catch {};
+        try page_obj_ids.append(ed.allocator, page_obj);
     }
 
     // Write Pages object (obj 2) — now that we know the page list
     pdf.offsets.items[1] = pdf.out.items.len; // obj 2 is at offsets index 1
-    pdf.writeFmt("2 0 obj\n<< /Type /Pages /Kids [", .{});
+    try pdf.writeFmt("2 0 obj\n<< /Type /Pages /Kids [", .{});
     for (page_obj_ids.items) |pid| {
-        pdf.writeFmt("{d} 0 R ", .{pid});
+        try pdf.writeFmt("{d} 0 R ", .{pid});
     }
-    pdf.writeFmt("] /Count {d} >>\nendobj\n", .{page_obj_ids.items.len});
+    try pdf.writeFmt("] /Count {d} >>\nendobj\n", .{page_obj_ids.items.len});
 
     // xref table
     const xref_offset = pdf.out.items.len;
-    pdf.writeRaw("xref\n");
-    pdf.writeFmt("0 {d}\n", .{pdf.obj_count + 1});
-    pdf.writeRaw("0000000000 65535 f \n");
+    try pdf.writeRaw("xref\n");
+    try pdf.writeFmt("0 {d}\n", .{pdf.obj_count + 1});
+    try pdf.writeRaw("0000000000 65535 f \n");
     for (pdf.offsets.items) |off| {
-        pdf.writeFmt("{d:0>10} 00000 n \n", .{off});
+        try pdf.writeFmt("{d:0>10} 00000 n \n", .{off});
     }
 
     // Trailer
-    pdf.writeRaw("trailer\n");
-    pdf.writeFmt("<< /Size {d} /Root 1 0 R >>\n", .{pdf.obj_count + 1});
-    pdf.writeRaw("startxref\n");
-    pdf.writeFmt("{d}\n", .{xref_offset});
-    pdf.writeRaw("%%EOF\n");
+    try pdf.writeRaw("trailer\n");
+    try pdf.writeFmt("<< /Size {d} /Root 1 0 R >>\n", .{pdf.obj_count + 1});
+    try pdf.writeRaw("startxref\n");
+    try pdf.writeFmt("{d}\n", .{xref_offset});
+    try pdf.writeRaw("%%EOF\n");
 
     // Write to file
     const file = try std.fs.cwd().createFile(output_path, .{});
@@ -329,27 +471,84 @@ pub fn toPdf(ed: *editor_mod.Editor, output_path: []const u8) !void {
     try file.writeAll(pdf.out.items);
 }
 
-fn writeColor(list: *std.ArrayList(u8), allocator: Allocator, color: config_mod.Color) void {
+/// Print-theme color for the token covering `byte_idx` (fg when no
+/// token covers it).
+fn printTokenColor(tokens: []const syntax_mod.Token, byte_idx: usize, pt: *const config_mod.PrintTheme) config_mod.Color {
+    for (tokens) |tok| {
+        if (byte_idx >= tok.start and byte_idx < tok.end) {
+            return switch (tok.token_type) {
+                .keyword1 => pt.keyword,
+                .keyword2 => pt.typ,
+                .comment => pt.comment,
+                .string => pt.string,
+                .number => pt.number,
+                .typ => pt.typ,
+                .function => pt.function,
+                .operator => pt.operator,
+                .preprocessor => pt.preprocessor,
+                .normal => pt.fg,
+            };
+        }
+    }
+    return pt.fg;
+}
+
+fn colorPtrEq(a: config_mod.Color, b: config_mod.Color) bool {
+    return switch (a) {
+        .default => b == .default,
+        .ansi => |va| switch (b) {
+            .ansi => |vb| va == vb,
+            else => false,
+        },
+        .rgb => |va| switch (b) {
+            .rgb => |vb| va.r == vb.r and va.g == vb.g and va.b == vb.b,
+            else => false,
+        },
+    };
+}
+
+/// Visual column of `byte_idx` within `data`, expanding tabs.
+fn visualColAt(data: []const u8, byte_idx: usize, tab_width: u8) usize {
+    var visual: usize = 0;
+    var i: usize = 0;
+    while (i < byte_idx and i < data.len) {
+        const b = data[i];
+        if (b == '\t') {
+            visual += tab_width - (visual % tab_width);
+            i += 1;
+        } else if (b < 0x80) {
+            visual += 1;
+            i += 1;
+        } else {
+            const dec = nextCodepoint(data, i);
+            visual += 1;
+            i += dec.len;
+        }
+    }
+    return visual;
+}
+
+fn writeColor(list: *std.ArrayList(u8), allocator: Allocator, color: config_mod.Color) !void {
     switch (color) {
         .rgb => |c| {
             var buf: [32]u8 = undefined;
-            const s = std.fmt.bufPrint(&buf, "{d:.3} {d:.3} {d:.3}", .{
+            const s = try std.fmt.bufPrint(&buf, "{d:.3} {d:.3} {d:.3}", .{
                 @as(f32, @floatFromInt(c.r)) / 255.0,
                 @as(f32, @floatFromInt(c.g)) / 255.0,
                 @as(f32, @floatFromInt(c.b)) / 255.0,
-            }) catch return;
-            list.appendSlice(allocator, s) catch {};
+            });
+            try list.appendSlice(allocator, s);
         },
         else => {
-            list.appendSlice(allocator, "0.180 0.180 0.180") catch {};
+            try list.appendSlice(allocator, "0.180 0.180 0.180");
         },
     }
 }
 
-fn appendFmt(list: *std.ArrayList(u8), allocator: Allocator, comptime fmt: []const u8, args: anytype) void {
+fn appendFmt(list: *std.ArrayList(u8), allocator: Allocator, comptime fmt: []const u8, args: anytype) !void {
     var buf: [512]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    list.appendSlice(allocator, s) catch {};
+    const s = try std.fmt.bufPrint(&buf, fmt, args);
+    try list.appendSlice(allocator, s);
 }
 
 fn isBreakAfter(ch: u8) bool {
@@ -375,7 +574,7 @@ fn nextCodepoint(data: []const u8, i: usize) struct { cp: u21, len: usize } {
             .len = 3,
         };
     }
-    if (i + 3 < data.len) {
+    if (b0 >= 0xF0 and i + 3 < data.len) {
         return .{
             .cp = (@as(u21, b0 & 0x07) << 18) | (@as(u21, data[i + 1] & 0x3F) << 12) | (@as(u21, data[i + 2] & 0x3F) << 6) | @as(u21, data[i + 3] & 0x3F),
             .len = 4,
@@ -474,8 +673,9 @@ fn computePdfWrapBreaks(
     return count;
 }
 
-/// Encode a byte slice as hex glyph IDs into `list`. Tabs expand to
-/// `tab_width` space glyphs so they don't render as .notdef. CR/LF
+/// Encode a byte slice as hex glyph IDs into `list`. Tabs expand to the
+/// next tab stop relative to `visual_col` (which is advanced as glyphs
+/// are emitted) so tab alignment survives color-run splitting. CR/LF
 /// terminators (if present) are skipped.
 fn encodeGlyphs(
     list: *std.ArrayList(u8),
@@ -483,7 +683,8 @@ fn encodeGlyphs(
     fnt: *const font_mod.Font,
     data: []const u8,
     tab_width: u8,
-) void {
+    visual_col: *usize,
+) !void {
     const space_gid = fnt.glyphId(' ');
     var bi: usize = 0;
     while (bi < data.len) {
@@ -493,34 +694,25 @@ fn encodeGlyphs(
             continue;
         }
         if (b0 == '\t') {
+            const advance = tab_width - @as(u8, @intCast(visual_col.* % tab_width));
             var k: u8 = 0;
-            while (k < tab_width) : (k += 1) {
+            while (k < advance) : (k += 1) {
                 var hex_buf: [4]u8 = undefined;
-                const s = std.fmt.bufPrint(&hex_buf, "{X:0>4}", .{space_gid}) catch break;
-                list.appendSlice(allocator, s) catch {};
+                const s = try std.fmt.bufPrint(&hex_buf, "{X:0>4}", .{space_gid});
+                try list.appendSlice(allocator, s);
             }
+            visual_col.* += advance;
             bi += 1;
             continue;
         }
         const dec = nextCodepoint(data, bi);
         const gid = fnt.glyphId(dec.cp);
         var hex_buf: [4]u8 = undefined;
-        if (std.fmt.bufPrint(&hex_buf, "{X:0>4}", .{gid})) |s| {
-            list.appendSlice(allocator, s) catch {};
-        } else |_| {}
+        const s = try std.fmt.bufPrint(&hex_buf, "{X:0>4}", .{gid});
+        try list.appendSlice(allocator, s);
+        visual_col.* += 1;
         bi += dec.len;
     }
-}
-
-/// Send the current editor buffer to the system default printer.
-pub fn toPrinter(ed: *editor_mod.Editor) !void {
-    // Write PDF to temp file, then spawn lpr
-    var tmp_path: [256]u8 = undefined;
-    const path = std.fmt.bufPrint(&tmp_path, "/tmp/issy_print_{d}.pdf", .{std.time.milliTimestamp()}) catch return error.PathTooLong;
-    try toPdf(ed, path);
-
-    var child = std.process.Child.init(&.{ "lpr", path }, ed.allocator);
-    _ = child.spawnAndWait() catch return error.PrintFailed;
 }
 
 // ── Tests ──
@@ -529,11 +721,40 @@ test "pdf writer basic" {
     var pdf = PdfWriter.init(std.testing.allocator);
     defer pdf.deinit();
 
-    pdf.writeRaw("%PDF-1.4\n");
-    _ = pdf.beginObj();
-    pdf.writeRaw("<< /Type /Catalog >>\n");
-    pdf.endObj();
+    try pdf.writeRaw("%PDF-1.4\n");
+    _ = try pdf.beginObj();
+    try pdf.writeRaw("<< /Type /Catalog >>\n");
+    try pdf.endObj();
 
     try std.testing.expect(pdf.out.items.len > 0);
     try std.testing.expect(std.mem.startsWith(u8, pdf.out.items, "%PDF-1.4"));
+}
+
+test "toPdf without a configured font errors cleanly" {
+    var cfg = config_mod.Config.init();
+    var ed = try editor_mod.Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+    try std.testing.expectError(error.NoFontConfigured, toPdf(&ed, "/tmp/never-written.pdf"));
+}
+
+test "encodeGlyphs expands tabs relative to the running column" {
+    var widths = [_]i16{500};
+    var cmap_data = [_]u16{0} ** 65536;
+    cmap_data[' '] = 0;
+
+    const fnt = font_mod.Font{
+        .allocator = std.testing.allocator,
+        .units_per_em = 1000,
+        .glyph_widths = &widths,
+        .cmap = &cmap_data,
+    };
+
+    var list: std.ArrayList(u8) = .{};
+    defer list.deinit(std.testing.allocator);
+
+    // Column 2, tab width 4 → tab expands to 2 spaces, not 4.
+    var visual: usize = 2;
+    try encodeGlyphs(&list, std.testing.allocator, &fnt, "\t", 4, &visual);
+    try std.testing.expectEqual(@as(usize, 4), visual);
+    try std.testing.expectEqual(@as(usize, 8), list.items.len); // two 4-hex glyphs
 }

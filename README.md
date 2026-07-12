@@ -14,7 +14,7 @@ curl -sSL https://raw.githubusercontent.com/davidemerson/issy/main/install.sh | 
 
 ## What it looks like
 
-Built in Zig with zero external dependencies. Single binary, around 470KB in `ReleaseSafe`. Gap-buffer text storage, syntax highlighting for 17 languages (including TeX/LaTeX), PDF export with real TTF/OTF font embedding, multi-cursors, undo/redo, incremental search, keyboard and mouse selection.
+Built in Zig with zero external dependencies. Single binary, around 700KB in `ReleaseSafe`. Gap-buffer text storage with an O(1) line index, syntax highlighting for 20 languages (including TeX/LaTeX), PDF export with real TTF/OTF font embedding and per-token print colors, multi-cursors, undo/redo, incremental search with smart case and live match highlighting, keyboard and mouse selection.
 
 ### Two themes — default (dark) and paper (Solarized Light)
 
@@ -22,11 +22,11 @@ Built in Zig with zero external dependencies. Single binary, around 470KB in `Re
 |---|---|
 | ![Default dark theme](assets/syntax-highlight.png) | ![Paper (Solarized Light) theme](assets/syntax-highlight-paper.png) |
 
-Both follow the same rule: only a couple of token types get real chromatic contrast so the eye parses structure through gentle luminance shifts instead of a rainbow. See [DESIGN.md](DESIGN.md) for the full visual design notes.
+Both follow the same rule: keywords and strings carry the strongest chromatic contrast, a few token types get lighter accents, and the rest sit at body-text luminance, so the eye parses structure through gentle shifts instead of a rainbow. See [DESIGN.md](DESIGN.md) for the full visual design notes.
 
 ### Print to PDF with embedded fonts
 
-`Ctrl+P` renders the current buffer to a real PDF 1.4 file with TTF/OTF font embedding, a separate ink-on-paper print theme, headers, and automatic page breaks. No external dependencies, no temporary PostScript — the PDF writer is hand-rolled in Zig.
+`Ctrl+P` renders the current buffer to a real PDF 1.4 file with TTF/OTF font embedding, per-token syntax colors from a separate ink-on-paper print theme, a filename + page-number header on every page, and automatic page breaks. Text copied out of the PDF extracts as real characters (a proper ToUnicode CMap, not an identity map). No external dependencies, no temporary PostScript — the PDF writer is hand-rolled in Zig.
 
 ![Printed PDF export of editor.zig in Berkeley Mono](assets/pdf-export.png)
 
@@ -38,7 +38,7 @@ Both follow the same rule: only a couple of token types get real chromatic contr
 
 ### Incremental search
 
-`Ctrl+F` enters search mode and each keystroke re-runs the search, jumping the cursor to the first live match. `Ctrl+G` walks to the next match; `Escape` cancels and returns the cursor to where it started.
+`Ctrl+F` enters search mode and each keystroke re-runs the search from where you started, jumping the cursor to the first match at or after that origin. Every visible match is highlighted while the prompt is open, and a dim `3/17`-style counter sits after the pattern. All-lowercase patterns match case-insensitively (smart case); any uppercase letter makes the search exact. `Down`/`Ctrl+G` walk to the next match, `Up` walks to the previous one, `Enter` confirms, and `Escape` cancels and returns the cursor to where it started.
 
 ![Incremental search demo](assets/incremental-search.gif)
 
@@ -81,7 +81,7 @@ less install.sh
 sh install.sh
 ```
 
-**How it decides what to do.** On Linux amd64/arm64 and OpenBSD amd64 the installer downloads a prebuilt binary, verifies an Ed25519 signature over `sha256sums.txt` against a public key baked into the script, then verifies the binary's SHA-256 against that manifest, and finally installs with `install -m 0755`. On macOS (and any platform without a prebuilt) it falls through to a source build: clones the repo, runs `zig build -Doptimize=ReleaseSafe`, and installs the resulting binary. Source builds require Zig 0.15.2+ on `PATH`.
+**How it decides what to do.** On Linux amd64/arm64 and OpenBSD amd64 the installer downloads a prebuilt binary, verifies an Ed25519 signature over `sha256sums.txt` against a public key baked into the script, then verifies the binary's SHA-256 against that manifest, and finally installs with `install -m 0755`. On macOS (and any platform without a prebuilt) it falls through to a source build: clones the repo, runs `zig build -Doptimize=ReleaseSafe`, and installs the resulting binary. Source builds require Zig 0.15.x on `PATH` (0.16 changed the std APIs issy depends on; `build.zig` rejects it with an actionable error).
 
 ### macOS via Homebrew
 
@@ -109,7 +109,7 @@ Building from source on OpenBSD: `pkg_add zig` then `zig build -Doptimize=Releas
 
 ### Build from source
 
-Requires [Zig 0.15.2+](https://ziglang.org/download/).
+Requires [Zig 0.15.x](https://ziglang.org/download/) (0.15.2 recommended; 0.16 is rejected at compile time).
 
 ```sh
 git clone https://github.com/davidemerson/issy
@@ -213,8 +213,11 @@ Typing, Tab, or Enter while a selection is active replaces the selection. Termin
 | Key | Action |
 |---|---|
 | Ctrl+F | Incremental search (Escape cancels, Enter confirms) |
+| Up / Down (in search) | Previous / next match |
 | Ctrl+G | Find next match |
-| Ctrl+H | Search and replace (Tab switches fields, Enter replaces next, Ctrl+A replaces all) |
+| Ctrl+H | Search and replace (Tab switches fields, Enter replaces next, Ctrl+A replaces all — one undo step) |
+
+Search is smart-case: all-lowercase patterns match case-insensitively, any uppercase letter makes the match exact. While the search prompt is open, every visible match is highlighted and a `current/total` counter is shown after the pattern. Each keystroke re-runs the search from the position where you pressed Ctrl+F.
 
 ### Files and buffers
 
@@ -223,8 +226,10 @@ Typing, Tab, or Enter while a selection is active replaces the selection. Termin
 | Ctrl+O | Open file (on unsaved changes, prompts for confirmation) |
 | Ctrl+N | New empty buffer (on unsaved changes, prompts for confirmation) |
 | Ctrl+P | Export to PDF (requires `font_file` in config or `--font`) |
-| Ctrl+R | Reload file from disk |
+| Ctrl+R | Reload file from disk (on unsaved changes, prompts for confirmation) |
 | Ctrl+W | Same as Ctrl+Q |
+
+If the open file changes on disk (a `git pull`, another editor), the status bar shows `File changed on disk. Ctrl+R to reload.` — even while issy is idle. Opening, reloading, or starting a new buffer clears the undo history, since it refers to the previous content.
 
 ### Multi-cursor
 
@@ -269,11 +274,15 @@ Quit a file and issy remembers the cursor position at `~/.cache/issy/positions.t
 
 ## Syntax highlighting
 
-C, C++, Zig, Python, JavaScript, TypeScript, Rust, Go, Shell, HTML, CSS, JSON, YAML, TOML, Makefile, Markdown, TeX/LaTeX. Language is detected by file extension.
+C, C++, Zig, Python, JavaScript, TypeScript, Rust, Go, Ruby, Java, Shell, HTML, CSS, JSON, YAML, TOML, Makefile, Dockerfile, Markdown, TeX/LaTeX. Language is detected by file extension or well-known filename (`Makefile`, `Dockerfile`, `Gemfile`, shell dotfiles like `.bashrc`). Multi-line constructs carry across lines — C block comments, Python triple-quoted strings, JS/TS template literals, and Zig `\\` line strings all highlight correctly, including when their opening delimiter is scrolled off-screen.
+
+## Line endings
+
+Files whose lines all end in CRLF are normalized to LF in memory and written back with CRLF on save, so Windows-authored files round-trip byte-for-byte without showing stray carriage returns. Files with mixed endings are left untouched.
 
 ## PDF printing
 
-`Ctrl+P` exports the current buffer to a PDF 1.4 file alongside it (same directory, `.pdf` suffix). `--print output.pdf source.c` does the same headlessly without opening the TUI. Both require a TTF or OTF font file via `font_file` in config or `--font` on the command line. PDF output uses a print theme with colors tuned for ink on white paper — it never inherits the TUI theme.
+`Ctrl+P` exports the current buffer to a PDF 1.4 file alongside it (same directory, `.pdf` suffix). `--print output.pdf source.c` does the same headlessly without opening the TUI. Both require a TTF or OTF font file via `font_file` in config or `--font` on the command line. PDF output uses a print theme with per-token syntax colors tuned for ink on white paper — it never inherits the TUI theme — and each page carries a filename + page-number header when the top margin has room for one.
 
 Recommended fonts: Berkeley Mono, Iosevka, JetBrains Mono, Commit Mono.
 
@@ -283,7 +292,7 @@ Recommended fonts: Berkeley Mono, Iosevka, JetBrains Mono, Commit Mono.
 
 Release builds check the latest GitHub release on startup via a detached background worker, so the editor itself never blocks on the network. If the release's commit SHA differs from the one the running binary was built from, the footer shows `update available: <sha>`.
 
-Opt into automatic download and in-session re-exec by setting `autoupdate = true` in `~/.issyrc`. With auto-apply on, the worker downloads the signed manifest, verifies the Ed25519 signature against `src/update_key.zig`, hashes the platform binary against the manifest, stages it at `~/.cache/issy/issy.staged`, and atomically swaps it over the running binary the next time the buffer is clean and the editor has been idle for 60 seconds — then `execve()`s the new binary with a one-shot `--resume` record that restores the cursor position. Rollback any time with `issy --rollback`.
+Opt into automatic download and in-session re-exec by setting `autoupdate = true` in `~/.issyrc`. With auto-apply on, the worker downloads the signed manifest, verifies the Ed25519 signature against `src/update_key.zig`, checks the manifest's embedded commit and monotonic epoch (so a replayed older release — authentic but stale — is rejected as a downgrade), hashes the platform binary against the manifest, and stages it at `~/.cache/issy/issy.staged`. The next time the buffer is clean and the editor has been idle for 60 seconds, the staged binary is re-verified against the cached signed manifest, atomically swapped over the running binary, and `execve()`d with a one-shot `--resume` record that restores the cursor position. Rollback any time with `issy --rollback` (the snapshot's recorded checksum is verified first).
 
 Dev builds skip the check entirely; only `ReleaseSafe` builds produced by CI participate. Root-owned installs silently fall back to notify-only (the worker refuses to overwrite root-owned binaries).
 
@@ -294,7 +303,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full flow, the cache layout, and 
 ## Architecture, testing, man page
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — tour of the source code and the major subsystems
-- `zig build test` — 789-test unit suite (gap buffer, Unicode, tokenizer, editor operations, mouse/selection, etc.)
+- `zig build test` — 227-test unit suite (gap buffer, Unicode, tokenizer, editor operations, mouse/selection, search, update verification, etc.); each source file compiles and runs as its own test unit, so imported modules' tests re-run per unit (~1,150 test executions total)
 - `bash tests/run_tests.sh` — end-to-end integration suite via `expect`, launches the real binary in a PTY
 - `man ./issy.1` — man page
 

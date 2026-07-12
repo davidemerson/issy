@@ -275,7 +275,15 @@ jobs:
           # Sha256 manifest over the prebuilt binaries. The auto-update
           # path fetches this, verifies its Ed25519 signature, and then
           # hashes the downloaded binary against it.
-          (cd dist && sha256sum issy-* > sha256sums.txt)
+          # Signed-manifest headers: the commit binds the manifest to this
+          # release; the epoch (commit timestamp) is a monotonic counter the
+          # client uses to reject replayed older releases. Both live INSIDE
+          # the signed content. src/update.zig parses them.
+          {
+            echo "# issy-commit: $(git rev-parse HEAD)"
+            echo "# issy-manifest-epoch: $(git show -s --format=%ct HEAD)"
+          } > dist/sha256sums.txt
+          (cd dist && sha256sum issy-* >> sha256sums.txt)
 
           ls -lh dist/
 
@@ -390,7 +398,15 @@ jobs:
         run: |
           chmod +x dist/issy-openbsd-amd64
           git rev-parse HEAD > dist/commit.txt
-          (cd dist && sha256sum issy-* > sha256sums.txt)
+          # Signed-manifest headers: the commit binds the manifest to this
+          # release; the epoch (commit timestamp) is a monotonic counter the
+          # client uses to reject replayed older releases. Both live INSIDE
+          # the signed content. src/update.zig parses them.
+          {
+            echo "# issy-commit: $(git rev-parse HEAD)"
+            echo "# issy-manifest-epoch: $(git show -s --format=%ct HEAD)"
+          } > dist/sha256sums.txt
+          (cd dist && sha256sum issy-* >> sha256sums.txt)
           ls -lh dist/
 
       - name: Sign sha256sums.txt

@@ -96,14 +96,23 @@ pub const Font = struct {
             const tag = data[entry..][0..4];
             const offset: usize = @intCast(readU32(data, entry + 8));
 
-            if (std.mem.eql(u8, tag, "head")) head_off = offset
-            else if (std.mem.eql(u8, tag, "hhea")) hhea_off = offset
-            else if (std.mem.eql(u8, tag, "hmtx")) hmtx_off = offset
-            else if (std.mem.eql(u8, tag, "maxp")) maxp_off = offset
-            else if (std.mem.eql(u8, tag, "OS/2")) os2_off = offset
-            else if (std.mem.eql(u8, tag, "name")) name_off = offset
-            else if (std.mem.eql(u8, tag, "cmap")) cmap_off = offset
-            else if (std.mem.eql(u8, tag, "post")) post_off = offset;
+            if (std.mem.eql(u8, tag, "head")) {
+                head_off = offset;
+            } else if (std.mem.eql(u8, tag, "hhea")) {
+                hhea_off = offset;
+            } else if (std.mem.eql(u8, tag, "hmtx")) {
+                hmtx_off = offset;
+            } else if (std.mem.eql(u8, tag, "maxp")) {
+                maxp_off = offset;
+            } else if (std.mem.eql(u8, tag, "OS/2")) {
+                os2_off = offset;
+            } else if (std.mem.eql(u8, tag, "name")) {
+                name_off = offset;
+            } else if (std.mem.eql(u8, tag, "cmap")) {
+                cmap_off = offset;
+            } else if (std.mem.eql(u8, tag, "post")) {
+                post_off = offset;
+            }
         }
 
         // head table
@@ -233,6 +242,15 @@ pub const Font = struct {
         if (off + 4 > data.len) return;
         const num_subtables = readU16(data, off + 2);
 
+        // Score the available Unicode subtables and pick the best:
+        // (3,10) format 12 → any format 12 → (3,1)/(0,*) format 4 →
+        // any format 4. Modern fonts increasingly ship format-12-only
+        // Unicode tables, which the old format-4-only parser mapped
+        // entirely to .notdef.
+        var best_off: ?usize = null;
+        var best_format: u16 = 0;
+        var best_score: u8 = 0;
+
         var i: usize = 0;
         while (i < num_subtables) : (i += 1) {
             const rec = off + 4 + i * 8;
@@ -241,15 +259,52 @@ pub const Font = struct {
             const platform_id = readU16(data, rec);
             const encoding_id = readU16(data, rec + 2);
             const subtable_off = off + @as(usize, readU32(data, rec + 4));
+            if (subtable_off + 2 > data.len) continue;
+            const format = readU16(data, subtable_off);
 
-            if (platform_id == 3 and encoding_id == 1) {
-                if (subtable_off + 6 <= data.len) {
-                    const format = readU16(data, subtable_off);
-                    if (format == 4) {
-                        self.parseCmapFormat4(data, subtable_off);
-                        return;
-                    }
-                }
+            var score: u8 = 0;
+            if (format == 12) {
+                score = if (platform_id == 3 and encoding_id == 10) 5 else if (platform_id == 0) 4 else 3;
+            } else if (format == 4) {
+                score = if (platform_id == 3 and encoding_id == 1) 2 else if (platform_id == 0) 2 else 1;
+            } else {
+                continue;
+            }
+
+            if (score > best_score) {
+                best_score = score;
+                best_off = subtable_off;
+                best_format = format;
+            }
+        }
+
+        if (best_off) |so| {
+            if (best_format == 12) {
+                self.parseCmapFormat12(data, so);
+            } else {
+                self.parseCmapFormat4(data, so);
+            }
+        }
+    }
+
+    /// Format 12: sequential map groups (u32 start/end char, u32 start
+    /// glyph). Only the BMP portion is retained — the glyph map array is
+    /// indexed by 16-bit codepoint and PDF Identity-H CIDs are 16-bit.
+    fn parseCmapFormat12(self: *Font, data: []const u8, off: usize) void {
+        if (off + 16 > data.len) return;
+        const num_groups: usize = @intCast(readU32(data, off + 12));
+        var g: usize = 0;
+        while (g < num_groups) : (g += 1) {
+            const rec = off + 16 + g * 12;
+            if (rec + 12 > data.len) break;
+            const start_char = readU32(data, rec);
+            const end_char = readU32(data, rec + 4);
+            const start_gid = readU32(data, rec + 8);
+            if (start_char > end_char) continue;
+            var c = start_char;
+            while (c <= end_char and c < 65536) : (c += 1) {
+                const gid = start_gid + (c - start_char);
+                self.cmap[@intCast(c)] = @intCast(gid & 0xFFFF);
             }
         }
     }

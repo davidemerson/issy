@@ -54,9 +54,9 @@ wait
 record_result [assert_file $f "aaa !bbb ccc" "E2_search_escape_restore"]
 
 # --- E3: Ctrl+G find next ---
-# After incremental search for "aa" in "aa bb aa cc", cursor ends at second "aa" (pos 6)
-# Ctrl+G from there should wrap to first "aa" (pos 0)
-# Then Ctrl+G again should go back to second "aa" (pos 6)
+# Incremental search re-anchors at the origin, so searching "aa" in
+# "aa bb aa cc" from the start lands on the FIRST "aa" (pos 0).
+# Ctrl+G then advances to the second "aa" (pos 6).
 set f "$tmpdir/e3.txt"
 exec echo -n "aa bb aa cc" > $f
 spawn $issy --no-config $f
@@ -65,12 +65,9 @@ send "\x06"; # Ctrl+F
 sleep 0.2
 send "aa"
 sleep 0.3
-send "\r"; # Confirm search
+send "\r"; # Confirm search — cursor at first "aa" (pos 0)
 sleep 0.5
-# Cursor is at second "aa" (pos 6) after incremental search
-send "\x07"; # Ctrl+G - wraps to first "aa" (pos 0)
-sleep 0.5
-send "\x07"; # Ctrl+G again - goes to second "aa" (pos 6)
+send "\x07"; # Ctrl+G - advances to second "aa" (pos 6)
 sleep 0.5
 send "!"; # Insert marker at second "aa"
 sleep 0.3

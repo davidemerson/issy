@@ -69,6 +69,10 @@ pub const Editor = struct {
     search_len: usize = 0,
     search_saved_line: usize = 0,
     search_saved_col: usize = 0,
+    /// Total matches for the current pattern and the 1-based index of
+    /// the match at/before the cursor. Shown in the search prompt.
+    search_match_count: usize = 0,
+    search_match_index: usize = 0,
 
     replace_buf: [256]u8 = undefined,
     replace_len: usize = 0,
@@ -116,7 +120,7 @@ pub const Editor = struct {
     detected_expand_tabs: ?bool = null,
     detected_tab_width: ?u8 = null,
 
-    confirm_action: enum { none, quit, new, open } = .none,
+    confirm_action: enum { none, quit, new, open, reload } = .none,
     command_action: enum { open, save_as, goto_line } = .open,
 
     // True between a bracketed-paste start and end marker. While set,
@@ -141,9 +145,9 @@ pub const Editor = struct {
     completion_match_lens: [16]usize = .{0} ** 16,
     completion_match_count: usize = 0,
 
-    pub fn init(config: *config_mod.Config, allocator: Allocator) Editor {
+    pub fn init(config: *config_mod.Config, allocator: Allocator) !Editor {
         return .{
-            .buf = buffer_mod.Buffer.init(allocator) catch @panic("failed to init buffer"),
+            .buf = try buffer_mod.Buffer.init(allocator),
             .config = config,
             .allocator = allocator,
             .cursors = .{},
@@ -203,6 +207,14 @@ pub const Editor = struct {
             },
             else => return e,
         };
+
+        // The undo/redo stacks hold byte offsets into the *previous*
+        // buffer — replaying them into the new content would corrupt it
+        // (or panic on out-of-range positions). Drop them, along with any
+        // selection and extra cursors.
+        self.clearUndoState();
+        self.cursors.clearRetainingCapacity();
+        self.sel_active = false;
 
         // Store filename
         if (actual_path.len <= self.filename.len) {
@@ -270,8 +282,9 @@ pub const Editor = struct {
     }
 
     /// Save the current cursor's line/col under the current filename's
-    /// realpath. Called on save, on open (for the outgoing buffer), and
-    /// on quit. No-op if the file has no resolvable path yet.
+    /// absolute (cwd-resolved; symlinks unresolved) path. Called on
+    /// save, on open (for the outgoing buffer), and on quit. No-op if
+    /// the file has no resolvable path yet.
     pub fn persistCursor(self: *const Editor) void {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const abs = self.absFilename(&path_buf) orelse return;
@@ -304,19 +317,25 @@ pub const Editor = struct {
         } else |_| {}
     }
 
-    pub fn checkFileChanged(self: *Editor) void {
-        if (self.filename_len == 0) return;
+    /// Poll the open file's mtime. On the transition to "changed on
+    /// disk", surfaces a status-bar notice and returns true so the main
+    /// loop can repaint even while idle.
+    pub fn checkFileChanged(self: *Editor) bool {
+        if (self.filename_len == 0) return false;
         const fname = self.filename[0..self.filename_len];
         if (std.fs.cwd().openFile(fname, .{})) |file| {
             defer file.close();
             if (file.stat()) |stat| {
                 if (self.file_mtime) |saved| {
-                    if (stat.mtime != saved) {
+                    if (stat.mtime != saved and !self.file_changed_on_disk) {
                         self.file_changed_on_disk = true;
+                        self.setStatusMessage("File changed on disk. Ctrl+R to reload.");
+                        return true;
                     }
                 }
             } else |_| {}
         } else |_| {}
+        return false;
     }
 
     pub fn detectIndent(self: *Editor) void {
@@ -674,16 +693,17 @@ pub const Editor = struct {
                 return .redraw;
             },
             'r' => {
-                if (self.file_changed_on_disk and self.filename_len > 0) {
-                    self.buf.load(self.filename[0..self.filename_len]) catch {
-                        self.setStatusMessage("Failed to reload.");
-                        return .redraw;
-                    };
-                    self.file_changed_on_disk = false;
-                    self.modified = false;
-                    self.updateMtime();
-                    self.setStatusMessage("Reloaded.");
+                if (self.filename_len == 0) {
+                    self.setStatusMessage("No file to reload.");
+                    return .redraw;
                 }
+                if (self.modified) {
+                    self.mode = .confirm;
+                    self.confirm_action = .reload;
+                    self.setStatusMessage("Unsaved changes. Enter or Ctrl+Q to discard and reload, Esc to cancel.");
+                    return .redraw;
+                }
+                self.doReload();
                 return .redraw;
             },
             'd' => {
@@ -711,21 +731,40 @@ pub const Editor = struct {
     fn handleSearchKey(self: *Editor, key: term.Key) Action {
         switch (key) {
             .char => |cp| {
-                if (self.search_len < 255) {
-                    var enc_buf: [4]u8 = undefined;
-                    const len = unicode.encode(cp, &enc_buf);
-                    const space = 256 - self.search_len;
-                    const copy_len = @min(len, space);
-                    @memcpy(self.search_pattern[self.search_len..][0..copy_len], enc_buf[0..copy_len]);
-                    self.search_len += copy_len;
+                var enc_buf: [4]u8 = undefined;
+                const len = unicode.encode(cp, &enc_buf);
+                // Only append when the whole codepoint fits — a partial
+                // copy would leave a truncated UTF-8 tail in the pattern.
+                if (self.search_len + len <= self.search_pattern.len) {
+                    @memcpy(self.search_pattern[self.search_len..][0..len], enc_buf[0..len]);
+                    self.search_len += len;
                 }
-                // Incremental search
-                self.findNext();
+                self.incrementalSearch();
                 return .redraw;
             },
             .backspace => {
-                if (self.search_len > 0) self.search_len -= 1;
+                // Remove the last codepoint, not the last byte, so
+                // multi-byte patterns stay valid UTF-8.
+                self.search_len = truncLastCodepoint(self.search_pattern[0..self.search_len]);
+                self.incrementalSearch();
                 return .redraw;
+            },
+            .up => {
+                self.findPrev();
+                return .redraw;
+            },
+            .down => {
+                self.findNext();
+                return .redraw;
+            },
+            .ctrl => |c| {
+                // Ctrl+G advances the match without leaving search mode,
+                // matching its normal-mode binding.
+                if (c == 'g') {
+                    self.findNext();
+                    return .redraw;
+                }
+                return .none;
             },
             .enter => {
                 self.mode = .normal;
@@ -742,6 +781,28 @@ pub const Editor = struct {
         }
     }
 
+    /// Re-run the incremental search from the position where search mode
+    /// was entered, so refining the pattern re-matches at or after the
+    /// origin instead of marching forward on every keystroke.
+    fn incrementalSearch(self: *Editor) void {
+        self.cursor.line = self.search_saved_line;
+        self.cursor.col = self.search_saved_col;
+        self.cursor.col_want = self.cursor.col;
+        if (self.search_len == 0) {
+            self.updateSearchStats();
+            self.ensureCursorVisible();
+            return;
+        }
+        const pattern = self.search_pattern[0..self.search_len];
+        const ic = self.searchIgnoreCase();
+        const origin = self.cursorBytePos();
+        const found = self.buf.find(pattern, origin, ic) orelse self.buf.find(pattern, 0, ic);
+        if (found) |pos| {
+            self.repositionCursorToBytePos(pos);
+        }
+        self.updateSearchStats();
+    }
+
     fn handleCommandKey(self: *Editor, key: term.Key) Action {
         // Filesystem tab-completion only fires for path-shaped prompts.
         // Goto-line takes digits, not paths, so it skips that whole
@@ -749,19 +810,17 @@ pub const Editor = struct {
         const is_path_prompt = self.command_action == .open or self.command_action == .save_as;
         switch (key) {
             .char => |cp| {
-                if (self.prompt_len < 255) {
-                    var enc_buf: [4]u8 = undefined;
-                    const len = unicode.encode(cp, &enc_buf);
-                    const space = 256 - self.prompt_len;
-                    const copy_len = @min(len, space);
-                    @memcpy(self.prompt_buf[self.prompt_len..][0..copy_len], enc_buf[0..copy_len]);
-                    self.prompt_len += copy_len;
+                var enc_buf: [4]u8 = undefined;
+                const len = unicode.encode(cp, &enc_buf);
+                if (self.prompt_len + len <= self.prompt_buf.len) {
+                    @memcpy(self.prompt_buf[self.prompt_len..][0..len], enc_buf[0..len]);
+                    self.prompt_len += len;
                 }
                 if (is_path_prompt) self.updateCompletions();
                 return .redraw;
             },
             .backspace => {
-                if (self.prompt_len > 0) self.prompt_len -= 1;
+                self.prompt_len = truncLastCodepoint(self.prompt_buf[0..self.prompt_len]);
                 if (is_path_prompt) self.updateCompletions();
                 return .redraw;
             },
@@ -856,7 +915,35 @@ pub const Editor = struct {
                 self.enterOpenPrompt();
                 return .redraw;
             },
+            .reload => {
+                self.mode = .normal;
+                self.status_msg_len = 0;
+                self.doReload();
+                return .redraw;
+            },
         }
+    }
+
+    /// Reload the current file from disk, discarding buffer contents and
+    /// undo history. Clamps the cursor into the reloaded dimensions.
+    fn doReload(self: *Editor) void {
+        if (self.filename_len == 0) return;
+        self.buf.load(self.filename[0..self.filename_len]) catch {
+            self.setStatusMessage("Failed to reload.");
+            return;
+        };
+        self.clearUndoState();
+        self.cursors.clearRetainingCapacity();
+        self.sel_active = false;
+        self.file_changed_on_disk = false;
+        self.modified = false;
+        self.updateMtime();
+        const max_line = if (self.buf.lineCount() > 0) self.buf.lineCount() - 1 else 0;
+        self.cursor.line = @min(self.cursor.line, max_line);
+        self.clampCursorCol();
+        self.cursor.col_want = self.cursor.col;
+        self.ensureCursorVisible();
+        self.setStatusMessage("Reloaded.");
     }
 
     fn enterOpenPrompt(self: *Editor) void {
@@ -899,10 +986,10 @@ pub const Editor = struct {
             .backspace => {
                 switch (self.replace_phase) {
                     .search => {
-                        if (self.search_len > 0) self.search_len -= 1;
+                        self.search_len = truncLastCodepoint(self.search_pattern[0..self.search_len]);
                     },
                     .replacement => {
-                        if (self.replace_len > 0) self.replace_len -= 1;
+                        self.replace_len = truncLastCodepoint(self.replace_buf[0..self.replace_len]);
                     },
                 }
                 return .redraw;
@@ -1309,6 +1396,9 @@ pub const Editor = struct {
         // Click-count tracking for double/triple-click word/line
         // selection. A click within CLICK_TIMEOUT_MS at the same
         // buffer position bumps the count; anything else resets it.
+        // Exact-cell matching is deliberate: at terminal cell
+        // granularity a one-column tolerance would misread two clicks
+        // on adjacent characters as a double-click.
         const now = std.time.milliTimestamp();
         if (now - self.last_click_ms < CLICK_TIMEOUT_MS and
             pos.line == self.last_click_line and
@@ -1980,7 +2070,10 @@ pub const Editor = struct {
             return;
         }
         if (self.effectiveExpandTabs()) {
-            const tw = self.effectiveTabWidth();
+            // tab_width is validated to 1..8 at config parse time and the
+            // detected width is always 2 or 4, but clamp anyway — an
+            // out-of-range width used to index past this 8-byte buffer.
+            const tw = @min(self.effectiveTabWidth(), 8);
             const spaces_needed = tw - @as(u8, @intCast(self.cursor.col % tw));
             var spaces: [8]u8 = .{' '} ** 8;
             self.pushUndo(pos, null, spaces_needed);
@@ -2068,14 +2161,19 @@ pub const Editor = struct {
     fn deleteSelection(self: *Editor) void {
         if (!self.sel_active) return;
         const sel = self.getSelectionRange() orelse return;
+        if (sel.len == 0) {
+            self.sel_active = false;
+            return;
+        }
 
-        // Save deleted text
-        var tmp_alloc = self.allocator.alloc(u8, sel.len) catch return;
-        var tmp_buf: [4096]u8 = undefined;
-        const data = self.buf.contiguousSlice(sel.start, sel.len, &tmp_buf);
-        @memcpy(tmp_alloc[0..sel.len], data[0..sel.len]);
+        // Save deleted text into a right-sized allocation. A fixed stack
+        // scratch here used to overflow on >4 KB selections that
+        // straddled the gap.
+        const saved = self.allocator.alloc(u8, sel.len) catch return;
+        const got = self.buf.contiguousSlice(sel.start, sel.len, saved);
+        if (got.ptr != saved.ptr) @memcpy(saved, got);
 
-        self.pushUndo(sel.start, tmp_alloc, 0);
+        self.pushUndo(sel.start, saved, 0);
         self.buf.delete(sel.start, sel.len);
 
         // Move cursor to selection start
@@ -2169,6 +2267,11 @@ pub const Editor = struct {
         self.pushUndoGrouped(pos, deleted, inserted_len, 0);
     }
 
+    /// Upper bound on retained undo entries. Beyond this the oldest
+    /// tenth is dropped (extended to a group boundary), so a marathon
+    /// session doesn't hold every edit ever made in memory.
+    const MAX_UNDO_ENTRIES: usize = 10_000;
+
     fn pushUndoGrouped(self: *Editor, pos: usize, deleted: ?[]u8, inserted_len: usize, group_id: u32) void {
         self.undo_stack.append(self.allocator, .{
             .pos = pos,
@@ -2182,6 +2285,35 @@ pub const Editor = struct {
             if (entry.deleted) |d| self.allocator.free(d);
         }
         self.redo_stack.clearRetainingCapacity();
+
+        if (self.undo_stack.items.len > MAX_UNDO_ENTRIES) {
+            var drop: usize = MAX_UNDO_ENTRIES / 10;
+            const items = self.undo_stack.items;
+            // Never split a multi-cursor group across the cut.
+            while (drop < items.len and items[drop].group_id != 0 and
+                items[drop].group_id == items[drop - 1].group_id) drop += 1;
+            for (items[0..drop]) |entry| {
+                if (entry.deleted) |d| self.allocator.free(d);
+            }
+            self.undo_stack.replaceRange(self.allocator, 0, drop, &.{}) catch {};
+        }
+    }
+
+    /// Drop all undo/redo history. Must be called whenever the buffer's
+    /// contents are wholesale replaced (open, new, reload) — stale
+    /// entries hold byte offsets into the old content and replaying them
+    /// would corrupt the new buffer or panic out of range.
+    fn clearUndoState(self: *Editor) void {
+        for (self.undo_stack.items) |entry| {
+            if (entry.deleted) |d| self.allocator.free(d);
+        }
+        self.undo_stack.clearRetainingCapacity();
+        for (self.redo_stack.items) |entry| {
+            if (entry.deleted) |d| self.allocator.free(d);
+        }
+        self.redo_stack.clearRetainingCapacity();
+        self.last_insert_ms = 0;
+        self.last_insert_was_word = false;
     }
 
     fn applyUndoEntry(self: *Editor, entry: UndoEntry) UndoEntry {
@@ -2190,11 +2322,13 @@ pub const Editor = struct {
         var redo_inserted_len: usize = 0;
 
         if (entry.inserted_len > 0) {
-            if (entry.inserted_len <= 4096) {
-                var tmp: [4096]u8 = undefined;
-                const data = self.buf.contiguousSlice(entry.pos, entry.inserted_len, &tmp);
-                redo_deleted = self.allocator.dupe(u8, data) catch null;
-            }
+            // Right-sized allocation: a fixed 4 KB scratch here used to
+            // silently drop the redo data for large inserts.
+            if (self.allocator.alloc(u8, entry.inserted_len)) |dst| {
+                const got = self.buf.contiguousSlice(entry.pos, entry.inserted_len, dst);
+                if (got.ptr != dst.ptr) @memcpy(dst, got);
+                redo_deleted = dst;
+            } else |_| {}
             self.buf.delete(entry.pos, entry.inserted_len);
         }
 
@@ -2263,51 +2397,75 @@ pub const Editor = struct {
     }
 
     fn repositionCursorToBytePos(self: *Editor, pos: usize) void {
-        // Find line and col from byte position
-        var line: usize = 0;
-        while (line < self.buf.lineCount()) : (line += 1) {
-            const info = self.buf.getLine(line) orelse break;
-            if (pos >= info.start and pos <= info.start + info.len) {
-                self.cursor.line = line;
-                self.cursor.col = pos - info.start;
-                self.cursor.col_want = self.cursor.col;
-                self.ensureCursorVisible();
-                return;
-            }
-        }
-        // Fallback: go to end
-        self.cursor.line = if (self.buf.lineCount() > 0) self.buf.lineCount() - 1 else 0;
-        self.moveCursorToLineEnd();
+        const lc = self.bytePosToLineCol(@min(pos, self.buf.logicalLen()));
+        self.cursor.line = lc.line;
+        self.cursor.col = lc.col;
+        self.cursor.col_want = lc.col;
+        self.ensureCursorVisible();
     }
 
     // ── Search ──
 
+    /// Smart case: an all-lowercase pattern matches case-insensitively
+    /// (ASCII); any uppercase letter makes the search exact.
+    pub fn searchIgnoreCase(self: *const Editor) bool {
+        for (self.search_pattern[0..self.search_len]) |c| {
+            if (c >= 'A' and c <= 'Z') return false;
+        }
+        return true;
+    }
+
     fn findNext(self: *Editor) void {
         if (self.search_len == 0) return;
         const pattern = self.search_pattern[0..self.search_len];
+        const ic = self.searchIgnoreCase();
         const start_pos = self.cursorBytePos() + 1;
-        const total = self.buf.logicalLen();
 
-        // Search forward from cursor
-        var pos = start_pos;
-        while (pos + pattern.len <= total) : (pos += 1) {
-            var tmp: [256]u8 = undefined;
-            const slice = self.buf.contiguousSlice(pos, pattern.len, &tmp);
-            if (std.mem.eql(u8, slice, pattern)) {
-                self.repositionCursorToBytePos(pos);
-                return;
-            }
+        const found = self.buf.find(pattern, start_pos, ic) orelse
+            self.buf.find(pattern, 0, ic); // wrap around
+        if (found) |pos| {
+            self.repositionCursorToBytePos(pos);
         }
+        self.updateSearchStats();
+    }
 
-        // Wrap around
-        pos = 0;
-        while (pos + pattern.len <= start_pos and pos + pattern.len <= total) : (pos += 1) {
-            var tmp: [256]u8 = undefined;
-            const slice = self.buf.contiguousSlice(pos, pattern.len, &tmp);
-            if (std.mem.eql(u8, slice, pattern)) {
-                self.repositionCursorToBytePos(pos);
-                return;
-            }
+    fn findPrev(self: *Editor) void {
+        if (self.search_len == 0) return;
+        const pattern = self.search_pattern[0..self.search_len];
+        const ic = self.searchIgnoreCase();
+        const cur = self.cursorBytePos();
+
+        // Scan forward collecting the last match before the cursor;
+        // if there is none, wrap to the last match in the buffer.
+        var last: ?usize = null;
+        var pos: usize = 0;
+        var wrapped: ?usize = null;
+        while (self.buf.find(pattern, pos, ic)) |p| {
+            if (p < cur) last = p;
+            wrapped = p;
+            pos = p + 1;
+        }
+        if (last orelse wrapped) |p| {
+            self.repositionCursorToBytePos(p);
+        }
+        self.updateSearchStats();
+    }
+
+    /// Recount matches for the current pattern and locate the cursor's
+    /// 1-based position among them. O(n) over the buffer; runs once per
+    /// search keystroke or jump, not per frame.
+    fn updateSearchStats(self: *Editor) void {
+        self.search_match_count = 0;
+        self.search_match_index = 0;
+        if (self.search_len == 0) return;
+        const pattern = self.search_pattern[0..self.search_len];
+        const ic = self.searchIgnoreCase();
+        const cur = self.cursorBytePos();
+        var pos: usize = 0;
+        while (self.buf.find(pattern, pos, ic)) |p| {
+            self.search_match_count += 1;
+            if (p <= cur) self.search_match_index = self.search_match_count;
+            pos = p + 1;
         }
     }
 
@@ -2315,6 +2473,7 @@ pub const Editor = struct {
         if (self.search_len == 0) return;
         const pattern = self.search_pattern[0..self.search_len];
         const replacement = self.replace_buf[0..self.replace_len];
+        const ic = self.searchIgnoreCase();
 
         const pos = self.cursorBytePos();
         const total = self.buf.logicalLen();
@@ -2322,7 +2481,11 @@ pub const Editor = struct {
         if (pos + pattern.len <= total) {
             var tmp: [256]u8 = undefined;
             const slice = self.buf.contiguousSlice(pos, pattern.len, &tmp);
-            if (std.mem.eql(u8, slice, pattern)) {
+            const matches = if (ic)
+                std.ascii.eqlIgnoreCase(slice, pattern)
+            else
+                std.mem.eql(u8, slice, pattern);
+            if (matches) {
                 const saved = self.allocator.dupe(u8, slice) catch return;
                 self.pushUndo(pos, saved, replacement.len);
                 self.buf.delete(pos, pattern.len);
@@ -2337,20 +2500,25 @@ pub const Editor = struct {
         if (self.search_len == 0) return;
         const pattern = self.search_pattern[0..self.search_len];
         const replacement = self.replace_buf[0..self.replace_len];
+        const ic = self.searchIgnoreCase();
         var count: usize = 0;
 
+        // All replacements share one undo group so Ctrl+Z reverts the
+        // whole pass as a single step. (This also keeps the undo stack
+        // consistent — replaceAll used to bypass it entirely, leaving
+        // stale offsets behind.)
+        const group_id = self.nextUndoGroupId();
+
         var pos: usize = 0;
-        while (pos + pattern.len <= self.buf.logicalLen()) {
+        while (self.buf.find(pattern, pos, ic)) |p| {
             var tmp: [256]u8 = undefined;
-            const slice = self.buf.contiguousSlice(pos, pattern.len, &tmp);
-            if (std.mem.eql(u8, slice, pattern)) {
-                self.buf.delete(pos, pattern.len);
-                self.buf.insert(pos, replacement) catch break;
-                pos += replacement.len;
-                count += 1;
-            } else {
-                pos += 1;
-            }
+            const slice = self.buf.contiguousSlice(p, pattern.len, &tmp);
+            const saved = self.allocator.dupe(u8, slice) catch break;
+            self.pushUndoGrouped(p, saved, replacement.len, group_id);
+            self.buf.delete(p, pattern.len);
+            self.buf.insert(p, replacement) catch break;
+            pos = p + replacement.len;
+            count += 1;
         }
         if (count > 0) self.modified = true;
         var msg_buf: [64]u8 = undefined;
@@ -2378,8 +2546,15 @@ pub const Editor = struct {
 
         // Also push to the OS clipboard via OSC 52 when the terminal
         // is initialized. Internal paste (Ctrl+V) still reads from
-        // self.clipboard, so Cmd+V in another app now works.
-        term.writeOsc52Clipboard(data);
+        // self.clipboard, so Cmd+V in another app now works. Oversize
+        // selections stay internal-only — pasting a silently truncated
+        // clipboard elsewhere would be data corruption — and the user
+        // is told so.
+        if (data.len <= term.osc52_max_bytes) {
+            term.writeOsc52Clipboard(data);
+        } else {
+            self.setStatusMessage("Selection too large for system clipboard (copied internally).");
+        }
     }
 
     fn cutSelection(self: *Editor) void {
@@ -2410,11 +2585,7 @@ pub const Editor = struct {
         const pos = self.cursorBytePos();
         if (pos >= self.buf.logicalLen()) return;
 
-        var tmp: [1]u8 = undefined;
-        const ch = self.buf.contiguousSlice(pos, 1, &tmp);
-        if (ch.len == 0) return;
-
-        const c = ch[0];
+        const c = self.buf.byteAt(pos);
         const match_info: ?struct { target: u8, forward: bool } = switch (c) {
             '(' => .{ .target = ')', .forward = true },
             '[' => .{ .target = ']', .forward = true },
@@ -2436,11 +2607,9 @@ pub const Editor = struct {
                     scan_pos += 1;
                     scanned += 1;
                 }) {
-                    var stmp: [1]u8 = undefined;
-                    const sc = self.buf.contiguousSlice(scan_pos, 1, &stmp);
-                    if (sc.len == 0) break;
-                    if (sc[0] == c) depth += 1;
-                    if (sc[0] == info.target) {
+                    const sc = self.buf.byteAt(scan_pos);
+                    if (sc == c) depth += 1;
+                    if (sc == info.target) {
                         depth -= 1;
                         if (depth == 0) {
                             self.matching_bracket_pos = self.bytePosToLineCol(scan_pos);
@@ -2453,11 +2622,9 @@ pub const Editor = struct {
                 var scan_pos = pos - 1;
                 var scanned: usize = 0;
                 while (scanned < max_scan) : (scanned += 1) {
-                    var stmp: [1]u8 = undefined;
-                    const sc = self.buf.contiguousSlice(scan_pos, 1, &stmp);
-                    if (sc.len == 0) break;
-                    if (sc[0] == c) depth += 1;
-                    if (sc[0] == info.target) {
+                    const sc = self.buf.byteAt(scan_pos);
+                    if (sc == c) depth += 1;
+                    if (sc == info.target) {
                         depth -= 1;
                         if (depth == 0) {
                             self.matching_bracket_pos = self.bytePosToLineCol(scan_pos);
@@ -2472,14 +2639,10 @@ pub const Editor = struct {
     }
 
     fn bytePosToLineCol(self: *Editor, pos: usize) LineCol {
-        var line: usize = 0;
-        while (line < self.buf.lineCount()) : (line += 1) {
-            const info = self.buf.getLine(line) orelse break;
-            if (pos >= info.start and pos < info.start + info.len) {
-                return .{ .line = line, .col = pos - info.start };
-            }
-        }
-        return .{ .line = 0, .col = 0 };
+        const line = self.buf.lineOfPos(pos);
+        const info = self.buf.getLine(line) orelse return .{ .line = 0, .col = 0 };
+        // A pos pointing at the line's newline clamps to end-of-line.
+        return .{ .line = line, .col = @min(pos - info.start, info.len) };
     }
 
     // ── Multi-cursor ──
@@ -2660,24 +2823,29 @@ pub const Editor = struct {
             if (cursor_end > search_start) search_start = cursor_end;
         }
 
-        var pos = search_start;
-        while (pos + word.len <= self.buf.logicalLen()) : (pos += 1) {
-            var tmp: [256]u8 = undefined;
-            const slice = self.buf.contiguousSlice(pos, word.len, &tmp);
-            if (std.mem.eql(u8, slice, word)) {
-                const lc = self.bytePosToLineCol(pos);
-                self.cursors.append(self.allocator, .{
-                    .line = lc.line,
-                    .col = lc.col,
-                    .col_want = lc.col,
-                }) catch {};
-                return;
-            }
+        if (self.buf.find(word, search_start, false)) |pos| {
+            const lc = self.bytePosToLineCol(pos);
+            self.cursors.append(self.allocator, .{
+                .line = lc.line,
+                .col = lc.col,
+                .col_want = lc.col,
+            }) catch {};
         }
     }
 
     fn isWordChar(c: u8) bool {
         return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
+    }
+
+    /// Length of `buf` with its final codepoint removed — the prompt
+    /// backspace helper. Walks back over UTF-8 continuation bytes so a
+    /// multi-byte character is removed whole instead of leaving a
+    /// truncated tail behind.
+    fn truncLastCodepoint(buf: []const u8) usize {
+        if (buf.len == 0) return 0;
+        var i: usize = buf.len - 1;
+        while (i > 0 and unicode.isContByte(buf[i])) i -= 1;
+        return i;
     }
 
     // ── File operations ──
@@ -2708,9 +2876,9 @@ pub const Editor = struct {
         // Re-detect syntax from the (possibly renamed) filename so
         // `:w foo.py` after opening `foo.txt` picks up Python highlighting.
         self.language = syntax_mod.detect(self.filename[0..self.filename_len]);
-        // Refresh the positions store now that the file exists (the
+        // Refresh the positions store now that the file exists — the
         // first save of a new file would otherwise lose its cursor
-        // state on quit since realpath would have failed earlier).
+        // state on quit.
         self.persistCursor();
         self.setStatusMessage("Saved.");
     }
@@ -2824,6 +2992,7 @@ pub const Editor = struct {
     fn newBuffer(self: *Editor) void {
         self.buf.deinit();
         self.buf = buffer_mod.Buffer.init(self.allocator) catch return;
+        self.clearUndoState();
         self.filename_len = 0;
         self.modified = false;
         self.cursor = .{};
@@ -2876,7 +3045,7 @@ pub const Editor = struct {
 
 test "editor init and deinit" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), ed.cursor.line);
@@ -2886,7 +3055,7 @@ test "editor init and deinit" {
 
 test "editor insert and cursor movement" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     // Insert "abc"
@@ -2908,7 +3077,7 @@ test "editor insert and cursor movement" {
 
 test "editor backspace" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     _ = ed.handleKey(.{ .char = 'a' });
@@ -2920,7 +3089,7 @@ test "editor backspace" {
 
 test "editor undo/redo" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     _ = ed.handleKey(.{ .char = 'x' });
@@ -2937,7 +3106,7 @@ test "editor undo/redo" {
 
 test "editor undo coalesces consecutive word-char inserts" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     for ("abc") |c| _ = ed.handleKey(.{ .char = c });
@@ -2952,7 +3121,7 @@ test "editor undo coalesces consecutive word-char inserts" {
 
 test "editor undo splits on whitespace" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     for ("ab cd") |c| _ = ed.handleKey(.{ .char = c });
@@ -2977,7 +3146,7 @@ test "editor undo splits on whitespace" {
 
 test "editor undo breaks run on cursor movement" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     // Seed one line then type, move, type.
@@ -2992,7 +3161,7 @@ test "editor undo breaks run on cursor movement" {
 
 test "editor undo breaks run on Enter" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     for ("ab") |c| _ = ed.handleKey(.{ .char = c });
@@ -3005,7 +3174,7 @@ test "editor undo breaks run on Enter" {
 
 test "byteColToVisualCol expands tabs to tab stops" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     // Same shape as the MAINTAINER line in packaging/openbsd/issy/Makefile:
@@ -3032,7 +3201,7 @@ test "byteColToVisualCol expands tabs to tab stops" {
 
 test "byteColToVisualCol with leading tab" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "\thello\n");
@@ -3058,7 +3227,7 @@ test "tab-bearing short line reports single visual row" {
     // visual row regardless of embedded tabs.
 
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     const sample = "COMMENT =\ttiny text editor\nGH =\tdave\nfin\n";
@@ -3084,7 +3253,7 @@ test "tab-bearing short line reports single visual row" {
 
 test "multi-cursor insert types at every cursor" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     // Seed buffer: "aa aa aa"
@@ -3109,7 +3278,7 @@ test "multi-cursor insert types at every cursor" {
 
 test "multi-cursor delete removes at every cursor" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     // Seed buffer: "xa xa xa"
@@ -3132,7 +3301,7 @@ test "multi-cursor delete removes at every cursor" {
 
 test "multi-cursor edit is a single undo group" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     // Seed buffer: "aa aa"
@@ -3162,7 +3331,7 @@ test "multi-cursor edit is a single undo group" {
 
 test "editor search mode" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     // Enter search mode
@@ -3176,7 +3345,7 @@ test "editor search mode" {
 
 test "editor quit with modifications" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     _ = ed.handleKey(.{ .char = 'x' });
@@ -3193,7 +3362,7 @@ test "editor quit with modifications" {
 
 test "editor Ctrl+N on dirty buffer confirms then newBuffer" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     _ = ed.handleKey(.{ .char = 'x' });
@@ -3212,7 +3381,7 @@ test "editor Ctrl+N on dirty buffer confirms then newBuffer" {
 
 test "editor Ctrl+O on dirty buffer confirms then opens prompt" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     _ = ed.handleKey(.{ .char = 'x' });
@@ -3235,7 +3404,7 @@ test "editor Ctrl+O on dirty buffer confirms then opens prompt" {
 
 test "editor Ctrl+O on clean buffer skips confirm" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     // Ctrl+O -> directly to command mode
@@ -3245,7 +3414,7 @@ test "editor Ctrl+O on clean buffer skips confirm" {
 
 test "editor Ctrl+L goto-line jumps to line" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     // Seed 5 lines
@@ -3265,7 +3434,7 @@ test "editor Ctrl+L goto-line jumps to line" {
 
 test "editor goto-line clamps past-end to last line" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     ed.buf.insert(0, "a\nb\nc\n") catch unreachable;
@@ -3281,7 +3450,7 @@ test "editor goto-line clamps past-end to last line" {
 
 test "editor goto-line Escape cancels" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     ed.buf.insert(0, "a\nb\nc\n") catch unreachable;
@@ -3298,7 +3467,7 @@ test "editor goto-line Escape cancels" {
 
 test "editor goto-line ignores non-numeric input" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     ed.buf.insert(0, "a\nb\nc\n") catch unreachable;
@@ -3314,7 +3483,7 @@ test "editor goto-line ignores non-numeric input" {
 
 test "editor confirm Escape restores buffer" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     _ = ed.handleKey(.{ .char = 'y' });
@@ -3330,7 +3499,7 @@ test "editor confirm Escape restores buffer" {
 
 test "editor detect indent - spaces" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     // Insert lines with 2-space indent
@@ -3344,7 +3513,7 @@ test "editor detect indent - spaces" {
 
 test "editor bracket matching" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     ed.buf.insert(0, "(hello)") catch unreachable;
@@ -3361,7 +3530,7 @@ test "editor bracket matching" {
 
 test "byteColToVisualCol handles multi-byte UTF-8" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     // "a─b\n" — 'a' (1) + ─ (3) + 'b' (1) + '\n' (1) = 6 bytes
@@ -3376,7 +3545,7 @@ test "byteColToVisualCol handles multi-byte UTF-8" {
 
 test "byteColToVisualCol with tab and multi-byte interleaved" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     // "a\t─b\n" — tab_width default 4, 'a' at vis 0, tab fills to 4,
@@ -3392,7 +3561,7 @@ test "byteColToVisualCol with tab and multi-byte interleaved" {
 
 test "computeWrapBreaks does not split multi-byte UTF-8" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     // 60 ─ characters (180 bytes) + newline.
@@ -3434,7 +3603,7 @@ test "computeWrapBreaks does not split multi-byte UTF-8" {
 
 test "computeWrapBreaks measures width in codepoints not bytes" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     // 30 ─ characters = 90 bytes but only 30 visual columns.
@@ -3464,7 +3633,7 @@ test "computeWrapBreaks measures width in codepoints not bytes" {
 
 test "insertCodepoint of 3-byte char advances cursor by codepoint" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     // Insert ─ (U+2500) — 3 bytes in UTF-8.
@@ -3480,7 +3649,7 @@ test "insertCodepoint of 3-byte char advances cursor by codepoint" {
 
 test "moveCursorRight steps over multi-byte codepoint" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "a\xE2\x94\x80b");
@@ -3497,7 +3666,7 @@ test "moveCursorRight steps over multi-byte codepoint" {
 
 test "moveCursorLeft steps over multi-byte codepoint" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "a\xE2\x94\x80b");
@@ -3514,7 +3683,7 @@ test "moveCursorLeft steps over multi-byte codepoint" {
 
 test "doBackspace deletes whole multi-byte codepoint" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "a\xE2\x94\x80");
@@ -3528,7 +3697,7 @@ test "doBackspace deletes whole multi-byte codepoint" {
 
 test "doDelete forward removes whole multi-byte codepoint" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "a\xE2\x94\x80b");
@@ -3545,7 +3714,7 @@ test "doDelete forward removes whole multi-byte codepoint" {
 
 test "shift_right starts and extends selection" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "hello");
@@ -3566,7 +3735,7 @@ test "shift_right starts and extends selection" {
 
 test "shift_up extends across lines" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "hello\nworld\n");
@@ -3592,7 +3761,7 @@ test "shift_up extends across lines" {
 
 test "plain right collapses active selection" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "hello");
@@ -3610,7 +3779,7 @@ test "plain right collapses active selection" {
 
 test "shift_left at line start crosses into previous line" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "hello\nworld\n");
@@ -3628,7 +3797,7 @@ test "shift_left at line start crosses into previous line" {
 
 test "shift_right over multi-byte char" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "a\xE2\x94\x80b");
@@ -3646,7 +3815,7 @@ test "shift_right over multi-byte char" {
 
 test "Ctrl+A select all then Ctrl+C still works" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "hi");
@@ -3668,7 +3837,7 @@ test "mouse drag creates selection" {
     cfg.left_padding = 0;
     cfg.gutter_padding = 0;
 
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "abcdef\n");
@@ -3695,7 +3864,7 @@ test "mouse release without drag clears selection" {
     cfg.left_padding = 0;
     cfg.gutter_padding = 0;
 
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "abcdef\n");
@@ -3712,7 +3881,7 @@ test "mouse drag past viewport clamps to last line" {
     cfg.left_padding = 0;
     cfg.gutter_padding = 0;
 
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "ab\ncd\n");
@@ -3729,7 +3898,7 @@ test "mouse drag past viewport clamps to last line" {
 
 test "visualColToByteCol identity on ASCII" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "abcdef\n");
@@ -3742,7 +3911,7 @@ test "visualColToByteCol identity on ASCII" {
 
 test "visualColToByteCol snaps inside tab to tab byte" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     // Default tab_width is 4. "\tabc" → tab covers visual 0..3,
@@ -3759,7 +3928,7 @@ test "visualColToByteCol snaps inside tab to tab byte" {
 
 test "visualColToByteCol handles multi-byte codepoints" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     // "a─b" — 'a' visual 0, ─ (3 bytes) visual 1, 'b' visual 2.
@@ -3777,7 +3946,7 @@ test "screenToBufferPos clicks past tab land on next char" {
     cfg.left_padding = 0;
     cfg.gutter_padding = 0;
 
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     // "\tabc": with tab_width=4, visual col 4 is 'a'. Clicking at
@@ -3805,7 +3974,7 @@ test "screenToBufferPos clicks past multi-byte land correctly" {
     cfg.left_padding = 0;
     cfg.gutter_padding = 0;
 
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     // "a─b" — 'a' visual 0, ─ visual 1, 'b' visual 2.
@@ -3826,7 +3995,7 @@ test "shift+click without selection anchors at current cursor" {
     cfg.left_padding = 0;
     cfg.gutter_padding = 0;
 
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "abcdefghij\n");
@@ -3849,7 +4018,7 @@ test "shift+click extends existing selection from original anchor" {
     cfg.left_padding = 0;
     cfg.gutter_padding = 0;
 
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "abcdefghij\n");
@@ -3877,7 +4046,7 @@ test "double click selects word" {
     cfg.left_padding = 0;
     cfg.gutter_padding = 0;
 
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "foo bar baz\n");
@@ -3897,7 +4066,7 @@ test "double click on punctuation selects single char" {
     cfg.left_padding = 0;
     cfg.gutter_padding = 0;
 
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "foo,bar\n");
@@ -3918,7 +4087,7 @@ test "triple click selects line" {
     cfg.left_padding = 0;
     cfg.gutter_padding = 0;
 
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "first line\nsecond line\n");
@@ -3940,7 +4109,7 @@ test "click count resets on different position" {
     cfg.left_padding = 0;
     cfg.gutter_padding = 0;
 
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "foo bar\n");
@@ -3959,7 +4128,7 @@ test "click count resets on different position" {
 
 test "ctrl_shift_right extends selection to next word" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "foo bar baz\n");
@@ -3979,7 +4148,7 @@ test "ctrl_shift_right extends selection to next word" {
 
 test "ctrl_shift_left at BOF is noop" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "foo bar\n");
@@ -3993,7 +4162,7 @@ test "ctrl_shift_left at BOF is noop" {
 
 test "ctrl_word_right crosses line boundary at EOL" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "foo\nbar\n");
@@ -4007,7 +4176,7 @@ test "ctrl_word_right crosses line boundary at EOL" {
 
 test "ctrl_word_right does not trigger search" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "foo bar\n");
@@ -4023,7 +4192,7 @@ test "ctrl_word_right does not trigger search" {
 
 test "moveCursorWordLeft from mid-word goes to word start" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "foo bar\n");
@@ -4036,7 +4205,7 @@ test "moveCursorWordLeft from mid-word goes to word start" {
 
 test "moveCursorWordLeft from space skips non-word then word" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "foo bar\n");
@@ -4051,7 +4220,7 @@ test "moveCursorWordLeft from space skips non-word then word" {
 
 test "dragAutoscrollTick noop when not dragging" {
     var cfg = config_mod.Config.init();
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "abc\n");
@@ -4069,7 +4238,7 @@ test "dragAutoscrollTick scrolls down at bottom edge" {
     cfg.left_padding = 0;
     cfg.gutter_padding = 0;
 
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     // 20 lines so scrolling is possible with visible_rows = 10.
@@ -4103,7 +4272,7 @@ test "dragAutoscrollTick scrolls up at top edge and clamps" {
     cfg.left_padding = 0;
     cfg.gutter_padding = 0;
 
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     var buf: [128]u8 = undefined;
@@ -4143,7 +4312,7 @@ test "mouse release clears is_dragging" {
     cfg.left_padding = 0;
     cfg.gutter_padding = 0;
 
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "abcdef\n");
@@ -4164,7 +4333,7 @@ test "mouse click on wrapped continuation line" {
     cfg.word_wrap = true;
     cfg.right_margin = 0;
 
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     // With visible_cols=20 and no gutter, wrapWidth()=20.
@@ -4195,7 +4364,7 @@ test "mouse click after multiple wrapped lines" {
     cfg.word_wrap = true;
     cfg.right_margin = 0;
 
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     // Two long lines that each wrap into 2 screen rows at width 20,
@@ -4221,7 +4390,7 @@ test "mouse click on wrap continuation clamps past line end" {
     cfg.word_wrap = true;
     cfg.right_margin = 0;
 
-    var ed = Editor.init(&cfg, std.testing.allocator);
+    var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     // 25-char line wraps at width 20; continuation has 5 chars (cols 20-24).
@@ -4234,4 +4403,202 @@ test "mouse click on wrap continuation clamps past line end" {
     try std.testing.expectEqual(@as(usize, 0), ed.cursor.line);
     const info = ed.buf.getLine(0).?;
     try std.testing.expect(ed.cursor.col <= info.len);
+}
+
+// ── Regression tests for fixed crashes and undo lifecycle ──
+
+test "insertTab with out-of-range detected width is clamped" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // Force a hostile width past the config validation layer.
+    ed.detected_tab_width = 200;
+    ed.detected_expand_tabs = true;
+    _ = ed.handleKey(.tab); // used to panic: index out of bounds
+    try std.testing.expect(ed.buf.logicalLen() <= 8);
+}
+
+test "deleting a large selection across the gap is safe" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    const big = "x" ** 10000;
+    try ed.buf.insert(0, big);
+    try ed.buf.insert(5000, "y"); // park the gap mid-buffer
+    _ = ed.handleKey(.{ .ctrl = 'a' });
+    _ = ed.handleKey(.backspace); // used to smash a 4 KB stack buffer
+    try std.testing.expectEqual(@as(usize, 0), ed.buf.logicalLen());
+
+    // And the whole delete undoes in one step.
+    _ = ed.handleKey(.{ .ctrl = 'z' });
+    try std.testing.expectEqual(@as(usize, 10001), ed.buf.logicalLen());
+}
+
+test "undo history is dropped on new buffer" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    for ("hello") |c| _ = ed.handleKey(.{ .char = c });
+    ed.modified = false; // pretend saved
+    _ = ed.handleKey(.{ .ctrl = 'n' });
+    try std.testing.expectEqual(@as(usize, 0), ed.buf.logicalLen());
+
+    // Undo after a buffer swap used to replay stale offsets and panic.
+    _ = ed.handleKey(.{ .ctrl = 'z' });
+    try std.testing.expectEqual(@as(usize, 0), ed.buf.logicalLen());
+    try std.testing.expectEqual(@as(usize, 0), ed.undo_stack.items.len);
+}
+
+test "replace all is a single undo step" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "foo bar foo baz foo");
+    @memcpy(ed.search_pattern[0..3], "foo");
+    ed.search_len = 3;
+    @memcpy(ed.replace_buf[0..4], "quux");
+    ed.replace_len = 4;
+
+    ed.replaceAll();
+    var tmp: [64]u8 = undefined;
+    var got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
+    try std.testing.expectEqualStrings("quux bar quux baz quux", got);
+
+    _ = ed.handleKey(.{ .ctrl = 'z' });
+    got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
+    try std.testing.expectEqualStrings("foo bar foo baz foo", got);
+
+    _ = ed.handleKey(.{ .ctrl = 'y' });
+    got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
+    try std.testing.expectEqualStrings("quux bar quux baz quux", got);
+}
+
+test "smart-case search: lowercase pattern matches any case" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "Alpha beta ALPHA\n");
+
+    _ = ed.handleKey(.{ .ctrl = 'f' });
+    for ("alpha") |c| _ = ed.handleKey(.{ .char = c });
+    // Lowercase pattern → case-insensitive → matches "Alpha" at 0.
+    try std.testing.expectEqual(@as(usize, 0), ed.cursor.col);
+    try std.testing.expectEqual(@as(usize, 2), ed.search_match_count);
+
+    // Uppercase letter in pattern → exact → only "ALPHA" matches.
+    for (0..5) |_| _ = ed.handleKey(.backspace);
+    for ("ALPHA") |c| _ = ed.handleKey(.{ .char = c });
+    try std.testing.expectEqual(@as(usize, 1), ed.search_match_count);
+    try std.testing.expectEqual(@as(usize, 11), ed.cursor.col);
+}
+
+test "incremental search re-anchors at the origin" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "xx abc xx\n");
+
+    _ = ed.handleKey(.{ .ctrl = 'f' });
+    _ = ed.handleKey(.{ .char = 'a' });
+    try std.testing.expectEqual(@as(usize, 3), ed.cursor.col);
+    // Typing 'b' must still match "ab" at col 3 (not march past it).
+    _ = ed.handleKey(.{ .char = 'b' });
+    try std.testing.expectEqual(@as(usize, 3), ed.cursor.col);
+}
+
+test "search prompt backspace removes whole codepoint" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    _ = ed.handleKey(.{ .ctrl = 'f' });
+    _ = ed.handleKey(.{ .char = 0x00E9 }); // é (2 bytes)
+    try std.testing.expectEqual(@as(usize, 2), ed.search_len);
+    _ = ed.handleKey(.backspace);
+    try std.testing.expectEqual(@as(usize, 0), ed.search_len);
+}
+
+test "search up/down navigate between matches" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "hit one hit two hit\n");
+
+    _ = ed.handleKey(.{ .ctrl = 'f' });
+    for ("hit") |c| _ = ed.handleKey(.{ .char = c });
+    try std.testing.expectEqual(@as(usize, 0), ed.cursor.col);
+    try std.testing.expectEqual(@as(usize, 3), ed.search_match_count);
+
+    _ = ed.handleKey(.down);
+    try std.testing.expectEqual(@as(usize, 8), ed.cursor.col);
+    _ = ed.handleKey(.down);
+    try std.testing.expectEqual(@as(usize, 16), ed.cursor.col);
+    _ = ed.handleKey(.up);
+    try std.testing.expectEqual(@as(usize, 8), ed.cursor.col);
+}
+
+test "Ctrl+R reload with clean buffer requires a file" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    _ = ed.handleKey(.{ .ctrl = 'r' });
+    try std.testing.expectEqualStrings("No file to reload.", ed.getStatusMsg());
+}
+
+test "Ctrl+R on dirty buffer asks for confirmation" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // Give it a filename and a dirty buffer.
+    ed.filename[0..4].* = "x.md".*;
+    ed.filename_len = 4;
+    _ = ed.handleKey(.{ .char = 'q' });
+    _ = ed.handleKey(.{ .ctrl = 'r' });
+    try std.testing.expectEqual(Mode.confirm, ed.mode);
+    // Escape cancels; buffer untouched.
+    _ = ed.handleKey(.escape);
+    try std.testing.expectEqual(Mode.normal, ed.mode);
+    try std.testing.expectEqual(@as(usize, 1), ed.buf.logicalLen());
+}
+
+test "Ctrl+G advances the match inside search mode" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "aa bb aa cc\n");
+    _ = ed.handleKey(.{ .ctrl = 'f' });
+    for ("aa") |c| _ = ed.handleKey(.{ .char = c });
+    try std.testing.expectEqual(@as(usize, 0), ed.cursor.col);
+    try std.testing.expectEqual(Mode.search, ed.mode);
+
+    _ = ed.handleKey(.{ .ctrl = 'g' });
+    try std.testing.expectEqual(@as(usize, 6), ed.cursor.col);
+    // Still in search mode — Ctrl+G must not confirm or cancel.
+    try std.testing.expectEqual(Mode.search, ed.mode);
+}
+
+test "oversize copy stays internal-only and says so" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    const big = "x" ** (term.osc52_max_bytes + 1);
+    try ed.buf.insert(0, big);
+    _ = ed.handleKey(.{ .ctrl = 'a' });
+    _ = ed.handleKey(.{ .ctrl = 'c' });
+
+    // The full selection lands in the internal clipboard…
+    try std.testing.expectEqual(term.osc52_max_bytes + 1, ed.clipboard.?.len);
+    // …and the user is told the system clipboard was skipped.
+    try std.testing.expect(std.mem.indexOf(u8, ed.getStatusMsg(), "too large") != null);
 }

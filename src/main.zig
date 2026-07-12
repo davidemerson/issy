@@ -20,6 +20,36 @@ comptime {
     }
 }
 
+/// Restore the terminal before the default panic handler prints its
+/// trace — otherwise a crash leaves the terminal in raw mode on the
+/// alternate screen with the panic message invisible and the shell
+/// unusable.
+pub const panic = std.debug.FullPanic(issyPanic);
+
+fn issyPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    term.emergencyRestore();
+    std.debug.defaultPanic(msg, first_trace_addr);
+}
+
+/// Set from the SIGTERM/SIGHUP handler; the main loop polls it every
+/// tick (the 100ms read timeout bounds the latency) and shuts down
+/// cleanly — restoring the terminal and persisting the cursor position.
+var shutdown_requested = std.atomic.Value(bool).init(false);
+
+fn handleFatalSignal(_: c_int) callconv(.c) void {
+    shutdown_requested.store(true, .release);
+}
+
+fn installSignalHandlers() void {
+    const action = std.posix.Sigaction{
+        .handler = .{ .handler = handleFatalSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.TERM, &action, null);
+    std.posix.sigaction(std.posix.SIG.HUP, &action, null);
+}
+
 const Args = struct {
     file: ?[]const u8 = null,
     config_path: ?[]const u8 = null,
@@ -40,6 +70,8 @@ fn applyCliOverrides(cfg: *config_mod.Config, args: Args) void {
     if (args.theme) |t| {
         if (std.mem.eql(u8, t, "paper")) {
             cfg.theme = config_mod.paper_theme;
+        } else if (std.mem.eql(u8, t, "default")) {
+            cfg.theme = .{};
         }
     }
     if (args.font) |f| {
@@ -74,7 +106,7 @@ fn parseArgs() Args {
             args_result.resume_path = args_iter.next();
         } else if (std.mem.eql(u8, arg, "--rollback")) {
             args_result.rollback = true;
-        } else if (arg[0] != '-') {
+        } else if (arg.len > 0 and arg[0] != '-') {
             args_result.file = arg;
         }
     }
@@ -162,13 +194,13 @@ pub fn main() !void {
 
     var cfg = config_mod.Config.init();
     if (cfg_path_len > 0) {
-        cfg = config_mod.load(allocator, cfg_path_buf[0..cfg_path_len]);
+        cfg = config_mod.load(cfg_path_buf[0..cfg_path_len]);
         if (config_mod.statMtime(cfg_path_buf[0..cfg_path_len])) |m| cfg_mtime = m;
     }
     applyCliOverrides(&cfg, args);
 
     // Init editor
-    var ed = editor_mod.Editor.init(&cfg, allocator);
+    var ed = try editor_mod.Editor.init(&cfg, allocator);
     defer ed.deinit();
 
     // Load file if specified
@@ -203,6 +235,7 @@ pub fn main() !void {
         stderr.writeAll("issy: stdin is not a terminal\n") catch {};
         std.process.exit(1);
     }
+    installSignalHandlers();
     try term.init();
     defer term.deinit();
 
@@ -226,31 +259,71 @@ pub fn main() !void {
     // Main loop
     var last_stat_check: i64 = 0;
     var idle_ms: u64 = 0;
+    var needs_redraw = true;
     while (true) {
+        // Graceful shutdown on SIGTERM/SIGHUP: the defers restore the
+        // terminal; persist the cursor like a normal quit would.
+        if (shutdown_requested.load(.acquire)) {
+            ed.persistCursor();
+            break;
+        }
+
         // Check for resize
         const new_size = term.getSize();
         if (new_size.rows != renderer.rows or new_size.cols != renderer.cols) {
             try renderer.resize(new_size.rows, new_size.cols);
             ed.visible_rows = new_size.rows;
             ed.visible_cols = new_size.cols;
+            needs_redraw = true;
         }
 
-        // Render
-        try renderer.drawFrame(&ed);
+        // Render only when something changed. Repainting every quiet
+        // 100ms tick used to re-tokenize and re-fill the whole grid
+        // just for the diff to discard it — constant idle CPU.
+        if (needs_redraw) {
+            try renderer.drawFrame(&ed);
+            needs_redraw = false;
+        }
 
-        // Read input
+        // Read input (returns .none after the ~100ms termios timeout).
         const key = try term.readKey();
+
+        // Periodic checks, throttled to 1/sec and running while idle
+        // too, so external file edits and config changes surface
+        // without waiting for a keypress.
+        const now = std.time.milliTimestamp();
+        if (now - last_stat_check > 1000) {
+            if (ed.checkFileChanged()) needs_redraw = true;
+            // Config auto-reload: if ~/.issyrc (or --config path) has a
+            // newer mtime than what we last loaded, reread it and
+            // reapply CLI overrides. Failure is silent — the editor
+            // keeps using the previous config rather than blanking it.
+            if (cfg_path_len > 0) {
+                if (config_mod.statMtime(cfg_path_buf[0..cfg_path_len])) |m| {
+                    if (m != cfg_mtime) {
+                        cfg = config_mod.load(cfg_path_buf[0..cfg_path_len]);
+                        applyCliOverrides(&cfg, args);
+                        cfg_mtime = m;
+                        ed.setStatusMessage("Config reloaded.");
+                        needs_redraw = true;
+                    }
+                }
+            }
+            last_stat_check = now;
+        }
+
         if (key == .none) {
-            // term.readKey has a ~100ms timeout; each .none return is
-            // roughly one quiet tick. Use this to drive drag
-            // autoscroll (the terminal only sends drag events when
-            // the pointer moves, so a stationary drag at the
-            // viewport edge would otherwise freeze) and for the idle
-            // auto-update accumulator.
+            // Quiet tick. Drives drag autoscroll (the terminal only
+            // sends drag events when the pointer moves, so a stationary
+            // drag at the viewport edge would otherwise freeze), status
+            // message expiry, and the idle auto-update accumulator.
             if (ed.is_dragging) {
-                _ = ed.dragAutoscrollTick();
-                // Fall through so the top of the loop repaints.
+                if (ed.dragAutoscrollTick()) needs_redraw = true;
                 continue;
+            }
+            if (ed.status_msg_len > 0 and now - ed.status_msg_time > 5000) {
+                ed.status_msg_len = 0;
+                needs_redraw = true;
             }
             idle_ms += 100;
             if (update_mod.canAutoApply(&update_state, &ed, &cfg, idle_ms, update_mod.min_idle_ms_default)) {
@@ -261,6 +334,7 @@ pub fn main() !void {
                     var buf: [128]u8 = undefined;
                     const msg = std.fmt.bufPrint(&buf, "auto-update failed: {s}", .{@errorName(e)}) catch "auto-update failed";
                     ed.setStatusMessage(msg);
+                    needs_redraw = true;
                     // Back off: don't retry until more idle time accrues.
                     idle_ms = 0;
                 };
@@ -268,29 +342,11 @@ pub fn main() !void {
             continue;
         }
 
-        // Real keystroke — reset idle counter.
+        // Real keystroke — reset idle counter and repaint. Repainting on
+        // every key (not just .redraw actions) keeps status-message
+        // expiry inside handleKey visible.
         idle_ms = 0;
-
-        // File change detection (throttled to 1/sec)
-        const now = std.time.milliTimestamp();
-        if (now - last_stat_check > 1000) {
-            ed.checkFileChanged();
-            // Config auto-reload: if ~/.issyrc (or --config path) has a
-            // newer mtime than what we last loaded, reread it and
-            // reapply CLI overrides. Failure is silent — the editor
-            // keeps using the previous config rather than blanking it.
-            if (cfg_path_len > 0) {
-                if (config_mod.statMtime(cfg_path_buf[0..cfg_path_len])) |m| {
-                    if (m != cfg_mtime) {
-                        cfg = config_mod.load(allocator, cfg_path_buf[0..cfg_path_len]);
-                        applyCliOverrides(&cfg, args);
-                        cfg_mtime = m;
-                        ed.setStatusMessage("Config reloaded.");
-                    }
-                }
-            }
-            last_stat_check = now;
-        }
+        needs_redraw = true;
 
         // Handle key
         switch (ed.handleKey(key)) {

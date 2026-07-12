@@ -211,7 +211,7 @@ install_from_source() {
         cat >&2 <<EOF
 error: zig is required to build from source on $OS/$ARCH.
 
-  1. Install Zig 0.15.2 or newer from https://ziglang.org/download/
+  1. Install Zig 0.15.x (0.15.2 recommended) from https://ziglang.org/download/
   2. Ensure 'zig' is on your PATH
   3. Re-run this installer
 
@@ -223,12 +223,17 @@ EOF
     fi
 
     zig_version="$(zig version 2>/dev/null || echo 0.0.0)"
-    # Accept 0.15.x and anything newer. Very coarse — just checks the major/minor.
+    # issy requires the 0.15.x series. Newer: build.zig rejects >= 0.16
+    # at comptime (0.16 moved std.fs under std.Io), so accepting it here
+    # would just fail later with a compile error. Older: the code uses
+    # 0.15 std APIs that don't exist before 0.15, so the build would
+    # fail there too — this gate simply fails earlier with a clearer
+    # message than either compile error.
     case "$zig_version" in
-        0.15.*|0.16.*|0.17.*|0.18.*|0.19.*|0.2*|1.*)
+        0.15.*)
             ;;
         *)
-            die "zig $zig_version is too old; need 0.15.2 or newer"
+            die "zig $zig_version is unsupported; issy requires Zig 0.15.x (0.16 changed the std APIs issy depends on)"
             ;;
     esac
 

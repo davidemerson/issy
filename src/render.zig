@@ -23,13 +23,25 @@ pub const Cell = struct {
     underline: bool = false,
 };
 
+/// A search match's byte range, used for viewport highlighting while
+/// search/replace mode is active.
+const MatchRange = struct { start: usize, end: usize };
+
 pub const Renderer = struct {
     current: []Cell,
     previous: []Cell,
     rows: u16,
     cols: u16,
     allocator: Allocator,
-    syntax_states: []syntax_mod.State,
+    /// Syntax-state cache: syn_states.items[i] is the tokenizer state at
+    /// the START of buffer line i (entry 0 is always .normal). Entries
+    /// [0..syn_valid) are valid; edits invalidate from the edited line
+    /// via the buffer's dirty watermark. This is what makes multi-line
+    /// comments and strings highlight correctly when their opening
+    /// delimiter is scrolled above the viewport.
+    syn_states: std.ArrayList(syntax_mod.State),
+    syn_valid: usize,
+    syn_lang: ?*const syntax_mod.Language,
 
     pub fn init(allocator: Allocator, rows: u16, cols: u16) !Renderer {
         const size = @as(usize, rows) * @as(usize, cols);
@@ -37,8 +49,6 @@ pub const Renderer = struct {
         @memset(current, Cell{});
         const previous = try allocator.alloc(Cell, size);
         @memset(previous, .{ .char = 0 }); // Force full redraw on first frame
-        const states = try allocator.alloc(syntax_mod.State, rows);
-        @memset(states, .normal);
 
         return .{
             .current = current,
@@ -46,30 +56,92 @@ pub const Renderer = struct {
             .rows = rows,
             .cols = cols,
             .allocator = allocator,
-            .syntax_states = states,
+            .syn_states = .{},
+            .syn_valid = 0,
+            .syn_lang = null,
         };
     }
 
     pub fn deinit(self: *Renderer) void {
         self.allocator.free(self.current);
         self.allocator.free(self.previous);
-        self.allocator.free(self.syntax_states);
+        self.syn_states.deinit(self.allocator);
     }
 
     pub fn resize(self: *Renderer, rows: u16, cols: u16) !void {
         self.allocator.free(self.current);
         self.allocator.free(self.previous);
-        self.allocator.free(self.syntax_states);
 
         const size = @as(usize, rows) * @as(usize, cols);
         self.current = try self.allocator.alloc(Cell, size);
         @memset(self.current, Cell{});
         self.previous = try self.allocator.alloc(Cell, size);
         @memset(self.previous, .{ .char = 0 });
-        self.syntax_states = try self.allocator.alloc(syntax_mod.State, rows);
-        @memset(self.syntax_states, .normal);
         self.rows = rows;
         self.cols = cols;
+        // The syntax-state cache is line-indexed, not screen-indexed —
+        // it survives resizes untouched.
+    }
+
+    /// Tokenizer state at the start of `target` line. Computed from the
+    /// nearest cached line forward, caching every intermediate line, so
+    /// scrolling costs only the newly-exposed lines and an edit costs
+    /// only the lines at and below it.
+    fn stateAtLine(self: *Renderer, ed: *editor_mod.Editor, target: usize) syntax_mod.State {
+        const lang = ed.language orelse return .normal;
+        if (self.syn_valid == 0) {
+            self.syn_states.clearRetainingCapacity();
+            self.syn_states.append(self.allocator, .normal) catch return .normal;
+            self.syn_valid = 1;
+        }
+        if (target < self.syn_valid) return self.syn_states.items[target];
+
+        var state = self.syn_states.items[self.syn_valid - 1];
+        var line = self.syn_valid - 1;
+        var tokens: [256]syntax_mod.Token = undefined;
+        var tmp: [8192]u8 = undefined;
+        while (line < target) : (line += 1) {
+            const info = ed.buf.getLine(line) orelse break;
+            const data = ed.buf.contiguousSlice(info.start, @min(info.len, 8192), &tmp);
+            _ = syntax_mod.tokenizeLine(lang, data, &state, &tokens);
+            self.cacheState(line + 1, state);
+        }
+        return state;
+    }
+
+    /// Record the state at the start of `line`, extending the valid
+    /// prefix when the entry is contiguous with it.
+    fn cacheState(self: *Renderer, line: usize, state: syntax_mod.State) void {
+        if (line == self.syn_states.items.len) {
+            self.syn_states.append(self.allocator, state) catch return;
+        } else if (line < self.syn_states.items.len) {
+            self.syn_states.items[line] = state;
+        } else {
+            return;
+        }
+        if (self.syn_valid == line) self.syn_valid = line + 1;
+    }
+
+    /// Collect search-match byte ranges that may be visible, sorted by
+    /// position. Only active in search/replace mode.
+    fn collectViewportMatches(self: *Renderer, ed: *editor_mod.Editor, out: *[256]MatchRange) []const MatchRange {
+        if (ed.mode != .search and ed.mode != .replace) return out[0..0];
+        if (ed.search_len == 0) return out[0..0];
+        const pattern = ed.search_pattern[0..ed.search_len];
+        const ic = ed.searchIgnoreCase();
+        const first = ed.buf.getLine(ed.scroll_top) orelse return out[0..0];
+        // Upper bound on bytes that can appear on screen.
+        const limit = @min(ed.buf.logicalLen(), first.start + @as(usize, self.rows) * 8192);
+        var pos = first.start;
+        var n: usize = 0;
+        while (n < out.len) {
+            const p = ed.buf.find(pattern, pos, ic) orelse break;
+            if (p >= limit) break;
+            out[n] = .{ .start = p, .end = p + pattern.len };
+            n += 1;
+            pos = p + 1;
+        }
+        return out[0..n];
     }
 
     fn cellAt(self: *Renderer, row: u16, col: u16) *Cell {
@@ -129,8 +201,25 @@ pub const Renderer = struct {
         // selection bg if it's inside.
         const sel_range: ?editor_mod.Editor.SelectionRange = if (ed.sel_active) ed.getSelectionRange() else null;
 
-        // Track syntax state
-        var syn_state: syntax_mod.State = .normal;
+        // Search-match highlighting (search/replace mode only).
+        var match_buf: [256]MatchRange = undefined;
+        const matches = self.collectViewportMatches(ed, &match_buf);
+
+        // Syntax-state cache maintenance: a language change resets it, an
+        // edit invalidates from the edited line down.
+        if (ed.language != self.syn_lang) {
+            self.syn_lang = ed.language;
+            self.syn_valid = 0;
+        }
+        if (ed.buf.takeDirtyMinPos()) |p| {
+            const dirty_line = ed.buf.lineOfPos(p);
+            self.syn_valid = @min(self.syn_valid, dirty_line + 1);
+        }
+
+        // Tokenizer state at the top of the viewport — carried in from
+        // the cache so multi-line comments/strings opened above the
+        // viewport render correctly.
+        var syn_state: syntax_mod.State = self.stateAtLine(ed, ed.scroll_top);
 
         // 3. Render visible lines
         var screen_row: u16 = 0;
@@ -145,11 +234,13 @@ pub const Renderer = struct {
             var line_tmp: [8192]u8 = undefined;
             const line_data = ed.buf.contiguousSlice(line_info.start, @min(line_info.len, 8192), &line_tmp);
 
-            // Tokenize
+            // Tokenize, and feed the resulting state (start of the next
+            // line) back into the cache so scrolling down is incremental.
             var token_buf: [256]syntax_mod.Token = undefined;
             var tokens: []syntax_mod.Token = &.{};
             if (ed.language) |lang| {
                 tokens = syntax_mod.tokenizeLine(lang, line_data, &syn_state, &token_buf);
+                self.cacheState(file_line + 1, syn_state);
             }
 
             // Compute wrap break points for this line
@@ -237,12 +328,13 @@ pub const Renderer = struct {
 
                     // Selection check is computed once per character so
                     // tab-expanded space cells all inherit the same
-                    // in_sel value.
+                    // in_sel value. Live search matches highlight with
+                    // the same background.
                     const abs_byte = line_info.start + byte_idx;
-                    const in_sel = if (sel_range) |sr|
+                    const in_sel = (if (sel_range) |sr|
                         (abs_byte >= sr.start and abs_byte < sr.start + sr.len)
                     else
-                        false;
+                        false) or matchAt(matches, abs_byte);
 
                     // In non-wrap mode, skip chars before scroll_left
                     if (!wrap_enabled and buf_col < ed.scroll_left) {
@@ -393,26 +485,30 @@ pub const Renderer = struct {
         return .{ code_start, center_offset };
     }
 
+    /// Write UTF-8 `text` into cells on `row` starting at `col`, one
+    /// codepoint per cell, stopping before `max_col`. Returns the next
+    /// free column. Rendering byte-per-cell garbled any non-ASCII
+    /// filename, status message, or prompt text.
+    fn putTextUtf8(self: *Renderer, row: u16, col: u16, text: []const u8, fg: Color, max_col: u16) u16 {
+        var c = col;
+        var i: usize = 0;
+        const cap = @min(max_col, self.cols);
+        while (i < text.len and c < cap) {
+            const r = unicode.decode(text[i..]);
+            const cell = self.cellAt(row, c);
+            cell.char = r.codepoint;
+            cell.fg = fg;
+            c += 1;
+            i += r.len;
+        }
+        return c;
+    }
+
     fn renderStatusBar(self: *Renderer, ed: *const editor_mod.Editor, row: u16, theme: *const config_mod.Theme, center_offset: u16, code_end: u16) void {
         // Left: filename (aligned with code area)
-        const fname = ed.getFilename();
-        var col: u16 = center_offset;
-        for (fname) |ch| {
-            if (col >= self.cols) break;
-            const cell = self.cellAt(row, col);
-            cell.char = ch;
-            cell.fg = theme.status_fg;
-            col += 1;
-        }
+        var col = self.putTextUtf8(row, center_offset, ed.getFilename(), theme.status_fg, self.cols);
         if (ed.modified) {
-            if (col + 2 < self.cols) {
-                self.cellAt(row, col).char = ' ';
-                self.cellAt(row, col).fg = theme.status_fg;
-                col += 1;
-                self.cellAt(row, col).char = '*';
-                self.cellAt(row, col).fg = theme.status_fg;
-                col += 1;
-            }
+            col = self.putTextUtf8(row, col, " *", theme.status_fg, self.cols);
         }
 
         // Right: line:col
@@ -426,27 +522,14 @@ pub const Renderer = struct {
         const right_edge = code_end;
         if (pos_str.len < right_edge) {
             const start = right_edge - @as(u16, @intCast(pos_str.len));
-            for (pos_str, 0..) |ch, i| {
-                const c = start + @as(u16, @intCast(i));
-                if (c < self.cols) {
-                    const cell = self.cellAt(row, c);
-                    cell.char = ch;
-                    cell.fg = theme.status_fg;
-                }
-            }
+            _ = self.putTextUtf8(row, start, pos_str, theme.status_fg, self.cols);
         }
 
         // Status message (if any)
         const msg = ed.getStatusMsg();
         if (msg.len > 0) {
-            const msg_start = col + 2;
-            var mc: u16 = msg_start;
-            for (msg) |ch| {
-                if (mc >= right_edge -| @as(u16, @intCast(pos_str.len)) -| 1) break;
-                self.cellAt(row, mc).char = ch;
-                self.cellAt(row, mc).fg = theme.status_fg;
-                mc += 1;
-            }
+            const msg_cap = right_edge -| @as(u16, @intCast(pos_str.len)) -| 1;
+            _ = self.putTextUtf8(row, col + 2, msg, theme.status_fg, msg_cap);
         }
     }
 
@@ -462,13 +545,15 @@ pub const Renderer = struct {
 
         switch (ed.mode) {
             .search => {
-                const text = ed.getPromptText();
-                var col: u16 = center_offset;
-                for (text) |ch| {
-                    if (col >= self.cols) break;
-                    self.cellAt(row, col).char = ch;
-                    self.cellAt(row, col).fg = theme.fg;
-                    col += 1;
+                var col = self.putTextUtf8(row, center_offset, ed.getPromptText(), theme.fg, self.cols);
+                // Match counter, dim, two cells after the pattern.
+                if (ed.search_len > 0) {
+                    var cnt_buf: [32]u8 = undefined;
+                    const cnt = std.fmt.bufPrint(&cnt_buf, "{d}/{d}", .{
+                        ed.search_match_index,
+                        ed.search_match_count,
+                    }) catch "";
+                    col = self.putTextUtf8(row, col + 2, cnt, theme.status_fg, self.cols);
                 }
             },
             .replace => {
@@ -476,30 +561,11 @@ pub const Renderer = struct {
                 const repl_text = ed.getReplaceText();
                 var col: u16 = center_offset;
 
-                // Search text
                 const search_color = if (ed.replace_phase == .search) theme.fg else theme.status_fg;
-                for (search_text) |ch| {
-                    if (col >= self.cols) break;
-                    self.cellAt(row, col).char = ch;
-                    self.cellAt(row, col).fg = search_color;
-                    col += 1;
-                }
-                // Separator
-                const sep = " -> ";
-                for (sep) |ch| {
-                    if (col >= self.cols) break;
-                    self.cellAt(row, col).char = ch;
-                    self.cellAt(row, col).fg = theme.status_fg;
-                    col += 1;
-                }
-                // Replacement
+                col = self.putTextUtf8(row, col, search_text, search_color, self.cols);
+                col = self.putTextUtf8(row, col, " -> ", theme.status_fg, self.cols);
                 const repl_color = if (ed.replace_phase == .replacement) theme.fg else theme.status_fg;
-                for (repl_text) |ch| {
-                    if (col >= self.cols) break;
-                    self.cellAt(row, col).char = ch;
-                    self.cellAt(row, col).fg = repl_color;
-                    col += 1;
-                }
+                col = self.putTextUtf8(row, col, repl_text, repl_color, self.cols);
             },
             .command => {
                 // Draw completion matches above the prompt line
@@ -526,47 +592,20 @@ pub const Renderer = struct {
                         // Draw the match filename right-aligned to the prompt's slash position
                         const match_name = ed.completion_matches[mi][0..ed.completion_match_lens[mi]];
                         const name_start = center_offset + dir_display_len;
-                        var mc: u16 = name_start;
-                        for (match_name) |mch| {
-                            if (mc >= self.cols) break;
-                            const cl = self.cellAt(match_row, mc);
-                            cl.char = mch;
-                            cl.fg = theme.comment; // dim
-                            mc += 1;
-                        }
+                        _ = self.putTextUtf8(match_row, name_start, match_name, theme.comment, self.cols);
                     }
                 }
 
-                // Draw the prompt text
+                // Draw the prompt text, then the completion hint (grayed out)
                 const text = ed.prompt_buf[0..ed.prompt_len];
-                var col_c: u16 = center_offset;
-                for (text) |ch| {
-                    if (col_c >= self.cols) break;
-                    self.cellAt(row, col_c).char = ch;
-                    self.cellAt(row, col_c).fg = theme.fg;
-                    col_c += 1;
-                }
-
-                // Draw the completion hint (grayed out)
+                var col_c = self.putTextUtf8(row, center_offset, text, theme.fg, self.cols);
                 if (ed.completion_hint_len > 0) {
                     const hint = ed.completion_hint[0..ed.completion_hint_len];
-                    for (hint) |ch| {
-                        if (col_c >= self.cols) break;
-                        self.cellAt(row, col_c).char = ch;
-                        self.cellAt(row, col_c).fg = theme.comment;
-                        col_c += 1;
-                    }
+                    col_c = self.putTextUtf8(row, col_c, hint, theme.comment, self.cols);
                 }
             },
             .confirm => {
-                const text = ed.getPromptText();
-                var col: u16 = center_offset;
-                for (text) |ch| {
-                    if (col >= self.cols) break;
-                    self.cellAt(row, col).char = ch;
-                    self.cellAt(row, col).fg = theme.status_fg;
-                    col += 1;
-                }
+                _ = self.putTextUtf8(row, center_offset, ed.getPromptText(), theme.status_fg, self.cols);
             },
             .normal, .help => {},
         }
@@ -658,9 +697,9 @@ pub const Renderer = struct {
                     colorEq(curr.fg, prev.fg) and
                     colorEq(curr.bg, prev.bg) and
                     curr.bold == prev.bold and
-                    curr.dim == prev.dim)
+                    curr.dim == prev.dim and
+                    curr.underline == prev.underline)
                 {
-                    col += 1 - 1; // no-op, just skip
                     continue;
                 }
 
@@ -696,14 +735,18 @@ pub const Renderer = struct {
         }
 
         if (ed.mode == .search or ed.mode == .command or ed.mode == .replace) {
+            // Prompt text renders one cell per codepoint, so the
+            // hardware cursor must count codepoints, not bytes.
+            const search_cps = unicode.countCodepoints(ed.search_pattern[0..ed.search_len]);
             const prompt_col: u16 = switch (ed.mode) {
-                .search => @intCast(@min(ed.search_len, self.cols - 1)),
-                .command => @intCast(@min(ed.prompt_len, self.cols - 1)),
+                .search => @intCast(@min(search_cps, self.cols - 1)),
+                .command => @intCast(@min(unicode.countCodepoints(ed.prompt_buf[0..ed.prompt_len]), self.cols - 1)),
                 .replace => blk: {
                     if (ed.replace_phase == .search) {
-                        break :blk @intCast(@min(ed.search_len, self.cols - 1));
+                        break :blk @intCast(@min(search_cps, self.cols - 1));
                     } else {
-                        break :blk @intCast(@min(ed.search_len + 4 + ed.replace_len, self.cols - 1));
+                        const repl_cps = unicode.countCodepoints(ed.getReplaceText());
+                        break :blk @intCast(@min(search_cps + 4 + repl_cps, self.cols - 1));
                     }
                 },
                 else => 0,
@@ -741,8 +784,17 @@ pub const Renderer = struct {
         term.showCursor();
         try term.flush();
     }
-
 };
+
+/// True when `pos` falls inside any of the sorted match ranges.
+/// Early-exits on the first range starting past `pos`.
+fn matchAt(matches: []const MatchRange, pos: usize) bool {
+    for (matches) |m| {
+        if (pos < m.start) return false;
+        if (pos < m.end) return true;
+    }
+    return false;
+}
 
 fn tokenColor(tokens: []syntax_mod.Token, byte_idx: usize, theme: *const config_mod.Theme) Color {
     for (tokens) |tok| {
@@ -847,7 +899,7 @@ test "render decodes multi-byte UTF-8 into a single cell" {
     cfg.right_margin = 0;
     cfg.cursor_line_bg = false;
 
-    var ed = editor_mod.Editor.init(&cfg, std.testing.allocator);
+    var ed = try editor_mod.Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     // "# ─\n" — '#' (1) + ' ' (1) + ─ (3) + '\n' (1) = 6 bytes.
@@ -883,7 +935,7 @@ test "selection highlights character cells" {
     cfg.cursor_line_bg = false;
     cfg.trailing_whitespace = false;
 
-    var ed = editor_mod.Editor.init(&cfg, std.testing.allocator);
+    var ed = try editor_mod.Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     try ed.buf.insert(0, "hello\n");
@@ -921,7 +973,7 @@ test "selection highlight covers tab expansion" {
     cfg.trailing_whitespace = false;
     // Default tab_width is 4.
 
-    var ed = editor_mod.Editor.init(&cfg, std.testing.allocator);
+    var ed = try editor_mod.Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
     // "a\tb\n" — 'a' at vis 0, tab fills vis 1..3 (4 cells: cols 1..3),
@@ -948,4 +1000,120 @@ test "selection highlight covers tab expansion" {
     try std.testing.expect(bgEq(renderer.cellAt(0, 2).bg, sel)); // tab cell 2
     try std.testing.expect(bgEq(renderer.cellAt(0, 3).bg, sel)); // tab cell 3
     try std.testing.expect(bgEq(renderer.cellAt(0, 4).bg, sel)); // 'b'
+}
+
+test "multi-line comment stays highlighted when scrolled into" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+    cfg.word_wrap = false;
+    cfg.right_margin = 0;
+    cfg.cursor_line_bg = false;
+
+    var ed = try editor_mod.Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // A C file whose block comment opens on line 0 and never closes
+    // before the viewport (scrolled to line 2).
+    try ed.buf.insert(0, "/* opening\ninside one\ninside two\ninside three\n*/\nint x;\n");
+    ed.language = syntax_mod.detect("t.c");
+    ed.visible_cols = 40;
+    ed.visible_rows = 4;
+    ed.scroll_top = 2;
+
+    var renderer = try Renderer.init(std.testing.allocator, 4, 40);
+    defer renderer.deinit();
+
+    _ = renderer.paintFrame(&ed);
+
+    // "inside two" on the first visible row must render in the comment
+    // color, not plain fg — the opening /* is above the viewport.
+    const comment_color = cfg.theme.comment;
+    try std.testing.expect(colorEq(renderer.cellAt(0, 0).fg, comment_color));
+}
+
+test "syntax cache invalidates when the comment opener is edited away" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+    cfg.word_wrap = false;
+    cfg.right_margin = 0;
+    cfg.cursor_line_bg = false;
+
+    var ed = try editor_mod.Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "/* c\nbody\n*/\n");
+    ed.language = syntax_mod.detect("t.c");
+    ed.visible_cols = 40;
+    ed.visible_rows = 4;
+
+    var renderer = try Renderer.init(std.testing.allocator, 4, 40);
+    defer renderer.deinit();
+    _ = renderer.paintFrame(&ed);
+    try std.testing.expect(colorEq(renderer.cellAt(1, 0).fg, cfg.theme.comment));
+
+    // Delete the opening "/*" — line 1 must stop being a comment.
+    ed.buf.delete(0, 2);
+    _ = renderer.paintFrame(&ed);
+    try std.testing.expect(!colorEq(renderer.cellAt(1, 0).fg, cfg.theme.comment));
+}
+
+test "search mode highlights every visible match" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+    cfg.word_wrap = false;
+    cfg.right_margin = 0;
+    cfg.cursor_line_bg = false;
+    cfg.trailing_whitespace = false;
+
+    var ed = try editor_mod.Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "foo bar foo\n");
+    ed.visible_cols = 20;
+    ed.visible_rows = 4;
+
+    _ = ed.handleKey(.{ .ctrl = 'f' });
+    for ("foo") |c| _ = ed.handleKey(.{ .char = c });
+
+    var renderer = try Renderer.init(std.testing.allocator, 4, 20);
+    defer renderer.deinit();
+    _ = renderer.paintFrame(&ed);
+
+    const sel = cfg.theme.selection;
+    // Both occurrences tinted; the gap between them is not.
+    try std.testing.expect(colorEq(renderer.cellAt(0, 0).bg, sel));
+    try std.testing.expect(colorEq(renderer.cellAt(0, 2).bg, sel));
+    try std.testing.expect(!colorEq(renderer.cellAt(0, 4).bg, sel));
+    try std.testing.expect(colorEq(renderer.cellAt(0, 8).bg, sel));
+}
+
+test "status bar renders non-ASCII filename one codepoint per cell" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+
+    var ed = try editor_mod.Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    const name = "r\xC3\xA9sum\xC3\xA9.md"; // résumé.md
+    @memcpy(ed.filename[0..name.len], name);
+    ed.filename_len = name.len;
+    ed.visible_cols = 40;
+    ed.visible_rows = 4;
+
+    var renderer = try Renderer.init(std.testing.allocator, 4, 40);
+    defer renderer.deinit();
+    _ = renderer.paintFrame(&ed);
+
+    const status_row: u16 = 3;
+    try std.testing.expectEqual(@as(u21, 'r'), renderer.cellAt(status_row, 0).char);
+    try std.testing.expectEqual(@as(u21, 0xE9), renderer.cellAt(status_row, 1).char);
+    try std.testing.expectEqual(@as(u21, 's'), renderer.cellAt(status_row, 2).char);
 }
