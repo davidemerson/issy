@@ -4,8 +4,8 @@ class Issy < Formula
   license "BSD-3-Clause"
 
   # STABLE_BEGIN — edited by .github/scripts/bump_formula.py on tag push. Do not edit by hand.
-  url "https://github.com/davidemerson/issy/archive/refs/tags/v1.1.0.tar.gz"
-  sha256 "a5b47e9d85441d0b25bc892b9cf2bfbff49e7b375bfa181a9eb6280998c29b37"
+  url "https://github.com/davidemerson/issy/archive/refs/tags/v1.2.0.tar.gz"
+  sha256 "f102fc5fa3c7234c18b164463b01fc6bdfb4f1b2219c5296a8acb6e34955b058"
   # STABLE_END
   head "https://github.com/davidemerson/issy.git", branch: "main"
 
