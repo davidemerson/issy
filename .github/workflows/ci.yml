@@ -49,7 +49,7 @@ jobs:
           sudo apt-get install -y -qq expect
           bash tests/run_tests.sh
 
-  # Real OpenBSD smoke test — boots a 7.8 amd64 VM via QEMU/KVM and
+  # Real OpenBSD smoke test — boots a 7.9 amd64 VM via QEMU/KVM and
   # runs the full unit + integration suite on it.  Catches OpenBSD-only
   # regressions like std.fs.Dir.realpath being unsupported, raw-syscall
   # SIGKILL traps, and pkg_add fallout from zig version drift.  Cannot
@@ -61,11 +61,11 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - name: Build and test on OpenBSD 7.8
-        uses: cross-platform-actions/action@v1.0.0
+      - name: Build and test on OpenBSD 7.9
+        uses: cross-platform-actions/action@v1.3.0
         with:
           operating_system: openbsd
-          version: '7.8'
+          version: '7.9'
           architecture: x86-64
           memory: 4G
           cpu_count: 2
@@ -113,19 +113,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Zig
+        # Use the Homebrew zig@0.15 bottle rather than the upstream
+        # ziglang.org tarball: the upstream 0.15.2 binary fails to link
+        # against the current macos-latest image's libSystem
+        # ("undefined symbol: __availability_version_check" et al. —
+        # its bundled stubs predate the image's macOS version), while
+        # the bottle is built for the image and just works. This also
+        # matches what real macOS users get via the formula.
         run: |
           set -eux
-          arch=$(uname -m)
-          case "$arch" in
-            arm64)  zig_arch=aarch64 ;;
-            x86_64) zig_arch=x86_64 ;;
-            *)      echo "unsupported arch: $arch"; exit 1 ;;
-          esac
-          curl -L -o zig.tar.xz \
-            "https://ziglang.org/download/${ZIG_VERSION}/zig-${zig_arch}-macos-${ZIG_VERSION}.tar.xz"
-          mkdir -p ~/zig
-          tar xf zig.tar.xz -C ~/zig --strip-components=1
-          echo "$HOME/zig" >> $GITHUB_PATH
+          brew install zig@0.15
+          echo "$(brew --prefix zig@0.15)/bin" >> $GITHUB_PATH
       - name: Zig info
         run: zig version && zig env
       - name: Unit tests

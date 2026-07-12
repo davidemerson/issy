@@ -98,7 +98,7 @@ rebuild the tarball.
   maintainers may ask for a shared `lang/zig` consumer module
   analogous to `lang/go`. The email draft mentions this up front.
 
-- **Verified on a real OpenBSD 7.8 amd64 VM.** Issy builds with
+- **Verified on a real OpenBSD 7.9 amd64 VM.** Issy builds with
   `zig build -Doptimize=ReleaseSafe`, all 666 unit tests pass under
   `zig build test`, and all 13 PTY-based integration suites in
   `tests/run_tests.sh` (76 individual cases) pass. The VM uses
