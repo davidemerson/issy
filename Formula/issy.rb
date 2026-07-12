@@ -4,13 +4,13 @@ class Issy < Formula
   license "BSD-3-Clause"
 
   # STABLE_BEGIN — edited by .github/scripts/bump_formula.py on tag push. Do not edit by hand.
-  url "https://github.com/davidemerson/issy/archive/refs/tags/v1.2.0.tar.gz"
-  sha256 "f102fc5fa3c7234c18b164463b01fc6bdfb4f1b2219c5296a8acb6e34955b058"
+  url "https://github.com/davidemerson/issy/archive/refs/tags/v1.2.1.tar.gz"
+  sha256 "1e1c1c2d37cfb6689270ac7db3d9d9970857f3424b316090392cdc7614e738d4"
   # Commit the stable tarball was cut from. The GitHub source archive has
   # no .git, so build.zig can't derive the SHA; passing it via -Dcommit
   # stamps build_info so `issy --version` shows the real commit and the
   # update-notify check runs (a "dev" stamp would silently disable it).
-  STABLE_COMMIT = "791b440debfee07f94ba043234904491c74d3e3f".freeze
+  STABLE_COMMIT = "4d0f3796a921d03180e4d4d71e11b356a3232b7c".freeze
   # STABLE_END
   head "https://github.com/davidemerson/issy.git", branch: "main"
 
