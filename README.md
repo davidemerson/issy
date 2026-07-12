@@ -217,7 +217,7 @@ Typing, Tab, or Enter while a selection is active replaces the selection. Termin
 | Ctrl+G | Find next match |
 | Ctrl+H | Search and replace (Tab switches fields, Enter replaces next, Ctrl+A replaces all — one undo step) |
 
-Search is smart-case: all-lowercase patterns match case-insensitively, any uppercase letter makes the match exact. While the search prompt is open, every visible match is highlighted and a `current/total` counter is shown after the pattern. Each keystroke re-runs the search from the position where you pressed Ctrl+F.
+Search is smart-case: all-lowercase patterns match case-insensitively, any uppercase letter makes the match exact. While the search prompt is open, every visible match is highlighted (the one at the cursor is underlined) and a `current/total` counter is shown after the pattern; `Tab` toggles whole-word matching (shown as `[w]`). Each keystroke re-runs the search from the position where you pressed Ctrl+F.
 
 ### Files and buffers
 
@@ -230,6 +230,8 @@ Search is smart-case: all-lowercase patterns match case-insensitively, any upper
 | Ctrl+W | Same as Ctrl+Q |
 
 If the open file changes on disk (a `git pull`, another editor), the status bar shows `File changed on disk. Ctrl+R to reload.` — even while issy is idle. Opening, reloading, or starting a new buffer clears the undo history, since it refers to the previous content.
+
+While a buffer has unsaved changes, issy periodically writes them to a sibling `.<name>.swp` file (removed on save or clean exit); if you reopen a file and a leftover swap from a crashed session is found, the status bar points you to it. Turn this off with `swap_files = false`. Optional editing aids off by default: `auto_close_brackets` (type `(` to get `()` with the cursor between, wrap a selection, step over closers, delete empty pairs) and `wrap_indent` (soft-wrap continuation rows hang under the line's own indentation).
 
 ### Multi-cursor
 
@@ -303,7 +305,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full flow, the cache layout, and 
 ## Architecture, testing, man page
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — tour of the source code and the major subsystems
-- `zig build test` — 227-test unit suite (gap buffer, Unicode, tokenizer, editor operations, mouse/selection, search, update verification, etc.); each source file compiles and runs as its own test unit, so imported modules' tests re-run per unit (~1,150 test executions total)
+- `zig build test` — 246-test unit suite (gap buffer, Unicode, tokenizer, editor operations, mouse/selection, search, auto-close, swap files, update verification, hostile-input hardening, etc.); each source file compiles and runs as its own test unit, so imported modules' tests re-run per unit
 - `bash tests/run_tests.sh` — end-to-end integration suite via `expect`, launches the real binary in a PTY
 - `man ./issy.1` — man page
 

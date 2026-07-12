@@ -1,4 +1,4 @@
-.TH ISSY 1 "July 11, 2026" "issy 1.1.0" "General Commands Manual"
+.TH ISSY 1 "July 11, 2026" "issy 1.2.0" "General Commands Manual"
 .SH NAME
 issy \- a text editor that looks like a printed page
 .SH SYNOPSIS
@@ -262,11 +262,16 @@ Every visible match is highlighted while the prompt is open, and a
 match counter is shown after the pattern.
 Search is smart-case: an all-lowercase pattern matches
 case-insensitively; any uppercase letter makes the match exact.
+The match at the cursor is underlined to distinguish it from the rest.
 Press
 .B Down
 to jump to the next match,
 .B Up
 to jump to the previous one,
+.B Tab
+to toggle whole-word matching (shown as
+.I [w]
+after the counter),
 .B Enter
 to confirm the cursor position, or
 .B Escape
@@ -439,8 +444,24 @@ Copy leading whitespace from the preceding line when pressing
 .BR Enter .
 .TP
 .BR auto_close_brackets " (default: false)"
-Automatically insert a matching closing bracket or quote after an
-opening one.
+Automatically insert the matching
+.BR ) ", " ] ", " } ", " \(dq ", " '
+or backtick when you type an opener, leaving the cursor between the
+pair.
+Typing the closer when it already sits at the cursor steps over it;
+backspacing an empty pair deletes both; typing an opener with a
+selection active wraps the selection.
+Quote pairing is suppressed next to word characters so apostrophes in
+prose stay literal.
+.TP
+.BR swap_files " (default: true)"
+While the buffer has unsaved changes, periodically write them to a
+sibling
+.RI . name .swp
+file, removed on save or clean exit.
+On open, a leftover swap file from a crash is reported in the status
+bar.
+Best-effort; silent when the directory is not writable.
 .TP
 .BR auto_detect_indent " (default: true)"
 Scan the file on open to detect whether it uses tabs or spaces, and
@@ -467,12 +488,19 @@ Columns of blank space between the line numbers and the code.
 .TP
 .BR word_wrap " (default: true)"
 Soft-wrap long lines at the right margin.
-Continuation lines are indented.
+Continuation rows are indented (see
+.BR wrap_indent ).
+.TP
+.BR wrap_indent " (default: false)"
+When soft-wrapping, indent continuation rows to the wrapped line's own
+leading whitespace (a hanging indent) instead of a flat 2 columns,
+capped at half the wrap width.
 .TP
 .BR right_margin " (default: 100)"
 Column at which text stops and the remaining terminal width is left
 as empty background.
 Set to 0 to fill the terminal.
+Capped at 2000.
 .TP
 .BR cursor_line_bg " (default: true)"
 Subtly highlight the full width of the line containing the cursor.

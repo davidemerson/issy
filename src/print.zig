@@ -119,7 +119,13 @@ pub fn toPdf(ed: *editor_mod.Editor, output_path: []const u8) !void {
     const scale = @as(f32, 1000.0) / @as(f32, @floatFromInt(fnt.units_per_em));
     try pdf.writeRaw("<< /Type /FontDescriptor\n");
     try pdf.writeFmt("/FontName /{s}\n", .{font_name});
-    try pdf.writeRaw("/Flags 37\n");
+    // PDF FontDescriptor flags: bit 1 (0x01) FixedPitch — set only for
+    // monospaced fonts per the parsed `post` table — plus bit 3 (0x04)
+    // Symbolic, which is correct for Identity-H embedding. (The old
+    // hardcoded 37 also set the mutually-exclusive Nonsymbolic bit and
+    // asserted FixedPitch for every font.)
+    const flags: u32 = 0x04 | @as(u32, if (fnt.is_fixed_pitch) 0x01 else 0);
+    try pdf.writeFmt("/Flags {d}\n", .{flags});
     try pdf.writeFmt("/FontBBox [{d} {d} {d} {d}]\n", .{
         @as(i32, @intFromFloat(@as(f32, @floatFromInt(fnt.x_min)) * scale)),
         @as(i32, @intFromFloat(@as(f32, @floatFromInt(fnt.y_min)) * scale)),
@@ -257,11 +263,10 @@ pub fn toPdf(ed: *editor_mod.Editor, output_path: []const u8) !void {
     var page_obj_ids: std.ArrayList(usize) = .{};
     defer page_obj_ids.deinit(ed.allocator);
 
-    // Content width in points and continuation indent (2 spaces, mirrors TUI).
+    // Content width in points. The continuation indent is computed
+    // per line inside the page loop (mirrors the TUI's wrap_indent).
     const space_w: f32 = @max(fnt.charWidth(' ', font_size), font_size * 0.25);
     const content_w: f32 = @max(page_w - margin_left - margin_right, space_w);
-    const cont_indent_pts: f32 = space_w * 2;
-    const cont_w: f32 = @max(content_w - cont_indent_pts, space_w);
     const tw = ed.effectiveTabWidth();
     const pt = config_mod.print_theme;
 
@@ -350,15 +355,21 @@ pub fn toPdf(ed: *editor_mod.Editor, output_path: []const u8) !void {
                 tokens_line = line_num;
             }
 
+            // Per-line continuation indent (points), mirroring the TUI's
+            // wrap_indent option — a flat 2 columns by default, or hanging
+            // under the line's own leading whitespace when enabled.
+            const line_cont_pts: f32 = space_w * @as(f32, @floatFromInt(ed.continuationIndentCols(line_num)));
+            const line_cont_w: f32 = @max(content_w - line_cont_pts, space_w);
+
             var breaks: [MAX_WRAP_BREAKS]usize = undefined;
-            const break_count = computePdfWrapBreaks(&fnt, font_size, line_data, content_w, cont_w, tw, &breaks);
+            const break_count = computePdfWrapBreaks(&fnt, font_size, line_data, content_w, line_cont_w, tw, &breaks);
 
             var si: usize = sub_start_idx;
             while (si < break_count and y > margin_bottom) : (si += 1) {
                 const sub_start = breaks[si];
                 const sub_end = if (si + 1 < break_count) breaks[si + 1] else line_data.len;
 
-                const target_x: f32 = if (si == 0) margin_left else margin_left + cont_indent_pts;
+                const target_x: f32 = if (si == 0) margin_left else margin_left + line_cont_pts;
                 const dx = target_x - last_origin_x;
                 try appendFmt(&page_lines, ed.allocator, "{d:.2} {d:.2} Td\n", .{ dx, -line_height });
                 last_origin_x = target_x;
@@ -738,7 +749,7 @@ test "toPdf without a configured font errors cleanly" {
 }
 
 test "encodeGlyphs expands tabs relative to the running column" {
-    var widths = [_]i16{500};
+    var widths = [_]u16{500};
     var cmap_data = [_]u16{0} ** 65536;
     cmap_data[' '] = 0;
 

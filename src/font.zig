@@ -29,7 +29,11 @@ pub const Font = struct {
     line_gap: i16 = 0,
     cap_height: i16 = 700,
     num_glyphs: u16 = 0,
-    glyph_widths: []i16 = &.{},
+    // Advance widths are unsigned uFWORD in `hmtx`; storing them as u16
+    // keeps wide glyphs (advance > 32767 font units — legal for large
+    // unitsPerEm or wide CJK metrics) from turning negative and breaking
+    // PDF /W entries and text measurement.
+    glyph_widths: []u16 = &.{},
     cmap: []u16 = &.{},
     x_min: i16 = 0,
     y_min: i16 = 0,
@@ -161,15 +165,15 @@ pub const Font = struct {
 
         // hmtx table
         if (hmtx_off) |off| {
-            self.glyph_widths = self.allocator.alloc(i16, self.num_glyphs) catch return error.OutOfMemory;
+            self.glyph_widths = self.allocator.alloc(u16, self.num_glyphs) catch return error.OutOfMemory;
             @memset(self.glyph_widths, 0);
 
-            var last_width: i16 = 0;
+            var last_width: u16 = 0;
             var g: usize = 0;
             while (g < num_h_metrics and g < self.num_glyphs) : (g += 1) {
                 const entry_off = off + g * 4;
                 if (entry_off + 2 <= data.len) {
-                    last_width = @bitCast(readU16(data, entry_off));
+                    last_width = readU16(data, entry_off);
                     self.glyph_widths[g] = last_width;
                 }
             }
@@ -290,21 +294,36 @@ pub const Font = struct {
     /// Format 12: sequential map groups (u32 start/end char, u32 start
     /// glyph). Only the BMP portion is retained — the glyph map array is
     /// indexed by 16-bit codepoint and PDF Identity-H CIDs are 16-bit.
+    ///
+    /// Hardened against hostile fonts: `start_gid`/`start_char` come
+    /// straight from the file, so the per-glyph id is computed in u64 and
+    /// masked (an unchecked u32 add would overflow-panic in ReleaseSafe),
+    /// and the total number of cmap writes is capped at 65536 across all
+    /// groups (a font packed with full-BMP groups would otherwise burn
+    /// billions of iterations — a load-time DoS).
     fn parseCmapFormat12(self: *Font, data: []const u8, off: usize) void {
         if (off + 16 > data.len) return;
         const num_groups: usize = @intCast(readU32(data, off + 12));
+        var writes: usize = 0;
         var g: usize = 0;
-        while (g < num_groups) : (g += 1) {
+        while (g < num_groups and writes < 65536) : (g += 1) {
             const rec = off + 16 + g * 12;
             if (rec + 12 > data.len) break;
             const start_char = readU32(data, rec);
             const end_char = readU32(data, rec + 4);
             const start_gid = readU32(data, rec + 8);
-            if (start_char > end_char) continue;
+            if (start_char > end_char or start_char >= 65536) continue;
+            const hi = @min(end_char, @as(u32, 65535));
             var c = start_char;
-            while (c <= end_char and c < 65536) : (c += 1) {
-                const gid = start_gid + (c - start_char);
-                self.cmap[@intCast(c)] = @intCast(gid & 0xFFFF);
+            while (c <= hi and writes < 65536) : (c += 1) {
+                const gid: u64 = @as(u64, start_gid) + (c - start_char);
+                // Only fill a slot once; the first (lowest-codepoint)
+                // mapping wins, matching the reverse-map convention used
+                // when building the ToUnicode CMap.
+                if (self.cmap[@intCast(c)] == 0) {
+                    self.cmap[@intCast(c)] = @intCast(gid & 0xFFFF);
+                }
+                writes += 1;
             }
         }
     }
@@ -449,6 +468,29 @@ fn decodeUtf16BE(src: []const u8, dst: *[256]u8) usize {
 
 // ── Tests ──
 
+test "cmap format 12 survives a hostile start_gid and full-BMP DoS group" {
+    const cmap = try std.testing.allocator.alloc(u16, 65536);
+    defer std.testing.allocator.free(cmap);
+    @memset(cmap, 0);
+
+    var font = Font{ .allocator = std.testing.allocator, .cmap = cmap };
+
+    // Build a format-12 subtable header + one group whose startGlyphID is
+    // 0xFFFFFFFE spanning the whole BMP. An unchecked u32 add would
+    // overflow-panic; the u64 math + mask keeps it safe.
+    var buf: [16 + 12]u8 = undefined;
+    @memset(&buf, 0);
+    std.mem.writeInt(u16, buf[0..2], 12, .big); // format
+    std.mem.writeInt(u32, buf[12..16], 1, .big); // numGroups = 1
+    std.mem.writeInt(u32, buf[16..20], 0, .big); // startCharCode
+    std.mem.writeInt(u32, buf[20..24], 0xFFFF, .big); // endCharCode
+    std.mem.writeInt(u32, buf[24..28], 0xFFFFFFFE, .big); // startGlyphID
+
+    font.parseCmapFormat12(&buf, 0); // must not panic
+    const expected: u16 = @intCast((@as(u64, 0xFFFFFFFE) + 'A') & 0xFFFF);
+    try std.testing.expectEqual(expected, cmap['A']);
+}
+
 test "big-endian readers" {
     const data = [_]u8{ 0x00, 0x01, 0x00, 0x02 };
     try std.testing.expectEqual(@as(u16, 1), readU16(&data, 0));
@@ -469,7 +511,7 @@ test "load returns error for empty file" {
 
 test "font metrics calculations" {
     // Create a minimal font struct for testing
-    var widths = [_]i16{ 500, 600, 700 };
+    var widths = [_]u16{ 500, 600, 700 };
     var cmap_data = [_]u16{0} ** 65536;
     cmap_data['A'] = 1;
     cmap_data['B'] = 2;

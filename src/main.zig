@@ -294,6 +294,9 @@ pub fn main() !void {
         const now = std.time.milliTimestamp();
         if (now - last_stat_check > 1000) {
             if (ed.checkFileChanged()) needs_redraw = true;
+            // Periodically autosave unsaved changes to a swap file so a
+            // crash or SIGKILL doesn't lose them (throttled internally).
+            ed.maybeAutosaveSwap();
             // Config auto-reload: if ~/.issyrc (or --config path) has a
             // newer mtime than what we last loaded, reread it and
             // reapply CLI overrides. Failure is silent — the editor
@@ -352,8 +355,10 @@ pub fn main() !void {
         switch (ed.handleKey(key)) {
             .quit, .force_quit => {
                 // Remember where the cursor was so the next open of
-                // this file drops the caret back in place.
+                // this file drops the caret back in place, and drop the
+                // swap file — this is a clean exit, not a crash.
                 ed.persistCursor();
+                ed.removeSwap();
                 break;
             },
             .export_pdf => {

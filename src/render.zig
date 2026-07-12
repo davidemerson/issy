@@ -127,17 +127,17 @@ pub const Renderer = struct {
     fn collectViewportMatches(self: *Renderer, ed: *editor_mod.Editor, out: *[256]MatchRange) []const MatchRange {
         if (ed.mode != .search and ed.mode != .replace) return out[0..0];
         if (ed.search_len == 0) return out[0..0];
-        const pattern = ed.search_pattern[0..ed.search_len];
-        const ic = ed.searchIgnoreCase();
+        const plen = ed.search_len;
         const first = ed.buf.getLine(ed.scroll_top) orelse return out[0..0];
         // Upper bound on bytes that can appear on screen.
         const limit = @min(ed.buf.logicalLen(), first.start + @as(usize, self.rows) * 8192);
         var pos = first.start;
         var n: usize = 0;
         while (n < out.len) {
-            const p = ed.buf.find(pattern, pos, ic) orelse break;
+            // Same smart-case + whole-word rules as the editor's search.
+            const p = ed.findMatch(pos) orelse break;
             if (p >= limit) break;
-            out[n] = .{ .start = p, .end = p + pattern.len };
+            out[n] = .{ .start = p, .end = p + plen };
             n += 1;
             pos = p + 1;
         }
@@ -194,7 +194,6 @@ pub const Renderer = struct {
         const status_row = if (self.rows > 0) self.rows - 1 else 0;
         const content_rows: u16 = if (self.rows > 1) self.rows - 1 else 1;
         const wrap_enabled = ed.config.word_wrap;
-        const cont_indent: u16 = if (wrap_enabled) 2 else 0;
 
         // Resolve the active selection once per frame. Each cell-write
         // checks `abs_byte` against this range and applies the
@@ -204,6 +203,18 @@ pub const Renderer = struct {
         // Search-match highlighting (search/replace mode only).
         var match_buf: [256]MatchRange = undefined;
         const matches = self.collectViewportMatches(ed, &match_buf);
+        // The match at the cursor (search jumps land the cursor on the
+        // match start) is underlined to distinguish it from the rest.
+        const cursor_abs: usize = if (ed.buf.getLine(ed.cursor.line)) |ci|
+            ci.start + @min(ed.cursor.col, ci.len)
+        else
+            0;
+        const cur_match: ?MatchRange = blk: {
+            for (matches) |m| {
+                if (m.start == cursor_abs) break :blk m;
+            }
+            break :blk null;
+        };
 
         // Syntax-state cache maintenance: a language change resets it, an
         // edit invalidates from the edited line down.
@@ -253,9 +264,16 @@ pub const Renderer = struct {
             var buf_col: usize = 0;
             var visual_sub_line: usize = 0;
 
+            // Per-line continuation indent (respects the wrap_indent
+            // hanging-indent option); 0 when wrapping is off.
+            const line_cont_indent: u16 = if (wrap_enabled)
+                @intCast(@min(ed.continuationIndentCols(file_line), std.math.maxInt(u16)))
+            else
+                0;
+
             while (screen_row < content_rows) {
                 const is_first_visual = (visual_sub_line == 0);
-                const this_indent: u16 = if (is_first_visual) 0 else cont_indent;
+                const this_indent: u16 = if (is_first_visual) 0 else line_cont_indent;
 
                 // Determine how many buffer columns this sub-line spans
                 const sub_end_col: usize = if (visual_sub_line + 1 < wrap_break_count)
@@ -297,6 +315,7 @@ pub const Renderer = struct {
                         const cell = self.cellAt(screen_row, indicator_col);
                         cell.char = 0x2194; // ↔
                         cell.fg = theme.wrap_indicator;
+                        cell.dim = true;
                     }
                 }
 
@@ -335,6 +354,12 @@ pub const Renderer = struct {
                         (abs_byte >= sr.start and abs_byte < sr.start + sr.len)
                     else
                         false) or matchAt(matches, abs_byte);
+                    // The search match at the cursor gets an underline so
+                    // the live match reads differently from the others.
+                    const in_cur = if (cur_match) |cm|
+                        (abs_byte >= cm.start and abs_byte < cm.end)
+                    else
+                        false;
 
                     // In non-wrap mode, skip chars before scroll_left
                     if (!wrap_enabled and buf_col < ed.scroll_left) {
@@ -356,6 +381,7 @@ pub const Renderer = struct {
                             const cell = self.cellAt(screen_row, col);
                             cell.char = ' ';
                             if (in_sel) cell.bg = theme.selection;
+                            if (in_cur) cell.underline = true;
                             col += 1;
                         }
                         buf_col += spaces;
@@ -365,6 +391,7 @@ pub const Renderer = struct {
                             cell.char = ch;
                             cell.fg = tokenColor(tokens, byte_idx, theme);
                             if (in_sel) cell.bg = theme.selection;
+                            if (in_cur) cell.underline = true;
                             col += 1;
                         }
                         buf_col += 1;
@@ -375,6 +402,7 @@ pub const Renderer = struct {
                             cell.char = '.';
                             cell.fg = tokenColor(tokens, byte_idx, theme);
                             if (in_sel) cell.bg = theme.selection;
+                            if (in_cur) cell.underline = true;
                             col += 1;
                         }
                         buf_col += 1;
@@ -390,6 +418,7 @@ pub const Renderer = struct {
                             cell.char = r.codepoint;
                             cell.fg = tokenColor(tokens, byte_idx, theme);
                             if (in_sel) cell.bg = theme.selection;
+                            if (in_cur) cell.underline = true;
                             col += 1;
                         }
                         buf_col += 1;
@@ -409,7 +438,7 @@ pub const Renderer = struct {
                         const bp_visual = ed.byteColToVisualCol(file_line, bp.col);
                         if (bp_visual >= row_start_buf_col and bp_visual < buf_col) {
                             const offset = bp_visual - row_start_buf_col;
-                            const bracket_screen_col = code_start + this_indent + @as(u16, @intCast(@min(offset, std.math.maxInt(u16))));
+                            const bracket_screen_col = screenColSat(code_start + this_indent, offset);
                             if (bracket_screen_col < code_end) {
                                 self.cellAt(screen_row, bracket_screen_col).bg = theme.selection;
                             }
@@ -432,7 +461,7 @@ pub const Renderer = struct {
                         // Highlight trailing whitespace cells on this row
                         if (stripped.len >= row_start_buf_col) {
                             const tw_start_offset = stripped.len - row_start_buf_col;
-                            var tw_col = code_start + this_indent + @as(u16, @intCast(@min(tw_start_offset, std.math.maxInt(u16))));
+                            var tw_col = screenColSat(code_start + this_indent, tw_start_offset);
                             while (tw_col < col and tw_col < code_end) : (tw_col += 1) {
                                 self.cellAt(screen_row, tw_col).bg = theme.trailing_ws;
                             }
@@ -448,7 +477,7 @@ pub const Renderer = struct {
                         const cursor_visual = ed.byteColToVisualCol(file_line, cursor.col);
                         if (cursor_visual >= row_start_buf_col and cursor_visual < buf_col) {
                             const offset = cursor_visual - row_start_buf_col;
-                            const mc_col = code_start + this_indent + @as(u16, @intCast(@min(offset, std.math.maxInt(u16))));
+                            const mc_col = screenColSat(code_start + this_indent, offset);
                             if (mc_col < self.cols) {
                                 const cell = self.cellAt(screen_row, mc_col);
                                 const tmp_fg = cell.fg;
@@ -490,6 +519,13 @@ pub const Renderer = struct {
     /// free column. Rendering byte-per-cell garbled any non-ASCII
     /// filename, status message, or prompt text.
     fn putTextUtf8(self: *Renderer, row: u16, col: u16, text: []const u8, fg: Color, max_col: u16) u16 {
+        return self.putTextAttr(row, col, text, fg, max_col, false);
+    }
+
+    /// As `putTextUtf8`, plus an optional `dim` attribute for text that
+    /// should recede (completion hints, the match counter, the wrap
+    /// indicator) — rendered via the terminal's real dim SGR.
+    fn putTextAttr(self: *Renderer, row: u16, col: u16, text: []const u8, fg: Color, max_col: u16, dim: bool) u16 {
         var c = col;
         var i: usize = 0;
         const cap = @min(max_col, self.cols);
@@ -498,6 +534,7 @@ pub const Renderer = struct {
             const cell = self.cellAt(row, c);
             cell.char = r.codepoint;
             cell.fg = fg;
+            cell.dim = dim;
             c += 1;
             i += r.len;
         }
@@ -505,6 +542,14 @@ pub const Renderer = struct {
     }
 
     fn renderStatusBar(self: *Renderer, ed: *const editor_mod.Editor, row: u16, theme: *const config_mod.Theme, center_offset: u16, code_end: u16) void {
+        // Fill the status row with the themeable status background. On the
+        // default/paper themes this equals the editor bg (the "no stripe"
+        // rule), but a custom theme can now tint the status line.
+        var bgc: u16 = 0;
+        while (bgc < self.cols) : (bgc += 1) {
+            self.cellAt(row, bgc).bg = theme.status_bg;
+        }
+
         // Left: filename (aligned with code area)
         var col = self.putTextUtf8(row, center_offset, ed.getFilename(), theme.status_fg, self.cols);
         if (ed.modified) {
@@ -553,7 +598,10 @@ pub const Renderer = struct {
                         ed.search_match_index,
                         ed.search_match_count,
                     }) catch "";
-                    col = self.putTextUtf8(row, col + 2, cnt, theme.status_fg, self.cols);
+                    col = self.putTextAttr(row, col + 2, cnt, theme.status_fg, self.cols, true);
+                    if (ed.search_whole_word) {
+                        col = self.putTextAttr(row, col + 1, "[w]", theme.status_fg, self.cols, true);
+                    }
                 }
             },
             .replace => {
@@ -601,7 +649,7 @@ pub const Renderer = struct {
                 var col_c = self.putTextUtf8(row, center_offset, text, theme.fg, self.cols);
                 if (ed.completion_hint_len > 0) {
                     const hint = ed.completion_hint[0..ed.completion_hint_len];
-                    col_c = self.putTextUtf8(row, col_c, hint, theme.comment, self.cols);
+                    col_c = self.putTextAttr(row, col_c, hint, theme.comment, self.cols, true);
                 }
             },
             .confirm => {
@@ -685,6 +733,9 @@ pub const Renderer = struct {
 
         var last_fg: Color = .default;
         var last_bg: Color = .default;
+        var last_bold = false;
+        var last_dim = false;
+        var last_underline = false;
 
         var row: u16 = 0;
         while (row < self.rows) : (row += 1) {
@@ -704,6 +755,20 @@ pub const Renderer = struct {
                 }
 
                 term.moveCursor(row, col);
+
+                // Text attributes are sticky SGR state and can only be
+                // turned off with a full reset, which also clears color —
+                // so when any attribute changes, reset and re-apply
+                // everything for this cell.
+                if (curr.bold != last_bold or curr.dim != last_dim or curr.underline != last_underline) {
+                    term.resetStyle();
+                    last_fg = .default;
+                    last_bg = .default;
+                    term.setAttr(curr.bold, curr.dim, curr.underline, false);
+                    last_bold = curr.bold;
+                    last_dim = curr.dim;
+                    last_underline = curr.underline;
+                }
 
                 if (!colorEq(curr.fg, last_fg)) {
                     term.setFg(curr.fg);
@@ -765,7 +830,7 @@ pub const Renderer = struct {
             // Column within sub-line — must be in visual cols, not byte
             // cols, or the cursor drifts on tab-bearing lines.
             const col_in_sub = ed.cursorVisualColInSubLine();
-            const indent: u16 = if (sub > 0) 2 else 0;
+            const indent: u16 = if (sub > 0) @intCast(@min(ed.continuationIndentCols(ed.cursor.line), std.math.maxInt(u16))) else 0;
             term.moveCursor(
                 @min(vis_row, self.rows -| 1),
                 code_start + indent + @as(u16, @intCast(@min(col_in_sub, std.math.maxInt(u16)))),
@@ -785,6 +850,16 @@ pub const Renderer = struct {
         try term.flush();
     }
 };
+
+/// `base + offset` clamped into u16. On a single line wider than 65535
+/// visual columns, a bracket match or secondary cursor far out would
+/// otherwise overflow the `u16 + u16` and panic in a safe build; the
+/// clamp lands it at the last column instead (then the caller's
+/// `< code_end` bound drops it, which is correct — it's off-screen).
+fn screenColSat(base: u16, offset: usize) u16 {
+    const sum = @as(usize, base) + offset;
+    return @intCast(@min(sum, std.math.maxInt(u16)));
+}
 
 /// True when `pos` falls inside any of the sorted match ranges.
 /// Early-exits on the first range starting past `pos`.
@@ -1116,4 +1191,57 @@ test "status bar renders non-ASCII filename one codepoint per cell" {
     try std.testing.expectEqual(@as(u21, 'r'), renderer.cellAt(status_row, 0).char);
     try std.testing.expectEqual(@as(u21, 0xE9), renderer.cellAt(status_row, 1).char);
     try std.testing.expectEqual(@as(u21, 's'), renderer.cellAt(status_row, 2).char);
+}
+
+test "current search match is underlined, others are not" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+    cfg.word_wrap = false;
+    cfg.right_margin = 0;
+    cfg.cursor_line_bg = false;
+    cfg.trailing_whitespace = false;
+
+    var ed = try editor_mod.Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "foo bar foo\n");
+    ed.visible_cols = 20;
+    ed.visible_rows = 4;
+
+    _ = ed.handleKey(.{ .ctrl = 'f' });
+    for ("foo") |c| _ = ed.handleKey(.{ .char = c });
+    // Incremental search anchors the cursor at the first "foo" (col 0).
+    try std.testing.expectEqual(@as(usize, 0), ed.cursor.col);
+
+    var renderer = try Renderer.init(std.testing.allocator, 4, 20);
+    defer renderer.deinit();
+    _ = renderer.paintFrame(&ed);
+
+    // First "foo" (cols 0-2) is the current match → underlined.
+    try std.testing.expect(renderer.cellAt(0, 0).underline);
+    try std.testing.expect(renderer.cellAt(0, 2).underline);
+    // The second "foo" (cols 8-10) is a match but not current → not underlined.
+    try std.testing.expect(!renderer.cellAt(0, 8).underline);
+}
+
+test "status row is filled with the status background" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    // Give the status bar a distinct background to prove it is applied.
+    cfg.theme.status_bg = .{ .rgb = .{ .r = 0x22, .g = 0x00, .b = 0x00 } };
+
+    var ed = try editor_mod.Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+    ed.visible_cols = 20;
+    ed.visible_rows = 4;
+
+    var renderer = try Renderer.init(std.testing.allocator, 4, 20);
+    defer renderer.deinit();
+    _ = renderer.paintFrame(&ed);
+
+    const status_row: u16 = 3;
+    try std.testing.expect(colorEq(renderer.cellAt(status_row, 0).bg, cfg.theme.status_bg));
+    try std.testing.expect(colorEq(renderer.cellAt(status_row, 19).bg, cfg.theme.status_bg));
 }

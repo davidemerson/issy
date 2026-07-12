@@ -26,9 +26,11 @@ Blank lines and lines starting with `#` are ignored. Unknown keys are silently s
 | `tab_width` | integer | `4` | Number of spaces per tab stop. Valid range 1–8; values outside it are ignored. |
 | `expand_tabs` | bool | `true` | Insert spaces instead of tab characters |
 | `line_numbers` | bool | `true` | Show line numbers in the gutter |
-| `word_wrap` | bool | `true` | Soft-wrap long lines at the right margin. Continuation lines are indented 2 spaces. The buffer is not modified. |
+| `word_wrap` | bool | `true` | Soft-wrap long lines at the right margin. The buffer is not modified. |
+| `wrap_indent` | bool | `false` | When soft-wrapping, indent continuation rows to the wrapped line's own leading whitespace (a hanging indent) instead of a flat 2 columns. Capped at half the wrap width. |
 | `auto_indent` | bool | `true` | Copy leading whitespace when pressing Enter |
-| `auto_close_brackets` | bool | `false` | Automatically insert matching bracket/quote pairs |
+| `auto_close_brackets` | bool | `false` | Automatically insert the matching `)`, `]`, `}`, `"`, `'`, or `` ` `` when you type an opener, leaving the cursor between the pair. Typing the closer when it already sits at the cursor steps over it; backspacing an empty pair deletes both; and typing an opener with text selected wraps the selection. Quote pairing is suppressed next to word characters (so apostrophes in prose stay literal). |
+| `swap_files` | bool | `true` | While a buffer has unsaved changes, periodically write them to a sibling `.<name>.swp` file; it is removed on save or clean exit. On open, a leftover swap (from a crash) is reported in the status bar. Best-effort — silent when the directory isn't writable. |
 | `auto_detect_indent` | bool | `true` | Scan file on open to detect tabs vs spaces and width |
 | `trailing_whitespace` | bool | `true` | Faintly highlight trailing spaces/tabs on non-empty lines |
 | `indent_mismatch` | bool | `true` | Faintly highlight leading indent that doesn't match the detected file style |
@@ -40,7 +42,7 @@ Blank lines and lines starting with `#` are ignored. Unknown keys are silently s
 |-----|------|---------|-------------|
 | `gutter_padding` | integer | `3` | Spaces between line numbers and code. Valid range 0–32. |
 | `left_padding` | integer | `2` | Spaces before line numbers. Valid range 0–32. |
-| `right_margin` | integer | `100` | Soft right margin -- code stops here, rest is empty background. `0` fills the terminal width. |
+| `right_margin` | integer | `100` | Soft right margin -- code stops here, rest is empty background. `0` fills the terminal width. Capped at 2000. |
 | `cursor_line_bg` | bool | `true` | Subtle full-width highlight on the current line |
 | `cursor_style` | string | `bar` | Terminal cursor shape: `bar`, `block`, or `underline` |
 

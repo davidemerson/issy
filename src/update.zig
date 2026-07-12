@@ -254,21 +254,23 @@ fn downloadAndStage(
     try verifyManifestSignature(manifest, sig_bytes);
 
     // 3a. Bind the manifest to the release we believe we're updating to.
-    // A signed manifest naming a different commit than the fetched
-    // commit.txt means the two files came from different releases.
-    if (manifestHeaderField(manifest, commit_header)) |mc| {
-        if (mc.len < 40 or !std.mem.eql(u8, mc[0..40], latest_commit)) {
-            return error.ManifestCommitMismatch;
-        }
+    // The commit header is mandatory (CI always emits it): a signed
+    // manifest with no commit binding, or one naming a different commit
+    // than the fetched commit.txt, is rejected. Requiring it — rather
+    // than only checking when present — closes the first-contact replay
+    // window where a validly-signed pre-header release could be served.
+    const mc = manifestHeaderField(manifest, commit_header) orelse return error.ManifestMissingCommit;
+    if (mc.len < 40 or !std.mem.eql(u8, mc[0..40], latest_commit)) {
+        return error.ManifestCommitMismatch;
     }
 
-    // 3b. Anti-rollback: a signed manifest with an epoch older than the
-    // newest epoch we've ever accepted is a replayed old release —
-    // authentic, but stale. Once an epoch has been seen, every future
-    // manifest must carry one that is >= it.
+    // 3b. Anti-rollback: the epoch header is likewise mandatory. A
+    // manifest with an epoch older than the newest we've ever accepted
+    // is a replayed old release — authentic, but stale. Once an epoch
+    // is seen, every future manifest must carry one that is >= it.
     const epoch_path = try std.fmt.allocPrint(allocator, "{s}/manifest_epoch.txt", .{cache_dir});
     defer allocator.free(epoch_path);
-    const new_epoch = manifestEpoch(manifest);
+    const new_epoch = manifestEpoch(manifest) orelse return error.ManifestMissingEpoch;
     const cached_epoch = readCachedEpoch(epoch_path);
     if (!epochAllows(cached_epoch, new_epoch)) return error.RollbackDetected;
 
@@ -289,12 +291,14 @@ fn downloadAndStage(
     Sha256.hash(binary, &actual_hash, .{});
     if (!std.mem.eql(u8, &actual_hash, &expected_hash)) return error.HashMismatch;
 
-    // 7. Atomic write: staged.tmp → chmod +x → rename to staged.
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}/issy.staged.tmp", .{cache_dir});
-    defer allocator.free(tmp_path);
+    // 7. Atomic write: unique staged.tmp → chmod +x → rename to staged.
     const final_path = try std.fmt.allocPrint(allocator, "{s}/issy.staged", .{cache_dir});
     defer allocator.free(final_path);
+    var tmp_buf: [std.fs.max_path_bytes + 48]u8 = undefined;
+    const tmp_path = try uniqueTmpPath(&tmp_buf, final_path);
 
+    var staged_ok = false;
+    defer if (!staged_ok) std.fs.cwd().deleteFile(tmp_path) catch {};
     {
         const f = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true, .mode = 0o755 });
         defer f.close();
@@ -311,13 +315,14 @@ fn downloadAndStage(
     defer allocator.free(sig_path);
     try writeAtomic(manifest_path, manifest);
     try writeAtomic(sig_path, sig_bytes);
-    if (new_epoch) |ne| {
+    {
         var epoch_buf: [32]u8 = undefined;
-        const epoch_str = std.fmt.bufPrint(&epoch_buf, "{d}", .{ne}) catch unreachable;
+        const epoch_str = std.fmt.bufPrint(&epoch_buf, "{d}", .{new_epoch}) catch unreachable;
         try writeAtomic(epoch_path, epoch_str);
     }
 
     try std.fs.cwd().rename(tmp_path, final_path);
+    staged_ok = true;
 }
 
 /// Return the trimmed value following a `key` header line in the
@@ -430,17 +435,28 @@ fn httpGet(
     return out;
 }
 
-/// Atomic file write: create a `.tmp` sibling, write, rename.
-fn writeAtomic(path: []const u8, content: []const u8) !void {
-    var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = try std.fmt.bufPrint(&tmp_path_buf, "{s}.tmp", .{path});
+/// Write a per-process-unique temp path for `path` into `buf` and return
+/// the slice: `<path>.tmp.<pid>.<ns>`. Two concurrent editors or update
+/// workers would otherwise truncate the same fixed `.tmp` sibling and
+/// corrupt each other's in-flight writes before the rename.
+fn uniqueTmpPath(buf: []u8, path: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}.tmp.{d}.{d}", .{ path, std.c.getpid(), std.time.nanoTimestamp() });
+}
 
+/// Atomic file write: create a unique `.tmp` sibling, write, rename.
+fn writeAtomic(path: []const u8, content: []const u8) !void {
+    var tmp_path_buf: [std.fs.max_path_bytes + 48]u8 = undefined;
+    const tmp_path = try uniqueTmpPath(&tmp_path_buf, path);
+
+    var ok = false;
+    defer if (!ok) std.fs.cwd().deleteFile(tmp_path) catch {};
     {
         const f = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
         defer f.close();
         try f.writeAll(content);
     }
     try std.fs.cwd().rename(tmp_path, path);
+    ok = true;
 }
 
 // ── Phase 3: in-session re-exec ──
@@ -522,9 +538,11 @@ pub fn apply(
     };
 
     // Write resume file before touching the binary, so if anything goes
-    // wrong we haven't broken the running instance.
+    // wrong we haven't broken the running instance. The name carries the
+    // pid so two instances applying in the same second don't collide on
+    // one path (and clobber/double-delete each other's record).
     const now_ns = std.time.nanoTimestamp();
-    const resume_path = std.fmt.allocPrint(allocator, "{s}/resume.{d}.txt", .{ cache_dir, @as(i64, @intCast(@divTrunc(now_ns, std.time.ns_per_s))) }) catch return ApplyError.OutOfMemory;
+    const resume_path = std.fmt.allocPrint(allocator, "{s}/resume.{d}.{d}.txt", .{ cache_dir, std.c.getpid(), @as(i64, @intCast(@divTrunc(now_ns, std.time.ns_per_s))) }) catch return ApplyError.OutOfMemory;
     defer allocator.free(resume_path);
 
     writeResumeFile(resume_path, ed, now_ns) catch return ApplyError.ResumeWriteFailed;
@@ -571,8 +589,8 @@ pub fn apply(
 }
 
 fn writeResumeFile(path: []const u8, ed: *const editor_mod.Editor, now_ns: i128) !void {
-    var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = try std.fmt.bufPrint(&tmp_path_buf, "{s}.tmp", .{path});
+    var tmp_path_buf: [std.fs.max_path_bytes + 48]u8 = undefined;
+    const tmp_path = try uniqueTmpPath(&tmp_path_buf, path);
 
     const f = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
     defer f.close();
@@ -654,11 +672,30 @@ fn writePrevChecksum(allocator: std.mem.Allocator, cache_dir: []const u8, src: [
 ///   - file mtime must match the recorded value (otherwise the file was
 ///     edited externally between apply and restore, and the cursor
 ///     position would be stale)
+/// True only if `path` is inside `$HOME/.cache/issy` and its basename
+/// looks like a resume record (`resume.*.txt`). Guards `tryResume`
+/// against deleting or reading an arbitrary user-supplied path.
+fn isResumePathSafe(path: []const u8) bool {
+    const home = std.posix.getenv("HOME") orelse return false;
+    var prefix_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&prefix_buf, "{s}/.cache/issy/", .{home}) catch return false;
+    if (!std.mem.startsWith(u8, path, prefix)) return false;
+    const base = path[prefix.len..];
+    // No further path separators — must be a direct child of the dir.
+    if (std.mem.indexOfScalar(u8, base, '/') != null) return false;
+    return std.mem.startsWith(u8, base, "resume.") and std.mem.endsWith(u8, base, ".txt");
+}
+
 pub fn tryResume(
     ed: *editor_mod.Editor,
     resume_path: []const u8,
 ) void {
-    defer std.fs.cwd().deleteFile(resume_path) catch {};
+    // `--resume` is an internal re-exec flag, but nothing stops a user
+    // from passing an arbitrary path. Refuse to touch anything outside
+    // the cache dir so `issy --resume ~/notes.txt file.c` can never
+    // delete ~/notes.txt. Only a validated resume record is deleted
+    // (below), never an unrelated or malformed file.
+    if (!isResumePathSafe(resume_path)) return;
 
     const f = std.fs.cwd().openFile(resume_path, .{}) catch return;
     defer f.close();
@@ -672,6 +709,10 @@ pub fn tryResume(
     if (version_line.len < 2 or version_line[0] != 'v') return;
     const version = std.fmt.parseInt(u32, version_line[1..], 10) catch return;
     if (version != resume_file_version) return;
+
+    // From here the file is a recognizable resume record (correct
+    // version header), so removing it on the way out is safe.
+    defer std.fs.cwd().deleteFile(resume_path) catch {};
 
     const created_str = lines.next() orelse return;
     const created_ns = std.fmt.parseInt(i128, std.mem.trim(u8, created_str, " \r\t"), 10) catch return;
@@ -871,4 +912,36 @@ test "epoch anti-rollback decisions" {
     // pre-epoch release looks like.
     try std.testing.expect(!epochAllows(100, 99));
     try std.testing.expect(!epochAllows(100, null));
+}
+
+test "isResumePathSafe only accepts cache-dir resume records" {
+    const home = std.posix.getenv("HOME") orelse return error.SkipZigTest;
+    var buf: [1024]u8 = undefined;
+
+    const good = try std.fmt.bufPrint(&buf, "{s}/.cache/issy/resume.123.456.txt", .{home});
+    try std.testing.expect(isResumePathSafe(good));
+
+    // A user file outside the cache dir must be rejected (the bug this
+    // guards: `issy --resume ~/notes.txt` must not delete notes.txt).
+    var b2: [1024]u8 = undefined;
+    const outside = try std.fmt.bufPrint(&b2, "{s}/notes.txt", .{home});
+    try std.testing.expect(!isResumePathSafe(outside));
+
+    // Right dir, wrong name.
+    var b3: [1024]u8 = undefined;
+    const wrong_name = try std.fmt.bufPrint(&b3, "{s}/.cache/issy/positions.txt", .{home});
+    try std.testing.expect(!isResumePathSafe(wrong_name));
+
+    // Path traversal out of the cache dir is rejected (no nested slash).
+    var b4: [1024]u8 = undefined;
+    const traversal = try std.fmt.bufPrint(&b4, "{s}/.cache/issy/sub/resume.1.2.txt", .{home});
+    try std.testing.expect(!isResumePathSafe(traversal));
+}
+
+test "downloadAndStage rejects a manifest missing the commit/epoch headers" {
+    // manifestHeaderField/manifestEpoch return null when absent, which the
+    // mandatory-header logic turns into an error. Verify the primitives.
+    const no_headers = "abc  issy-linux-amd64\n";
+    try std.testing.expectEqual(@as(?[]const u8, null), manifestHeaderField(no_headers, commit_header));
+    try std.testing.expectEqual(@as(?u64, null), manifestEpoch(no_headers));
 }

@@ -21,9 +21,8 @@ pub const Cursor = struct {
     line: usize = 0,
     col: usize = 0,
     col_want: usize = 0,
-    sel_active: bool = false,
-    sel_anchor_line: usize = 0,
-    sel_anchor_col: usize = 0,
+    // Selection state lives on the Editor (a single active selection),
+    // not per-cursor — secondary cursors carry only a position.
 };
 
 const UndoEntry = struct {
@@ -73,6 +72,9 @@ pub const Editor = struct {
     /// the match at/before the cursor. Shown in the search prompt.
     search_match_count: usize = 0,
     search_match_index: usize = 0,
+    /// Whole-word matching: only match when the pattern is bounded by
+    /// non-word characters. Toggled with Tab in search mode.
+    search_whole_word: bool = false,
 
     replace_buf: [256]u8 = undefined,
     replace_len: usize = 0,
@@ -127,6 +129,10 @@ pub const Editor = struct {
     // insertNewline/insertTab skip their auto-indent and tab-expansion
     // logic so already-formatted pasted content comes in verbatim.
     in_paste: bool = false,
+
+    // Swap-file autosave: timestamp of the last swap write, so the main
+    // loop's 1/sec tick can throttle writes while the buffer is dirty.
+    last_swap_ms: i64 = 0,
 
     // Coalesced-undo state. A run of consecutive word-char inserts,
     // each arriving within COALESCE_WINDOW_MS of the previous one at
@@ -190,7 +196,10 @@ pub const Editor = struct {
 
         // If we're replacing an existing file's buffer, remember where
         // the cursor was so the next open of that same file restores.
+        // Open is only reached with a clean buffer, so its swap (if any)
+        // is stale — drop it before switching away.
         self.persistCursor();
+        self.removeSwap();
 
         // Missing file → open as an empty new buffer bound to that
         // filename. This makes `issy newdoc.md` behave like a "create
@@ -239,6 +248,8 @@ pub const Editor = struct {
         self.scroll_top = 0;
         self.scroll_left = 0;
 
+        self.last_swap_ms = 0;
+
         if (is_new_file) {
             self.setStatusMessage("New file.");
             return;
@@ -253,6 +264,9 @@ pub const Editor = struct {
         } else {
             self.restoreCursorFromPositions();
         }
+
+        // Warn if a swap file from a previous crashed session is present.
+        self.notifySwapIfPresent();
     }
 
     /// Resolve `self.filename` to an absolute path into `buf` and
@@ -289,6 +303,75 @@ pub const Editor = struct {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const abs = self.absFilename(&path_buf) orelse return;
         positions_mod.record(abs, self.cursor.line, self.cursor.col);
+    }
+
+    // ── Swap-file autosave ──
+
+    /// Minimum interval between swap writes while dirty.
+    const SWAP_INTERVAL_MS: i64 = 2000;
+
+    /// Build the sibling swap path `.<basename>.swp` for the current
+    /// file into `buf`. Returns null if there's no filename or it
+    /// doesn't fit. Placing the swap in the file's own directory keeps
+    /// it discoverable and co-located, matching the vim convention.
+    fn swapPath(self: *const Editor, buf: []u8) ?[]const u8 {
+        if (self.filename_len == 0) return null;
+        const fname = self.filename[0..self.filename_len];
+        const slash = std.mem.lastIndexOfScalar(u8, fname, '/');
+        const dir = if (slash) |s| fname[0 .. s + 1] else "";
+        const base = if (slash) |s| fname[s + 1 ..] else fname;
+        const needed = dir.len + 1 + base.len + 4; // "." + base + ".swp"
+        if (needed > buf.len or base.len == 0) return null;
+        var n: usize = 0;
+        @memcpy(buf[n..][0..dir.len], dir);
+        n += dir.len;
+        buf[n] = '.';
+        n += 1;
+        @memcpy(buf[n..][0..base.len], base);
+        n += base.len;
+        @memcpy(buf[n..][0..4], ".swp");
+        n += 4;
+        return buf[0..n];
+    }
+
+    /// Write the current buffer contents to the swap file if autosave is
+    /// on, the buffer is dirty, and at least SWAP_INTERVAL_MS has passed
+    /// since the last write. Best-effort; any error is ignored.
+    pub fn maybeAutosaveSwap(self: *Editor) void {
+        if (!self.config.swap_files or !self.modified or self.filename_len == 0) return;
+        const now = std.time.milliTimestamp();
+        if (now - self.last_swap_ms < SWAP_INTERVAL_MS) return;
+        self.last_swap_ms = now;
+
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = self.swapPath(&buf) orelse return;
+        const contents = self.buf.contents(self.allocator) catch return;
+        defer self.allocator.free(contents);
+        const file = std.fs.cwd().createFile(path, .{ .truncate = true }) catch return;
+        defer file.close();
+        file.writeAll(contents) catch {};
+    }
+
+    /// Remove the swap file for the current buffer. Called on save, clean
+    /// quit, new buffer, and before switching files.
+    pub fn removeSwap(self: *const Editor) void {
+        if (self.filename_len == 0) return;
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = self.swapPath(&buf) orelse return;
+        std.fs.cwd().deleteFile(path) catch {};
+    }
+
+    /// If a swap file exists for the just-opened file (left by a crash),
+    /// surface it in the status bar. We deliberately don't auto-load it —
+    /// that would be surprising — but the user is told where it is.
+    fn notifySwapIfPresent(self: *Editor) void {
+        if (!self.config.swap_files or self.filename_len == 0) return;
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = self.swapPath(&buf) orelse return;
+        std.fs.cwd().access(path, .{}) catch return;
+        var msg_buf: [std.fs.max_path_bytes + 48]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "Recovered edits may exist in {s}", .{path}) catch "Recovered edits swap file exists.";
+        self.setStatusMessage(msg);
     }
 
     fn restoreCursorFromPositions(self: *Editor) void {
@@ -651,7 +734,11 @@ pub const Editor = struct {
                 return .redraw;
             },
             'a' => {
-                // Select all
+                // Select all. Clear any extra cursors first: a later
+                // edit must not take the multi-cursor path against
+                // secondaries whose byte positions are stale after the
+                // whole-buffer selection is deleted.
+                self.cursors.clearRetainingCapacity();
                 self.sel_active = true;
                 self.sel_anchor_line = 0;
                 self.sel_anchor_col = 0;
@@ -757,6 +844,12 @@ pub const Editor = struct {
                 self.findNext();
                 return .redraw;
             },
+            .tab => {
+                // Toggle whole-word matching and re-run from the origin.
+                self.search_whole_word = !self.search_whole_word;
+                self.incrementalSearch();
+                return .redraw;
+            },
             .ctrl => |c| {
                 // Ctrl+G advances the match without leaving search mode,
                 // matching its normal-mode binding.
@@ -793,10 +886,8 @@ pub const Editor = struct {
             self.ensureCursorVisible();
             return;
         }
-        const pattern = self.search_pattern[0..self.search_len];
-        const ic = self.searchIgnoreCase();
         const origin = self.cursorBytePos();
-        const found = self.buf.find(pattern, origin, ic) orelse self.buf.find(pattern, 0, ic);
+        const found = self.findMatch(origin) orelse self.findMatch(0);
         if (found) |pos| {
             self.repositionCursorToBytePos(pos);
         }
@@ -849,6 +940,7 @@ pub const Editor = struct {
                             };
                             self.modified = false;
                             self.updateMtime();
+                            self.removeSwap();
                             self.persistCursor();
                             self.setStatusMessage("Saved.");
                         }
@@ -938,6 +1030,7 @@ pub const Editor = struct {
         self.file_changed_on_disk = false;
         self.modified = false;
         self.updateMtime();
+        self.removeSwap(); // reloaded from disk; unsaved edits discarded
         const max_line = if (self.buf.lineCount() > 0) self.buf.lineCount() - 1 else 0;
         self.cursor.line = @min(self.cursor.line, max_line);
         self.clampCursorCol();
@@ -1041,7 +1134,8 @@ pub const Editor = struct {
 
         var line_tmp: [8192]u8 = undefined;
         const data = self.buf.contiguousSlice(info.start, @min(line_len, 8192), &line_tmp);
-        const cont_w = if (w > 2) w - 2 else 1;
+        const cont_indent = self.continuationIndentCols(line);
+        const cont_w = if (w > cont_indent) w - cont_indent else 1;
         const tw = self.effectiveTabWidth();
 
         // Single forward scan tracking (byte_offset, visual_col) per
@@ -1581,8 +1675,14 @@ pub const Editor = struct {
                 self.scroll_left -= 1;
                 scrolled = true;
             } else if (col >= max_col) {
-                self.scroll_left += 1;
-                scrolled = true;
+                // Cap at the longest visual column of the current line so
+                // a right-edge drag on a short line doesn't scroll the
+                // view off into empty space unboundedly.
+                const line_visual = self.byteColToVisualCol(self.cursor.line, self.currentLineLen());
+                if (self.scroll_left < line_visual) {
+                    self.scroll_left += 1;
+                    scrolled = true;
+                }
             }
         }
 
@@ -1693,7 +1793,7 @@ pub const Editor = struct {
             const c_offset = self.centerOffset();
             const gutter_width = self.gutterWidth();
             const code_start = c_offset + gutter_width;
-            const cont_indent: u16 = if (sub_line > 0) 2 else 0;
+            const cont_indent: u16 = if (sub_line > 0) @intCast(@min(self.continuationIndentCols(file_line), std.math.maxInt(u16))) else 0;
             const total_col_offset = code_start + cont_indent;
 
             const sub_start_visual = self.byteColToVisualCol(file_line, breaks[sub_line]);
@@ -1782,6 +1882,30 @@ pub const Editor = struct {
             self.visible_cols;
         if (code_end > gw) return code_end - gw;
         return 1;
+    }
+
+    /// Visual-column indent applied to soft-wrap continuation rows of
+    /// `line`. Defaults to a flat 2 columns; with `wrap_indent` on, it
+    /// hangs under the line's own leading whitespace (indent + 2),
+    /// capped at half the wrap width so content always has room.
+    pub fn continuationIndentCols(self: *Editor, line: usize) usize {
+        const base: usize = 2;
+        if (!self.config.wrap_indent) return base;
+        const info = self.buf.getLine(line) orelse return base;
+        var tmp: [256]u8 = undefined;
+        const data = self.buf.contiguousSlice(info.start, @min(info.len, 256), &tmp);
+        const tw = self.effectiveTabWidth();
+        var visual: usize = 0;
+        for (data) |c| {
+            if (c == ' ') {
+                visual += 1;
+            } else if (c == '\t') {
+                visual += tw - (visual % tw);
+            } else break;
+        }
+        const w = self.wrapWidth();
+        const cap = if (w > 4) w / 2 else 1;
+        return @min(visual + base, cap);
     }
 
     /// How many visual (screen) rows a buffer line occupies when wrapped.
@@ -1917,34 +2041,40 @@ pub const Editor = struct {
             // With wrapping, horizontal scroll is disabled
             self.scroll_left = 0;
 
-            // Vertical: count visual rows from scroll_top to cursor
-            // First, make sure scroll_top <= cursor.line
+            const visible = @as(usize, self.visible_rows) -| 1; // -1 for status bar
+
+            // Scroll up: if the cursor's line starts above scroll_top,
+            // pull scroll_top up to it (minus the margin).
             if (self.cursor.line < self.scroll_top) {
                 self.scroll_top = if (self.cursor.line > margin) self.cursor.line - margin else 0;
             }
 
-            // Count visual rows from scroll_top to cursor line
-            const visible = @as(usize, self.visible_rows) -| 1; // -1 for status bar
-            var visual_rows: usize = 0;
-            var line = self.scroll_top;
-            while (line < self.cursor.line) : (line += 1) {
-                visual_rows += self.visualLinesForBufferLine(line);
-                if (visual_rows >= visible) break;
-            }
-            // Add cursor's sub-line within its wrapped line
-            visual_rows += self.cursorVisualSubLine();
-
-            if (visual_rows >= visible -| margin) {
-                // Scroll down: advance scroll_top until cursor fits
-                while (self.scroll_top < self.cursor.line) {
-                    var vr: usize = 0;
-                    var l = self.scroll_top;
-                    while (l <= self.cursor.line) : (l += 1) {
-                        vr += self.visualLinesForBufferLine(l);
-                    }
-                    if (vr <= visible) break;
-                    self.scroll_top += 1;
+            // Scroll down: advance scroll_top just until the cursor's
+            // visual row sits within the viewport. Rather than the old
+            // O(distance^2) rescan (which froze for seconds on a
+            // goto-line deep into a large wrapped file), walk visual
+            // rows from the cursor UPWARD, counting how many buffer lines
+            // fit above it in `visible` rows — that line becomes the new
+            // scroll_top. Cost is O(rows on screen), independent of how
+            // far the jump was.
+            const cursor_sub = self.cursorVisualSubLine();
+            if (self.cursor.line >= self.scroll_top) {
+                // Rows consumed by the cursor's own sub-line position.
+                var used: usize = cursor_sub + 1;
+                var top = self.cursor.line;
+                // Keep a small margin of context above the cursor when
+                // possible by treating the budget as `visible - margin`.
+                const budget = visible -| @min(margin, visible -| 1);
+                while (top > self.scroll_top) {
+                    const prev = top - 1;
+                    const add = self.visualLinesForBufferLine(prev);
+                    if (used + add > budget) break;
+                    used += add;
+                    top = prev;
                 }
+                // Only push scroll_top down (never up here); the scroll-up
+                // branch above already handles the cursor-above case.
+                if (top > self.scroll_top) self.scroll_top = top;
             }
         } else {
             // Non-wrapping mode: original logic
@@ -1956,14 +2086,19 @@ pub const Editor = struct {
                 self.scroll_top = self.cursor.line -| (visible -| margin -| 1);
             }
 
-            // Horizontal
+            // Horizontal. scroll_left is a VISUAL column threshold
+            // (render.zig and screenToBufferPos both treat it that way),
+            // so convert the cursor's byte column to its visual column
+            // before comparing — otherwise a tab- or multibyte-bearing
+            // line scrolls too far and the cursor drifts off its glyph.
             const gw = self.gutterWidth();
             const code_cols = if (self.visible_cols > gw) @as(usize, self.visible_cols - gw) else 1;
-            if (self.cursor.col < self.scroll_left) {
-                self.scroll_left = self.cursor.col;
+            const cursor_visual = self.byteColToVisualCol(self.cursor.line, self.cursor.col);
+            if (cursor_visual < self.scroll_left) {
+                self.scroll_left = cursor_visual;
             }
-            if (self.cursor.col >= self.scroll_left + code_cols) {
-                self.scroll_left = self.cursor.col - code_cols + 1;
+            if (cursor_visual >= self.scroll_left + code_cols) {
+                self.scroll_left = cursor_visual - code_cols + 1;
             }
         }
     }
@@ -1975,9 +2110,58 @@ pub const Editor = struct {
         return line_info.start + @min(self.cursor.col, line_info.len);
     }
 
+    /// The auto-close partner for an opening bracket/quote, or null.
+    fn autoCloseFor(cp: u21) ?u8 {
+        return switch (cp) {
+            '(' => ')',
+            '[' => ']',
+            '{' => '}',
+            '"' => '"',
+            '\'' => '\'',
+            '`' => '`',
+            else => null,
+        };
+    }
+
+    fn isCloser(cp: u21) bool {
+        return cp == ')' or cp == ']' or cp == '}' or cp == '"' or cp == '\'' or cp == '`';
+    }
+
+    /// True when auto-close should fire for `cp` at the current single
+    /// cursor: the feature is on, there are no extra cursors, and — for a
+    /// quote — the neighbours aren't word characters (so an apostrophe in
+    /// "don't" or before/inside a word isn't turned into a pair).
+    fn shouldAutoClose(self: *Editor, cp: u21) bool {
+        if (!self.config.auto_close_brackets) return false;
+        if (self.cursors.items.len != 0) return false;
+        const close = autoCloseFor(cp) orelse return false;
+        const is_quote = (close == cp);
+        const pos = self.cursorBytePos();
+        const total = self.buf.logicalLen();
+        // Don't pair when the next char is a word/quote char (e.g. typing
+        // before an identifier), which would strand a dangling closer.
+        if (pos < total) {
+            const nb = self.buf.byteAt(pos);
+            if (isWordChar(nb)) return false;
+            if (is_quote and nb == @as(u8, @intCast(cp))) return false;
+        }
+        if (is_quote and pos > 0) {
+            const pb = self.buf.byteAt(pos - 1);
+            if (isWordChar(pb)) return false; // apostrophe in a word
+        }
+        return true;
+    }
+
     fn insertCodepoint(self: *Editor, cp: u21) void {
         var enc: [4]u8 = undefined;
         const len = unicode.encode(cp, &enc);
+
+        // Auto-close: wrapping an active selection, skipping over an
+        // existing closer, or inserting a fresh pair. Handled before the
+        // normal insert path and only for the single-cursor case.
+        if (self.config.auto_close_brackets and self.cursors.items.len == 0) {
+            if (self.autoCloseHandle(cp)) return;
+        }
 
         if (self.sel_active) self.deleteSelection();
 
@@ -2009,6 +2193,75 @@ pub const Editor = struct {
         self.last_insert_ms = 0;
         self.last_insert_was_word = false;
         self.updateBracketMatch();
+    }
+
+    /// Auto-close handling for a single cursor. Returns true if it fully
+    /// handled the keystroke (so insertCodepoint should stop). Covers:
+    ///   1. Wrap an active selection in the typed bracket/quote pair.
+    ///   2. Type a closer that already sits at the cursor → step over it.
+    ///   3. Type an opener in a valid context → insert the matching pair
+    ///      and leave the cursor between them.
+    fn autoCloseHandle(self: *Editor, cp: u21) bool {
+        // 1. Surround an active selection with the pair, then re-select
+        // the original (now-wrapped) text.
+        if (self.sel_active) {
+            const close = autoCloseFor(cp) orelse return false;
+            const sel = self.getSelectionRange() orelse return false;
+            if (sel.len == 0) return false;
+            const group = self.nextUndoGroupId();
+            const open_byte: u8 = @intCast(cp);
+            // Insert closer first (its offset stays valid while we then
+            // insert the opener earlier), as one undo group.
+            self.pushUndoGrouped(sel.start + sel.len, null, 1, group);
+            self.buf.insert(sel.start + sel.len, &.{close}) catch return false;
+            self.pushUndoGrouped(sel.start, null, 1, group);
+            self.buf.insert(sel.start, &.{open_byte}) catch return false;
+            self.modified = true;
+            // Re-select the inner text: it now spans [start+1, start+1+len).
+            const inner_start = self.bytePosToLineCol(sel.start + 1);
+            const inner_end = self.bytePosToLineCol(sel.start + 1 + sel.len);
+            self.sel_anchor_line = inner_start.line;
+            self.sel_anchor_col = inner_start.col;
+            self.cursor.line = inner_end.line;
+            self.cursor.col = inner_end.col;
+            self.cursor.col_want = self.cursor.col;
+            self.sel_active = true;
+            self.last_insert_ms = 0;
+            self.ensureCursorVisible();
+            self.updateBracketMatch();
+            return true;
+        }
+
+        const pos = self.cursorBytePos();
+        const total = self.buf.logicalLen();
+
+        // 2. Step over an existing closer.
+        if (isCloser(cp) and pos < total and self.buf.byteAt(pos) == @as(u8, @intCast(cp))) {
+            self.cursor.col += 1;
+            self.cursor.col_want = self.cursor.col;
+            self.last_insert_ms = 0;
+            self.ensureCursorVisible();
+            self.updateBracketMatch();
+            return true;
+        }
+
+        // 3. Insert a fresh pair.
+        if (self.shouldAutoClose(cp)) {
+            const close = autoCloseFor(cp).?;
+            const open_byte: u8 = @intCast(cp);
+            self.pushUndo(pos, null, 2);
+            self.buf.insert(pos, &.{ open_byte, close }) catch return false;
+            self.cursor.col += 1; // between the pair
+            self.cursor.col_want = self.cursor.col;
+            self.modified = true;
+            self.last_insert_ms = 0;
+            self.last_insert_was_word = false;
+            self.ensureCursorVisible();
+            self.updateBracketMatch();
+            return true;
+        }
+
+        return false;
     }
 
     fn insertNewline(self: *Editor) void {
@@ -2098,6 +2351,33 @@ pub const Editor = struct {
         if (self.cursors.items.len == 0) {
             // Fast path: single cursor.
             if (self.cursor.col == 0 and self.cursor.line == 0) return;
+
+            // Auto-close: backspacing between an empty pair (cursor sits
+            // just after an opener whose matching closer is right at the
+            // cursor) deletes both, as one undo step.
+            if (self.config.auto_close_brackets and self.cursor.col > 0) {
+                const pos = self.cursorBytePos();
+                if (pos > 0 and pos < self.buf.logicalLen()) {
+                    const before = self.buf.byteAt(pos - 1);
+                    const after = self.buf.byteAt(pos);
+                    if (autoCloseFor(before)) |close| {
+                        if (after == close) {
+                            const group = self.nextUndoGroupId();
+                            self.pushUndoGrouped(pos, self.allocator.dupe(u8, &.{after}) catch return, 0, group);
+                            self.buf.delete(pos, 1);
+                            self.cursor.col -= 1;
+                            const p2 = self.cursorBytePos();
+                            self.pushUndoGrouped(p2, self.allocator.dupe(u8, &.{before}) catch return, 0, group);
+                            self.buf.delete(p2, 1);
+                            self.cursor.col_want = self.cursor.col;
+                            self.modified = true;
+                            self.ensureCursorVisible();
+                            self.updateBracketMatch();
+                            return;
+                        }
+                    }
+                }
+            }
 
             if (self.cursor.col == 0) {
                 // Join with previous line
@@ -2402,6 +2682,10 @@ pub const Editor = struct {
         self.cursor.col = lc.col;
         self.cursor.col_want = lc.col;
         self.ensureCursorVisible();
+        // Refresh the bracket-match highlight: this is the shared landing
+        // point for undo/redo, search jumps, and paste, none of which
+        // otherwise re-evaluate it, leaving a stale highlight behind.
+        self.updateBracketMatch();
     }
 
     // ── Search ──
@@ -2415,14 +2699,34 @@ pub const Editor = struct {
         return true;
     }
 
-    fn findNext(self: *Editor) void {
-        if (self.search_len == 0) return;
+    /// Find the current search pattern at or after `from`, honoring the
+    /// smart-case and whole-word toggles. Public so the renderer can use
+    /// the same match rules when highlighting the viewport.
+    pub fn findMatch(self: *Editor, from: usize) ?usize {
+        if (self.search_len == 0) return null;
         const pattern = self.search_pattern[0..self.search_len];
         const ic = self.searchIgnoreCase();
-        const start_pos = self.cursorBytePos() + 1;
+        var pos = from;
+        while (self.buf.find(pattern, pos, ic)) |p| {
+            if (!self.search_whole_word or self.isWholeWordAt(p, pattern.len)) return p;
+            pos = p + 1;
+        }
+        return null;
+    }
 
-        const found = self.buf.find(pattern, start_pos, ic) orelse
-            self.buf.find(pattern, 0, ic); // wrap around
+    /// A match at [start, start+len) is a whole word when the bytes just
+    /// outside it are not word characters (or the buffer edge).
+    fn isWholeWordAt(self: *Editor, start: usize, len: usize) bool {
+        if (start > 0 and isWordChar(self.buf.byteAt(start - 1))) return false;
+        const after = start + len;
+        if (after < self.buf.logicalLen() and isWordChar(self.buf.byteAt(after))) return false;
+        return true;
+    }
+
+    fn findNext(self: *Editor) void {
+        if (self.search_len == 0) return;
+        const found = self.findMatch(self.cursorBytePos() + 1) orelse
+            self.findMatch(0); // wrap around
         if (found) |pos| {
             self.repositionCursorToBytePos(pos);
         }
@@ -2431,8 +2735,6 @@ pub const Editor = struct {
 
     fn findPrev(self: *Editor) void {
         if (self.search_len == 0) return;
-        const pattern = self.search_pattern[0..self.search_len];
-        const ic = self.searchIgnoreCase();
         const cur = self.cursorBytePos();
 
         // Scan forward collecting the last match before the cursor;
@@ -2440,7 +2742,7 @@ pub const Editor = struct {
         var last: ?usize = null;
         var pos: usize = 0;
         var wrapped: ?usize = null;
-        while (self.buf.find(pattern, pos, ic)) |p| {
+        while (self.findMatch(pos)) |p| {
             if (p < cur) last = p;
             wrapped = p;
             pos = p + 1;
@@ -2458,11 +2760,9 @@ pub const Editor = struct {
         self.search_match_count = 0;
         self.search_match_index = 0;
         if (self.search_len == 0) return;
-        const pattern = self.search_pattern[0..self.search_len];
-        const ic = self.searchIgnoreCase();
         const cur = self.cursorBytePos();
         var pos: usize = 0;
-        while (self.buf.find(pattern, pos, ic)) |p| {
+        while (self.findMatch(pos)) |p| {
             self.search_match_count += 1;
             if (p <= cur) self.search_match_index = self.search_match_count;
             pos = p + 1;
@@ -2500,7 +2800,6 @@ pub const Editor = struct {
         if (self.search_len == 0) return;
         const pattern = self.search_pattern[0..self.search_len];
         const replacement = self.replace_buf[0..self.replace_len];
-        const ic = self.searchIgnoreCase();
         var count: usize = 0;
 
         // All replacements share one undo group so Ctrl+Z reverts the
@@ -2510,7 +2809,7 @@ pub const Editor = struct {
         const group_id = self.nextUndoGroupId();
 
         var pos: usize = 0;
-        while (self.buf.find(pattern, pos, ic)) |p| {
+        while (self.findMatch(pos)) |p| {
             var tmp: [256]u8 = undefined;
             const slice = self.buf.contiguousSlice(p, pattern.len, &tmp);
             const saved = self.allocator.dupe(u8, slice) catch break;
@@ -2873,6 +3172,7 @@ pub const Editor = struct {
         self.modified = false;
         self.updateMtime();
         self.file_changed_on_disk = false;
+        self.removeSwap(); // buffer is clean; no unsaved edits to protect
         // Re-detect syntax from the (possibly renamed) filename so
         // `:w foo.py` after opening `foo.txt` picks up Python highlighting.
         self.language = syntax_mod.detect(self.filename[0..self.filename_len]);
@@ -2990,9 +3290,12 @@ pub const Editor = struct {
     }
 
     fn newBuffer(self: *Editor) void {
+        // Only reached when the outgoing buffer is clean; drop its swap.
+        self.removeSwap();
         self.buf.deinit();
         self.buf = buffer_mod.Buffer.init(self.allocator) catch return;
         self.clearUndoState();
+        self.last_swap_ms = 0;
         self.filename_len = 0;
         self.modified = false;
         self.cursor = .{};
@@ -4601,4 +4904,249 @@ test "oversize copy stays internal-only and says so" {
     try std.testing.expectEqual(term.osc52_max_bytes + 1, ed.clipboard.?.len);
     // …and the user is told the system clipboard was skipped.
     try std.testing.expect(std.mem.indexOf(u8, ed.getStatusMsg(), "too large") != null);
+}
+
+test "ensureCursorVisible far wrap jump is fast and lands the cursor on screen" {
+    var cfg = config_mod.Config.init();
+    cfg.word_wrap = true;
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // 20k lines, each long enough to wrap a few times at width 40.
+    var line: [200]u8 = undefined;
+    @memset(&line, 'x');
+    line[199] = '\n';
+    var i: usize = 0;
+    while (i < 20000) : (i += 1) try ed.buf.insert(ed.buf.logicalLen(), &line);
+
+    ed.visible_rows = 40;
+    ed.visible_cols = 40;
+    ed.config.right_margin = 0;
+
+    // Jump to the very end. The old O(distance^2) rescan froze here for
+    // seconds; this must complete effectively instantly and leave the
+    // cursor line at or after scroll_top (i.e. actually on screen).
+    ed.cursor.line = 19999;
+    ed.cursor.col = 0;
+    ed.ensureCursorVisible();
+    try std.testing.expect(ed.scroll_top <= ed.cursor.line);
+    try std.testing.expect(ed.cursor.line - ed.scroll_top < ed.visible_rows);
+}
+
+test "select-all clears extra cursors" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    for ("aa aa aa") |c| _ = ed.handleKey(.{ .char = c });
+    ed.cursor.line = 0;
+    ed.cursor.col = 0;
+    _ = ed.handleKey(.{ .ctrl = 'd' });
+    _ = ed.handleKey(.{ .ctrl = 'd' });
+    try std.testing.expect(ed.cursors.items.len > 0);
+
+    _ = ed.handleKey(.{ .ctrl = 'a' });
+    try std.testing.expectEqual(@as(usize, 0), ed.cursors.items.len);
+
+    // Typing now replaces the whole selection with a single char.
+    _ = ed.handleKey(.{ .char = 'Z' });
+    var tmp: [16]u8 = undefined;
+    const got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
+    try std.testing.expectEqualStrings("Z", got);
+}
+
+test "scroll_left tracks visual columns on a tab-bearing long line" {
+    var cfg = config_mod.Config.init();
+    cfg.word_wrap = false;
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // A line of tabs then text; put the cursor far right and shrink the
+    // viewport so horizontal scroll engages.
+    try ed.buf.insert(0, "\t\t\t\t\t\t\t\t\t\tHELLO WORLD LONG TAIL\n");
+    ed.visible_cols = 20;
+    ed.visible_rows = 6;
+    ed.cursor.line = 0;
+    ed.cursor.col = ed.currentLineLen();
+    ed.ensureCursorVisible();
+
+    // scroll_left is a visual column; with tab_width 4 the 10 leading
+    // tabs alone are 40 visual columns, so scroll_left must exceed the
+    // raw byte column would-be value and stay within the line's visual
+    // width.
+    const line_visual = ed.byteColToVisualCol(0, ed.currentLineLen());
+    try std.testing.expect(ed.scroll_left <= line_visual);
+    try std.testing.expect(ed.scroll_left > ed.currentLineLen());
+}
+
+test "auto_close inserts a matching pair with the cursor between" {
+    var cfg = config_mod.Config.init();
+    cfg.auto_close_brackets = true;
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    _ = ed.handleKey(.{ .char = '(' });
+    var tmp: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("()", ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp));
+    try std.testing.expectEqual(@as(usize, 1), ed.cursor.col); // between
+
+    // Typing the closer steps over the existing one instead of adding.
+    _ = ed.handleKey(.{ .char = ')' });
+    try std.testing.expectEqualStrings("()", ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp));
+    try std.testing.expectEqual(@as(usize, 2), ed.cursor.col);
+}
+
+test "auto_close undoes the pair in one step" {
+    var cfg = config_mod.Config.init();
+    cfg.auto_close_brackets = true;
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    _ = ed.handleKey(.{ .char = '{' });
+    _ = ed.handleKey(.{ .ctrl = 'z' });
+    try std.testing.expectEqual(@as(usize, 0), ed.buf.logicalLen());
+}
+
+test "auto_close backspace between empty pair deletes both" {
+    var cfg = config_mod.Config.init();
+    cfg.auto_close_brackets = true;
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    _ = ed.handleKey(.{ .char = '[' });
+    _ = ed.handleKey(.backspace);
+    try std.testing.expectEqual(@as(usize, 0), ed.buf.logicalLen());
+    try std.testing.expectEqual(@as(usize, 0), ed.cursor.col);
+}
+
+test "auto_close does not pair a quote inside a word" {
+    var cfg = config_mod.Config.init();
+    cfg.auto_close_brackets = true;
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    for ("don") |c| _ = ed.handleKey(.{ .char = c });
+    _ = ed.handleKey(.{ .char = '\'' }); // apostrophe after a word char
+    var tmp: [8]u8 = undefined;
+    // No auto-pair: just the apostrophe.
+    try std.testing.expectEqualStrings("don'", ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp));
+}
+
+test "auto_close surrounds an active selection" {
+    var cfg = config_mod.Config.init();
+    cfg.auto_close_brackets = true;
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "hello");
+    ed.cursor.line = 0;
+    ed.cursor.col = 0;
+    _ = ed.handleKey(.{ .ctrl = 'a' }); // select all "hello"
+    _ = ed.handleKey(.{ .char = '(' });
+
+    var tmp: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("(hello)", ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp));
+    // Inner text re-selected.
+    try std.testing.expect(ed.sel_active);
+    const sr = ed.getSelectionRange().?;
+    try std.testing.expectEqual(@as(usize, 1), sr.start);
+    try std.testing.expectEqual(@as(usize, 5), sr.len);
+}
+
+test "auto_close off by default leaves a plain insert" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+    _ = ed.handleKey(.{ .char = '(' });
+    var tmp: [4]u8 = undefined;
+    try std.testing.expectEqualStrings("(", ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp));
+}
+
+test "whole-word search toggle bounds matches at word edges" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "in inside pin in\n");
+    _ = ed.handleKey(.{ .ctrl = 'f' });
+    for ("in") |c| _ = ed.handleKey(.{ .char = c });
+    // Substring mode: "in", "in"(side), "in"(p... no), matches: in(0), in(3 inside), (pin has 'in' at 11), in(14) => 4
+    try std.testing.expectEqual(@as(usize, 4), ed.search_match_count);
+
+    // Tab toggles whole-word: only the two standalone "in" tokens match.
+    _ = ed.handleKey(.tab);
+    try std.testing.expect(ed.search_whole_word);
+    try std.testing.expectEqual(@as(usize, 2), ed.search_match_count);
+    // Cursor re-anchored on the first standalone "in" (col 0).
+    try std.testing.expectEqual(@as(usize, 0), ed.cursor.col);
+}
+
+test "wrap_indent hangs continuation under the line's own indentation" {
+    var cfg = config_mod.Config.init();
+    cfg.word_wrap = true;
+    cfg.wrap_indent = true;
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // A line indented 4 spaces that wraps.
+    try ed.buf.insert(0, "    aaaa bbbb cccc dddd eeee ffff gggg hhhh\n");
+    ed.visible_cols = 20;
+    ed.visible_rows = 6;
+    ed.config.right_margin = 0;
+
+    // Continuation indent for this line = 4 (indent) + 2 (base) = 6,
+    // capped at wrapWidth/2 (10) → 6.
+    try std.testing.expectEqual(@as(usize, 6), ed.continuationIndentCols(0));
+
+    // Default (off) is a flat 2.
+    ed.config.wrap_indent = false;
+    try std.testing.expectEqual(@as(usize, 2), ed.continuationIndentCols(0));
+}
+
+test "swap file writes while dirty and is removed on save" {
+    var cfg = config_mod.Config.init();
+    cfg.swap_files = true;
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = try std.posix.getcwd(&cwd_buf);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const fpath = try std.fmt.bufPrint(&path_buf, "{s}/.zig-cache/tmp/{s}/note.txt", .{ cwd, &tmp.sub_path });
+
+    @memcpy(ed.filename[0..fpath.len], fpath);
+    ed.filename_len = fpath.len;
+
+    for ("hello") |c| _ = ed.handleKey(.{ .char = c });
+    try std.testing.expect(ed.modified);
+
+    // Force a swap write (bypass the interval throttle).
+    ed.last_swap_ms = 0;
+    ed.maybeAutosaveSwap();
+
+    var swap_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const swap = ed.swapPath(&swap_buf).?;
+    // Swap basename is ".note.txt.swp" in the same dir.
+    try std.testing.expect(std.mem.endsWith(u8, swap, "/.note.txt.swp"));
+    std.fs.cwd().access(swap, .{}) catch return error.SwapNotWritten;
+
+    // Saving removes it.
+    ed.save();
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(swap, .{}));
+}
+
+test "swap path is null without a filename" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    try std.testing.expectEqual(@as(?[]const u8, null), ed.swapPath(&buf));
 }

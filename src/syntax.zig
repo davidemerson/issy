@@ -56,7 +56,6 @@ pub const Language = struct {
     multi_comment_start: ?[]const u8,
     multi_comment_end: ?[]const u8,
     string_delimiters: []const u8,
-    has_char_literals: bool,
     preprocessor_prefix: ?u8,
     /// Optional leading character that introduces a "command" token
     /// (`\` in TeX/LaTeX). When set, a run of `<prefix><letter>+` is
@@ -686,7 +685,6 @@ pub const languages = [_]Language{
         .multi_comment_start = "/*",
         .multi_comment_end = "*/",
         .string_delimiters = "\"'",
-        .has_char_literals = true,
         .preprocessor_prefix = '#',
     },
     .{
@@ -698,7 +696,6 @@ pub const languages = [_]Language{
         .multi_comment_start = "/*",
         .multi_comment_end = "*/",
         .string_delimiters = "\"'",
-        .has_char_literals = true,
         .preprocessor_prefix = '#',
     },
     .{
@@ -710,7 +707,6 @@ pub const languages = [_]Language{
         .multi_comment_start = null,
         .multi_comment_end = null,
         .string_delimiters = "\"",
-        .has_char_literals = false,
         .preprocessor_prefix = null,
         .line_string_prefix = "\\\\",
     },
@@ -723,7 +719,6 @@ pub const languages = [_]Language{
         .multi_comment_start = null,
         .multi_comment_end = null,
         .string_delimiters = "\"'",
-        .has_char_literals = false,
         .preprocessor_prefix = null,
         .triple_quote_strings = true,
     },
@@ -736,7 +731,6 @@ pub const languages = [_]Language{
         .multi_comment_start = "/*",
         .multi_comment_end = "*/",
         .string_delimiters = "\"'",
-        .has_char_literals = false,
         .preprocessor_prefix = null,
         .backtick_multiline = true,
     },
@@ -749,7 +743,6 @@ pub const languages = [_]Language{
         .multi_comment_start = "/*",
         .multi_comment_end = "*/",
         .string_delimiters = "\"'",
-        .has_char_literals = false,
         .preprocessor_prefix = null,
         .backtick_multiline = true,
     },
@@ -762,7 +755,6 @@ pub const languages = [_]Language{
         .multi_comment_start = "/*",
         .multi_comment_end = "*/",
         .string_delimiters = "\"",
-        .has_char_literals = true,
         .preprocessor_prefix = null,
     },
     .{
@@ -774,7 +766,6 @@ pub const languages = [_]Language{
         .multi_comment_start = "/*",
         .multi_comment_end = "*/",
         .string_delimiters = "\"'`",
-        .has_char_literals = true,
         .preprocessor_prefix = null,
     },
     .{
@@ -789,7 +780,6 @@ pub const languages = [_]Language{
         .multi_comment_start = null,
         .multi_comment_end = null,
         .string_delimiters = "\"'",
-        .has_char_literals = false,
         .preprocessor_prefix = null,
     },
     .{
@@ -801,7 +791,6 @@ pub const languages = [_]Language{
         .multi_comment_start = "<!--",
         .multi_comment_end = "-->",
         .string_delimiters = "\"'",
-        .has_char_literals = false,
         .preprocessor_prefix = null,
     },
     .{
@@ -813,7 +802,6 @@ pub const languages = [_]Language{
         .multi_comment_start = "/*",
         .multi_comment_end = "*/",
         .string_delimiters = "\"'",
-        .has_char_literals = false,
         .preprocessor_prefix = null,
     },
     .{
@@ -825,7 +813,6 @@ pub const languages = [_]Language{
         .multi_comment_start = null,
         .multi_comment_end = null,
         .string_delimiters = "\"",
-        .has_char_literals = false,
         .preprocessor_prefix = null,
     },
     .{
@@ -837,7 +824,6 @@ pub const languages = [_]Language{
         .multi_comment_start = null,
         .multi_comment_end = null,
         .string_delimiters = "\"'",
-        .has_char_literals = false,
         .preprocessor_prefix = null,
     },
     .{
@@ -849,7 +835,6 @@ pub const languages = [_]Language{
         .multi_comment_start = null,
         .multi_comment_end = null,
         .string_delimiters = "\"'",
-        .has_char_literals = false,
         .preprocessor_prefix = null,
     },
     .{
@@ -872,7 +857,6 @@ pub const languages = [_]Language{
         .multi_comment_start = null,
         .multi_comment_end = null,
         .string_delimiters = "\"'",
-        .has_char_literals = false,
         .preprocessor_prefix = null,
     },
     .{
@@ -884,7 +868,6 @@ pub const languages = [_]Language{
         .multi_comment_start = null,
         .multi_comment_end = null,
         .string_delimiters = "\"'",
-        .has_char_literals = false,
         .preprocessor_prefix = null,
     },
     .{
@@ -896,7 +879,6 @@ pub const languages = [_]Language{
         .multi_comment_start = "/*",
         .multi_comment_end = "*/",
         .string_delimiters = "\"'",
-        .has_char_literals = true,
         .preprocessor_prefix = null,
     },
     .{
@@ -908,7 +890,6 @@ pub const languages = [_]Language{
         .multi_comment_start = null,
         .multi_comment_end = null,
         .string_delimiters = "\"'",
-        .has_char_literals = false,
         .preprocessor_prefix = null,
     },
     .{
@@ -920,7 +901,6 @@ pub const languages = [_]Language{
         .multi_comment_start = null,
         .multi_comment_end = null,
         .string_delimiters = "",
-        .has_char_literals = false,
         .preprocessor_prefix = null,
     },
     .{
@@ -932,7 +912,6 @@ pub const languages = [_]Language{
         .multi_comment_start = null,
         .multi_comment_end = null,
         .string_delimiters = "",
-        .has_char_literals = false,
         .preprocessor_prefix = null,
         .command_prefix = '\\',
     },

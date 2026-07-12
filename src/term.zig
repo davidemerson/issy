@@ -493,7 +493,15 @@ fn parseSgrMouse(buf: []const u8) Key {
         }
         if (c == 'M' or c == 'm') break;
         if (c >= '0' and c <= '9') {
-            params[param_idx] = params[param_idx] * 10 + @as(u16, c - '0');
+            // Saturating accumulation: a hostile or pasted sequence like
+            // ESC[<70000;1;1M would otherwise overflow u16 and, in a
+            // ReleaseSafe build, abort the process. Clamp instead —
+            // coordinates past the terminal size are meaningless anyway.
+            const next = @as(u32, params[param_idx]) * 10 + (c - '0');
+            params[param_idx] = if (next > std.math.maxInt(u16))
+                std.math.maxInt(u16)
+            else
+                @intCast(next);
         }
         pos += 1;
     }
@@ -561,7 +569,13 @@ fn parseSgrMouse(buf: []const u8) Key {
 fn writeStr(s: []const u8) void {
     for (s) |c| {
         if (write_pos >= WRITE_BUF_SIZE) {
+            // Flush to make room. If the flush fails (e.g. the pty/
+            // terminal was torn down and write() returns EPIPE),
+            // write_pos stays at capacity — drop the byte rather than
+            // storing one past the end of the buffer, which would panic
+            // in ReleaseSafe or corrupt memory otherwise.
             doFlush() catch {};
+            if (write_pos >= WRITE_BUF_SIZE) return;
         }
         write_buf[write_pos] = c;
         write_pos += 1;
@@ -846,6 +860,20 @@ test "key parsing - SGR mouse scroll" {
     try std.testing.expectEqual(Key.scroll_down, parseKey("\x1b[<69;1;1M"));
     try std.testing.expectEqual(Key.scroll_up, parseKey("\x1b[<80;1;1M"));
     try std.testing.expectEqual(Key.scroll_down, parseKey("\x1b[<81;1;1M"));
+}
+
+test "key parsing - hostile SGR params saturate instead of overflowing u16" {
+    // ESC[<70000;99999;88888M would overflow the u16 param accumulator
+    // and abort a ReleaseSafe build. It must parse without panicking;
+    // the scroll/click decode from the (clamped) button just yields a
+    // benign event.
+    const r = parseKey("\x1b[<70000;99999;88888M");
+    switch (r) {
+        .mouse_click, .mouse_drag, .scroll_up, .scroll_down, .none, .mouse_release => {},
+        else => return error.TestUnexpectedResult,
+    }
+    // A wheel event with a huge coordinate still decodes as a scroll.
+    try std.testing.expectEqual(Key.scroll_up, parseKey("\x1b[<64;99999;99999M"));
 }
 
 test "key parsing - SGR mouse click" {

@@ -15,8 +15,14 @@
 # Copy leading whitespace when pressing Enter
 # auto_indent = true
 
-# Automatically insert matching bracket/quote pairs
+# Automatically insert matching bracket/quote pairs (type ( to get (),
+# cursor between; wraps a selection; steps over closers; deletes empty pairs)
 # auto_close_brackets = false
+
+# Periodically write unsaved changes to a sibling .<name>.swp file while
+# dirty (removed on save/clean exit); a leftover swap from a crash is
+# reported on open. Set false to disable.
+# swap_files = true
 
 # Scan file on open to detect tabs vs spaces (overrides tab_width/expand_tabs per file)
 # auto_detect_indent = true
@@ -35,8 +41,12 @@
 # Spaces between line numbers and code
 # gutter_padding = 3
 
-# Soft-wrap long lines at the right margin. Continuation lines are indented.
+# Soft-wrap long lines at the right margin. The buffer is not modified.
 # word_wrap = true
+
+# Hang soft-wrap continuation rows under the line's own indentation
+# instead of a flat 2 columns.
+# wrap_indent = false
 
 # Soft right margin — code stops here, rest is empty background. 0 = fill terminal.
 # right_margin = 100

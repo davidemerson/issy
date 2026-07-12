@@ -91,11 +91,20 @@ pub const Config = struct {
     expand_tabs: bool = true,
     line_numbers: bool = true,
     word_wrap: bool = true,
+    /// When true, soft-wrap continuation rows indent to the wrapped
+    /// line's own leading whitespace (a hanging indent) instead of a
+    /// flat 2 columns.
+    wrap_indent: bool = false,
     auto_indent: bool = true,
     auto_close_brackets: bool = false,
     auto_detect_indent: bool = true,
     trailing_whitespace: bool = true,
     indent_mismatch: bool = true,
+    /// Periodically write unsaved changes to a sibling `.<name>.swp`
+    /// file while the buffer is dirty; removed on save or clean exit.
+    /// On open, a leftover swap (from a crash) is reported in the status
+    /// bar. Best-effort; silent when the directory isn't writable.
+    swap_files: bool = true,
     scroll_margin: u8 = 5,
 
     // Visual design
@@ -210,6 +219,7 @@ pub fn load(path: ?[]const u8) Config {
 const max_tab_width = 8; // insertTab expands into a fixed 8-byte buffer
 const max_padding = 32;
 const max_scroll_margin = 100;
+const max_right_margin = 2000;
 const min_font_size = 4.0;
 const max_font_size = 144.0;
 
@@ -223,6 +233,8 @@ fn parseConfigKey(cfg: *Config, key: []const u8, val: []const u8) void {
         cfg.line_numbers = parseBool(val);
     } else if (std.mem.eql(u8, key, "word_wrap")) {
         cfg.word_wrap = parseBool(val);
+    } else if (std.mem.eql(u8, key, "wrap_indent")) {
+        cfg.wrap_indent = parseBool(val);
     } else if (std.mem.eql(u8, key, "auto_indent")) {
         cfg.auto_indent = parseBool(val);
     } else if (std.mem.eql(u8, key, "auto_close_brackets")) {
@@ -233,6 +245,8 @@ fn parseConfigKey(cfg: *Config, key: []const u8, val: []const u8) void {
         cfg.trailing_whitespace = parseBool(val);
     } else if (std.mem.eql(u8, key, "indent_mismatch")) {
         cfg.indent_mismatch = parseBool(val);
+    } else if (std.mem.eql(u8, key, "swap_files")) {
+        cfg.swap_files = parseBool(val);
     } else if (std.mem.eql(u8, key, "scroll_margin")) {
         const v = std.fmt.parseInt(u8, val, 10) catch return;
         if (v <= max_scroll_margin) cfg.scroll_margin = v;
@@ -243,7 +257,10 @@ fn parseConfigKey(cfg: *Config, key: []const u8, val: []const u8) void {
         const v = std.fmt.parseInt(u8, val, 10) catch return;
         if (v <= max_padding) cfg.left_padding = v;
     } else if (std.mem.eql(u8, key, "right_margin")) {
-        cfg.right_margin = std.fmt.parseInt(u16, val, 10) catch return;
+        const v = std.fmt.parseInt(u16, val, 10) catch return;
+        // 0 = fill terminal width; otherwise a sane column cap. Values
+        // in the thousands flow into wrap/render math for no benefit.
+        if (v <= max_right_margin) cfg.right_margin = v;
     } else if (std.mem.eql(u8, key, "cursor_line_bg")) {
         cfg.cursor_line_bg = parseBool(val);
     } else if (std.mem.eql(u8, key, "cursor_style")) {
