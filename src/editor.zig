@@ -347,7 +347,15 @@ pub const Editor = struct {
         const path = self.swapPath(&buf) orelse return;
         const contents = self.buf.contents(self.allocator) catch return;
         defer self.allocator.free(contents);
-        const file = std.fs.cwd().createFile(path, .{ .truncate = true }) catch return;
+
+        // Open with O_NOFOLLOW so a symlink planted at the swap path by a
+        // hostile local process can't redirect the write onto a victim
+        // file (the classic swap-symlink attack). O_NOFOLLOW makes the
+        // open fail (ELOOP) rather than following the link; we then just
+        // skip the autosave for this tick.
+        const flags: std.posix.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .NOFOLLOW = true };
+        const fd = std.posix.open(path, flags, 0o600) catch return;
+        const file = std.fs.File{ .handle = fd };
         defer file.close();
         file.writeAll(contents) catch {};
     }
@@ -930,8 +938,14 @@ pub const Editor = struct {
                     .save_as => {
                         // Set filename and save
                         if (path.len > 0 and path.len <= self.filename.len) {
+                            // Remove the OLD file's swap before the filename
+                            // is reassigned — removeSwap derives its path from
+                            // the current filename, so doing it after the swap
+                            // over the new name would orphan `.oldname.swp`.
+                            self.removeSwap();
                             @memcpy(self.filename[0..path.len], path);
                             self.filename_len = path.len;
+                            self.last_swap_ms = 0;
                             self.language = syntax_mod.detect(path);
                             self.buf.save(path) catch {
                                 self.setStatusMessage("Save failed!");
@@ -940,6 +954,8 @@ pub const Editor = struct {
                             };
                             self.modified = false;
                             self.updateMtime();
+                            // Also drop any swap under the new name (the
+                            // buffer is now clean on disk).
                             self.removeSwap();
                             self.persistCursor();
                             self.setStatusMessage("Saved.");
@@ -2717,10 +2733,19 @@ pub const Editor = struct {
     /// A match at [start, start+len) is a whole word when the bytes just
     /// outside it are not word characters (or the buffer edge).
     fn isWholeWordAt(self: *Editor, start: usize, len: usize) bool {
-        if (start > 0 and isWordChar(self.buf.byteAt(start - 1))) return false;
+        if (start > 0 and isWordBoundaryByte(self.buf.byteAt(start - 1))) return false;
         const after = start + len;
-        if (after < self.buf.logicalLen() and isWordChar(self.buf.byteAt(after))) return false;
+        if (after < self.buf.logicalLen() and isWordBoundaryByte(self.buf.byteAt(after))) return false;
         return true;
+    }
+
+    /// A byte counts as "part of a word" for whole-word boundary tests if
+    /// it's an ASCII word char OR any non-ASCII byte (≥ 0x80) — the latter
+    /// is a UTF-8 lead/continuation byte of a letter like é or 世, which
+    /// must not be treated as a word boundary (searching "bar" whole-word
+    /// in "cafébar" should not match).
+    fn isWordBoundaryByte(c: u8) bool {
+        return isWordChar(c) or c >= 0x80;
     }
 
     fn findNext(self: *Editor) void {
@@ -5149,4 +5174,58 @@ test "swap path is null without a filename" {
     defer ed.deinit();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     try std.testing.expectEqual(@as(?[]const u8, null), ed.swapPath(&buf));
+}
+
+test "whole-word search does not match across a non-ASCII letter boundary" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // "café" ends in a 2-byte é; "bar" immediately follows. Whole-word
+    // "bar" must NOT match, since it's glued to a letter.
+    try ed.buf.insert(0, "caf\xC3\xA9bar and bar\n");
+    _ = ed.handleKey(.{ .ctrl = 'f' });
+    for ("bar") |c| _ = ed.handleKey(.{ .char = c });
+    _ = ed.handleKey(.tab); // whole-word on
+    // Only the standalone "bar" (after "and ") matches.
+    try std.testing.expectEqual(@as(usize, 1), ed.search_match_count);
+}
+
+test "swap autosave refuses to follow a planted symlink" {
+    var cfg = config_mod.Config.init();
+    cfg.swap_files = true;
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = try std.posix.getcwd(&cwd_buf);
+    const dir_rel = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(dir_rel);
+
+    // Victim file the attacker wants overwritten.
+    const victim = try tmp.dir.createFile("victim.txt", .{});
+    try victim.writeAll("precious");
+    victim.close();
+
+    // Plant a symlink at the swap path (.note.txt.swp) → victim.txt.
+    try tmp.dir.symLink("victim.txt", ".note.txt.swp", .{});
+
+    // Point the editor at <cwd>/<dir_rel>/note.txt and make it dirty.
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const fpath = try std.fmt.bufPrint(&path_buf, "{s}/{s}/note.txt", .{ cwd, dir_rel });
+    @memcpy(ed.filename[0..fpath.len], fpath);
+    ed.filename_len = fpath.len;
+    for ("attacker-controlled") |c| _ = ed.handleKey(.{ .char = c });
+
+    ed.last_swap_ms = 0;
+    ed.maybeAutosaveSwap(); // must refuse (O_NOFOLLOW) — no write through the link
+
+    // Victim must be untouched.
+    const check = try tmp.dir.openFile("victim.txt", .{});
+    defer check.close();
+    var vbuf: [64]u8 = undefined;
+    const n = try check.readAll(&vbuf);
+    try std.testing.expectEqualStrings("precious", vbuf[0..n]);
 }

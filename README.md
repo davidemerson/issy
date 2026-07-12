@@ -305,7 +305,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full flow, the cache layout, and 
 ## Architecture, testing, man page
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — tour of the source code and the major subsystems
-- `zig build test` — 246-test unit suite (gap buffer, Unicode, tokenizer, editor operations, mouse/selection, search, auto-close, swap files, update verification, hostile-input hardening, etc.); each source file compiles and runs as its own test unit, so imported modules' tests re-run per unit
+- `zig build test` — 249-test unit suite (gap buffer, Unicode, tokenizer, editor operations, mouse/selection, search, auto-close, swap files, update verification, hostile-input hardening, etc.); each source file compiles and runs as its own test unit, so imported modules' tests re-run per unit
 - `bash tests/run_tests.sh` — end-to-end integration suite via `expect`, launches the real binary in a PTY
 - `man ./issy.1` — man page
 

@@ -458,11 +458,16 @@ jobs:
         env:
           VERSION: ${{ steps.ver.outputs.version }}
           SHA256: ${{ steps.tarball.outputs.sha256 }}
-          # Commit the tag points at — recorded in the formula so the
-          # brew stable build (a .git-less source tarball) can stamp the
-          # real SHA into build_info via -Dcommit.
-          COMMIT: ${{ github.sha }}
         run: |
+          # Commit the tag points at — recorded in the formula so the brew
+          # stable build (a .git-less source tarball) can stamp the real
+          # SHA into build_info via -Dcommit. Read it from the `build`
+          # checkout's HEAD (the tag, resolved to its commit), which is
+          # exactly the value written into the release's commit.txt. Do
+          # NOT use github.sha: for an ANNOTATED/signed tag it can be the
+          # tag-object SHA, which never matches commit.txt and would pin
+          # brew users to a permanent "update available".
+          COMMIT="$(git -C "$GITHUB_WORKSPACE/build" rev-parse HEAD)"
           python3 .github/scripts/bump_formula.py Formula/issy.rb "$VERSION" "$SHA256" "$COMMIT"
           if git diff --quiet Formula/issy.rb; then
             echo "Formula/issy.rb already at v$VERSION — nothing to commit."

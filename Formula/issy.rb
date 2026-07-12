@@ -10,7 +10,11 @@ class Issy < Formula
   # no .git, so build.zig can't derive the SHA; passing it via -Dcommit
   # stamps build_info so `issy --version` shows the real commit and the
   # update-notify check runs (a "dev" stamp would silently disable it).
-  STABLE_COMMIT = "4d0f3796a921d03180e4d4d71e11b356a3232b7c".freeze
+  # A method (not a constant) avoids "already initialized constant"
+  # warnings when Homebrew reloads the formula in one process.
+  def stable_commit
+    "4d0f3796a921d03180e4d4d71e11b356a3232b7c"
+  end
   # STABLE_END
   head "https://github.com/davidemerson/issy.git", branch: "main"
 
@@ -27,7 +31,7 @@ class Issy < Formula
     # status from git itself. The stable tarball has no .git, so hand it
     # the recorded release commit and mark it a release build.
     unless build.head?
-      args << "-Dcommit=#{STABLE_COMMIT}"
+      args << "-Dcommit=#{stable_commit}"
       args << "-Drelease=true"
     end
     system "zig", "build", *args

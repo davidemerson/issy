@@ -709,12 +709,11 @@ pub const Renderer = struct {
                         const text = lines[text_line_idx];
                         if (col_idx < text.len) {
                             cell.char = text[col_idx];
-                            // Title and dismiss line are bright, keys are bright, descriptions dim
-                            if (text_line_idx == 0 or text_line_idx == lines.len - 1) {
-                                cell.fg = bright_fg;
-                            } else {
-                                cell.fg = bright_fg;
-                            }
+                            // Every glyph in the box renders bright against
+                            // the subtle box background; keys and their
+                            // descriptions share a line, so there's no
+                            // clean per-column split to dim.
+                            cell.fg = bright_fg;
                         } else {
                             cell.char = ' ';
                             cell.fg = dim_fg;

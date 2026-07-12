@@ -123,6 +123,12 @@ pub const Font = struct {
         if (head_off) |off| {
             if (off + 54 <= data.len) {
                 self.units_per_em = readU16(data, off + 18);
+                // Guard against a corrupt/hostile font declaring
+                // unitsPerEm = 0: every metric (charWidth, lineHeight,
+                // the PDF scale) divides by it, and 1000/0 → inf →
+                // @intFromFloat(inf) is a hard panic in ReleaseSafe
+                // during PDF export. Fall back to the em-square default.
+                if (self.units_per_em == 0) self.units_per_em = 1000;
                 self.x_min = readI16(data, off + 36);
                 self.y_min = readI16(data, off + 38);
                 self.x_max = readI16(data, off + 40);
@@ -540,4 +546,27 @@ test "font metrics calculations" {
 
     // Don't call deinit since we didn't allocate
     _ = &font;
+}
+
+test "units_per_em of zero is clamped so metrics don't divide by zero" {
+    // A head table declaring unitsPerEm = 0 would make charWidth /
+    // lineHeight / the PDF scale divide by zero → inf → an
+    // @intFromFloat panic during export. Build a minimal head table and
+    // confirm the loader clamps to the em-square default.
+    const allocator = std.testing.allocator;
+    var data = try allocator.alloc(u8, 12 + 16 + 60);
+    defer allocator.free(data);
+    @memset(data, 0);
+    // Offset table: sfnt 0x00010000, numTables = 1.
+    std.mem.writeInt(u32, data[0..4], 0x00010000, .big);
+    std.mem.writeInt(u16, data[4..6], 1, .big);
+    // Table record for "head" at offset 12+16 = 28.
+    @memcpy(data[12..16], "head");
+    std.mem.writeInt(u32, data[20..24], 28, .big); // offset
+    std.mem.writeInt(u32, data[24..28], 54, .big); // length
+    // head.unitsPerEm at head_off + 18 = 46 → leave it 0 (already memset).
+
+    var font = Font{ .allocator = allocator, .data = &.{}, .cmap = &.{} };
+    try font.parseTables(data, 1);
+    try std.testing.expectEqual(@as(u16, 1000), font.units_per_em);
 }

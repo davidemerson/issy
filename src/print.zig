@@ -88,7 +88,10 @@ pub fn toPdf(ed: *editor_mod.Editor, output_path: []const u8) !void {
     // Layout geometry + margin sanity. Margins that leave no usable
     // content area would otherwise loop forever emitting empty pages.
     const font_size = cfg.font_size;
-    const line_height = fnt.lineHeight(font_size) * 1.3;
+    // Floor the line height at the font size: a font whose vertical
+    // metrics sum to zero (ascender == descender, no line gap) would
+    // otherwise give a zero advance and pile every line onto one page.
+    const line_height = @max(fnt.lineHeight(font_size) * 1.3, font_size);
     const page_w: f32 = 612.0;
     const page_h: f32 = 792.0;
     const margin_top = cfg.print_margin_top;
@@ -357,8 +360,12 @@ pub fn toPdf(ed: *editor_mod.Editor, output_path: []const u8) !void {
 
             // Per-line continuation indent (points), mirroring the TUI's
             // wrap_indent option — a flat 2 columns by default, or hanging
-            // under the line's own leading whitespace when enabled.
-            const line_cont_pts: f32 = space_w * @as(f32, @floatFromInt(ed.continuationIndentCols(line_num)));
+            // under the line's own leading whitespace when enabled. Capped
+            // to half the page content width so a wide-terminal indent
+            // cap (continuationIndentCols keys off the TUI's visible_cols)
+            // can't push continuation text off the right page edge.
+            const raw_cont_pts: f32 = space_w * @as(f32, @floatFromInt(ed.continuationIndentCols(line_num)));
+            const line_cont_pts: f32 = @min(raw_cont_pts, content_w / 2.0);
             const line_cont_w: f32 = @max(content_w - line_cont_pts, space_w);
 
             var breaks: [MAX_WRAP_BREAKS]usize = undefined;

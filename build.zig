@@ -172,7 +172,11 @@ fn writeBuildInfo(b: *std.Build, commit_override: ?[]const u8, release_override:
         };
         defer allocator.free(status);
         const dirty = std.mem.trim(u8, status, " \t\r\n").len != 0;
-        break :blk .{ sha, !dirty or release_override };
+        // Only a clean tree earns a release stamp on the git path.
+        // `-Drelease=true` is honored solely alongside a valid `-Dcommit`
+        // (handled above) — it must not be able to mint a "release" over
+        // uncommitted local changes.
+        break :blk .{ sha, !dirty };
     };
 
     const content = try std.fmt.allocPrint(allocator,

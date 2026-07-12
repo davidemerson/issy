@@ -32,7 +32,11 @@ def render_block(version: str, sha256: str, commit: str) -> str:
         "  # no .git, so build.zig can't derive the SHA; passing it via -Dcommit\n"
         "  # stamps build_info so `issy --version` shows the real commit and the\n"
         "  # update-notify check runs (a \"dev\" stamp would silently disable it).\n"
-        f'  STABLE_COMMIT = "{commit}".freeze\n'
+        "  # A method (not a constant) avoids \"already initialized constant\"\n"
+        "  # warnings when Homebrew reloads the formula in one process.\n"
+        "  def stable_commit\n"
+        f'    "{commit}"\n'
+        "  end\n"
         f"{END}\n"
     )
 
