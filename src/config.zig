@@ -367,6 +367,17 @@ pub fn statMtime(path: []const u8) ?i128 {
     return s.mtime;
 }
 
+/// True if `path` is a non-empty file. The reload watcher uses this to
+/// skip the truncate window of a non-atomic external editor save: a
+/// zero-byte read would otherwise `load()` back to compiled-in defaults
+/// and flash the user's settings away for ~1s until the write finishes.
+pub fn hasContent(path: []const u8) bool {
+    const file = std.fs.cwd().openFile(path, .{}) catch return false;
+    defer file.close();
+    const s = file.stat() catch return false;
+    return s.size > 0;
+}
+
 // ── Tests ──
 
 test "default config has sane values" {

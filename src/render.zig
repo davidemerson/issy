@@ -69,14 +69,22 @@ pub const Renderer = struct {
     }
 
     pub fn resize(self: *Renderer, rows: u16, cols: u16) !void {
+        // Allocate both new grids BEFORE freeing the old ones. If either
+        // alloc fails, the Renderer is left pointing at its still-valid
+        // old buffers, so the propagated error can't turn the unwinding
+        // deinit into a double-free.
+        const size = @as(usize, rows) * @as(usize, cols);
+        const new_current = try self.allocator.alloc(Cell, size);
+        errdefer self.allocator.free(new_current);
+        const new_previous = try self.allocator.alloc(Cell, size);
+
+        @memset(new_current, Cell{});
+        @memset(new_previous, .{ .char = 0 });
+
         self.allocator.free(self.current);
         self.allocator.free(self.previous);
-
-        const size = @as(usize, rows) * @as(usize, cols);
-        self.current = try self.allocator.alloc(Cell, size);
-        @memset(self.current, Cell{});
-        self.previous = try self.allocator.alloc(Cell, size);
-        @memset(self.previous, .{ .char = 0 });
+        self.current = new_current;
+        self.previous = new_previous;
         self.rows = rows;
         self.cols = cols;
         // The syntax-state cache is line-indexed, not screen-indexed —

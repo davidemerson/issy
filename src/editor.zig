@@ -620,11 +620,16 @@ pub const Editor = struct {
                 return .redraw;
             },
             .page_up => {
+                // Clear the selection like the other non-shift movement
+                // keys — otherwise the anchor is retained and the jump
+                // silently grows the selection by a whole page.
+                self.sel_active = false;
                 const amount = if (self.visible_rows > 2) self.visible_rows - 2 else 1;
                 self.moveCursorUp(amount);
                 return .redraw;
             },
             .page_down => {
+                self.sel_active = false;
                 const amount = if (self.visible_rows > 2) self.visible_rows - 2 else 1;
                 self.moveCursorDown(amount);
                 return .redraw;
@@ -959,6 +964,11 @@ pub const Editor = struct {
                             self.removeSwap();
                             self.persistCursor();
                             self.setStatusMessage("Saved.");
+                        } else if (path.len > self.filename.len) {
+                            // Don't silently swallow an over-long path — the
+                            // user typed something and got no save and no
+                            // error otherwise.
+                            self.setStatusMessage("Path too long.");
                         }
                     },
                     .goto_line => {
@@ -2645,6 +2655,12 @@ pub const Editor = struct {
     fn undo(self: *Editor) void {
         if (self.undo_stack.items.len == 0) return;
 
+        // Drop any active selection: its anchor points into the pre-undo
+        // buffer and would resolve to a stale (often zero) byte offset
+        // after the edit, so the next typed char / cut would delete an
+        // unrelated range — silent data loss.
+        self.sel_active = false;
+
         const top = self.undo_stack.items[self.undo_stack.items.len - 1];
         const group_id = top.group_id;
 
@@ -2672,6 +2688,9 @@ pub const Editor = struct {
 
     fn redo(self: *Editor) void {
         if (self.redo_stack.items.len == 0) return;
+
+        // Same stale-anchor hazard as undo: clear the selection first.
+        self.sel_active = false;
 
         const top = self.redo_stack.items[self.redo_stack.items.len - 1];
         const group_id = top.group_id;
@@ -5228,4 +5247,42 @@ test "swap autosave refuses to follow a planted symlink" {
     var vbuf: [64]u8 = undefined;
     const n = try check.readAll(&vbuf);
     try std.testing.expectEqualStrings("precious", vbuf[0..n]);
+}
+
+test "undo clears an active selection so the next edit doesn't delete extra text" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.buf.insert(0, "X");
+    var i: usize = 0;
+    while (i < 5) : (i += 1) _ = ed.handleKey(.enter);
+    _ = ed.handleKey(.shift_up);
+    try std.testing.expect(ed.sel_active);
+    _ = ed.handleKey(.{ .ctrl = 'z' }); // must clear the selection
+    try std.testing.expect(!ed.sel_active);
+    // Typing inserts a single char, not a mass-delete of the prefix.
+    const before = ed.buf.logicalLen();
+    _ = ed.handleKey(.{ .char = 'q' });
+    try std.testing.expectEqual(before + 1, ed.buf.logicalLen());
+}
+
+test "PageUp and PageDown clear an active selection" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    var i: usize = 0;
+    while (i < 30) : (i += 1) try ed.buf.insert(ed.buf.logicalLen(), "line\n");
+    ed.visible_rows = 10;
+    ed.cursor.line = 15;
+    _ = ed.handleKey(.shift_up);
+    try std.testing.expect(ed.sel_active);
+    _ = ed.handleKey(.page_down);
+    try std.testing.expect(!ed.sel_active);
+
+    _ = ed.handleKey(.shift_down);
+    try std.testing.expect(ed.sel_active);
+    _ = ed.handleKey(.page_up);
+    try std.testing.expect(!ed.sel_active);
 }

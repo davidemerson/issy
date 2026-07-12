@@ -262,9 +262,12 @@ pub fn main() !void {
     var needs_redraw = true;
     while (true) {
         // Graceful shutdown on SIGTERM/SIGHUP: the defers restore the
-        // terminal; persist the cursor like a normal quit would.
+        // terminal; persist the cursor and drop the swap like a normal
+        // quit would (we're exiting cleanly — a leftover swap would
+        // otherwise trigger a false "recovered edits" notice next time).
         if (shutdown_requested.load(.acquire)) {
             ed.persistCursor();
+            ed.removeSwap();
             break;
         }
 
@@ -299,11 +302,14 @@ pub fn main() !void {
             ed.maybeAutosaveSwap();
             // Config auto-reload: if ~/.issyrc (or --config path) has a
             // newer mtime than what we last loaded, reread it and
-            // reapply CLI overrides. Failure is silent — the editor
-            // keeps using the previous config rather than blanking it.
+            // reapply CLI overrides. A zero-byte read is skipped (and
+            // cfg_mtime is NOT advanced) so the truncate window of a
+            // non-atomic external save doesn't momentarily blank the
+            // settings back to defaults; the next tick retries once the
+            // write completes.
             if (cfg_path_len > 0) {
                 if (config_mod.statMtime(cfg_path_buf[0..cfg_path_len])) |m| {
-                    if (m != cfg_mtime) {
+                    if (m != cfg_mtime and config_mod.hasContent(cfg_path_buf[0..cfg_path_len])) {
                         cfg = config_mod.load(cfg_path_buf[0..cfg_path_len]);
                         applyCliOverrides(&cfg, args);
                         cfg_mtime = m;

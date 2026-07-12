@@ -121,13 +121,19 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run all tests");
     for (source_files) |src| {
-        const unit_tests = b.addTest(.{
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(src),
-                .target = target,
-                .optimize = optimize,
-            }),
+        const test_mod = b.createModule(.{
+            .root_source_file = b.path(src),
+            .target = target,
+            .optimize = optimize,
         });
+        // Link libc in tests too, matching the shipped binary — some code
+        // (e.g. positions.zig's atomic temp-name via std.c.getpid) needs
+        // libc, and a test exercising it would otherwise fail to link on
+        // Linux/OpenBSD where libc isn't linked by default.
+        if (os_tag == .linux or os_tag == .macos or os_tag == .openbsd) {
+            test_mod.link_libc = true;
+        }
+        const unit_tests = b.addTest(.{ .root_module = test_mod });
         const run_unit_tests = b.addRunArtifact(unit_tests);
         test_step.dependOn(&run_unit_tests.step);
     }

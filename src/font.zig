@@ -123,12 +123,14 @@ pub const Font = struct {
         if (head_off) |off| {
             if (off + 54 <= data.len) {
                 self.units_per_em = readU16(data, off + 18);
-                // Guard against a corrupt/hostile font declaring
-                // unitsPerEm = 0: every metric (charWidth, lineHeight,
-                // the PDF scale) divides by it, and 1000/0 → inf →
-                // @intFromFloat(inf) is a hard panic in ReleaseSafe
-                // during PDF export. Fall back to the em-square default.
-                if (self.units_per_em == 0) self.units_per_em = 1000;
+                // Guard against a corrupt/hostile font declaring an
+                // out-of-spec unitsPerEm. 0 would divide-by-zero (→ inf →
+                // @intFromFloat panic during PDF export); a tiny value
+                // like 1 makes glyphs measure absurdly wide, which drives
+                // the wrap math into degenerate territory. The TrueType
+                // spec requires 16..16384; anything outside falls back to
+                // the em-square default.
+                if (self.units_per_em < 16 or self.units_per_em > 16384) self.units_per_em = 1000;
                 self.x_min = readI16(data, off + 36);
                 self.y_min = readI16(data, off + 38);
                 self.x_max = readI16(data, off + 40);

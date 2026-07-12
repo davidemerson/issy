@@ -374,7 +374,7 @@ pub fn toPdf(ed: *editor_mod.Editor, output_path: []const u8) !void {
             var si: usize = sub_start_idx;
             while (si < break_count and y > margin_bottom) : (si += 1) {
                 const sub_start = breaks[si];
-                const sub_end = if (si + 1 < break_count) breaks[si + 1] else line_data.len;
+                const sub_end = @min(if (si + 1 < break_count) breaks[si + 1] else line_data.len, line_data.len);
 
                 const target_x: f32 = if (si == 0) margin_left else margin_left + line_cont_pts;
                 const dx = target_x - last_origin_x;
@@ -677,10 +677,15 @@ fn computePdfWrapBreaks(
             if (last_punct_width >= min_width) break_at = bp;
         }
 
-        // Forward-progress guard for runs of unbreakable codepoints wider than avail.
+        // Forward-progress guard for runs of unbreakable codepoints wider
+        // than avail. utf8Len reports the lead byte's DECLARED length,
+        // which can exceed the bytes actually present (a truncated
+        // multibyte sequence at end-of-line, or one split by the
+        // max_line_bytes cap). Clamp to data.len so the break offset —
+        // later used to slice line_data — can never point past the end.
         if (break_at <= pos) {
             const blen = @max(@as(usize, unicode.utf8Len(data[pos])), 1);
-            break_at = pos + blen;
+            break_at = @min(pos + blen, data.len);
         }
 
         breaks[count] = break_at;
@@ -775,4 +780,30 @@ test "encodeGlyphs expands tabs relative to the running column" {
     try encodeGlyphs(&list, std.testing.allocator, &fnt, "\t", 4, &visual);
     try std.testing.expectEqual(@as(usize, 4), visual);
     try std.testing.expectEqual(@as(usize, 8), list.items.len); // two 4-hex glyphs
+}
+
+test "computePdfWrapBreaks never overshoots a truncated multibyte tail" {
+    // A line ending in a lone 4-byte lead (0xF0) with no continuation
+    // bytes. The forward-progress guard trusts utf8Len (=4), so without
+    // the data.len clamp break_at would be pos+4 > data.len and the
+    // export slice would panic. Every break must stay within bounds.
+    var widths = [_]u16{5000}; // huge advance so any glyph exceeds avail
+    var cmap = [_]u16{0} ** 65536;
+    cmap[0xF0] = 0; // maps to notdef (width via glyph 0)
+
+    const fnt = font_mod.Font{
+        .allocator = std.testing.allocator,
+        .units_per_em = 1000,
+        .glyph_widths = &widths,
+        .cmap = &cmap,
+    };
+
+    const data = [_]u8{ 'a', 'b', 0xF0 }; // truncated lead at the end
+    var breaks: [MAX_WRAP_BREAKS]usize = undefined;
+    // Tiny available width forces the per-glyph forward-progress guard.
+    const count = computePdfWrapBreaks(&fnt, 10.0, &data, 1.0, 1.0, 4, &breaks);
+    var k: usize = 0;
+    while (k < count) : (k += 1) {
+        try std.testing.expect(breaks[k] <= data.len);
+    }
 }

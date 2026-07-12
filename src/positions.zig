@@ -162,14 +162,16 @@ pub fn record(abs_path: []const u8, line: usize, col: usize) void {
         entry_count += 1;
     }
 
-    // Atomic write: positions.txt.tmp + rename. Same pattern buffer.zig
-    // uses for buffer saves so a crash mid-write can't corrupt the
-    // existing file.
-    var tmp_path_buf: [std.fs.max_path_bytes + 8]u8 = undefined;
+    // Atomic write: per-process-unique .tmp + rename. Same pattern
+    // buffer.zig uses for buffer saves so a crash mid-write can't corrupt
+    // the existing file. The pid+timestamp suffix keeps two issy
+    // processes exiting at once from truncating the same temp and racing
+    // the rename (which could delete each other's temp mid-flight).
+    var tmp_path_buf: [std.fs.max_path_bytes + 48]u8 = undefined;
     const tmp_path = std.fmt.bufPrint(
         &tmp_path_buf,
-        "{s}.tmp",
-        .{positions_path},
+        "{s}.tmp.{d}.{d}",
+        .{ positions_path, std.c.getpid(), std.time.nanoTimestamp() },
     ) catch return;
 
     const tmp_file = std.fs.cwd().createFile(tmp_path, .{ .truncate = true }) catch return;
