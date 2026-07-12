@@ -458,8 +458,12 @@ jobs:
         env:
           VERSION: ${{ steps.ver.outputs.version }}
           SHA256: ${{ steps.tarball.outputs.sha256 }}
+          # Commit the tag points at — recorded in the formula so the
+          # brew stable build (a .git-less source tarball) can stamp the
+          # real SHA into build_info via -Dcommit.
+          COMMIT: ${{ github.sha }}
         run: |
-          python3 .github/scripts/bump_formula.py Formula/issy.rb "$VERSION" "$SHA256"
+          python3 .github/scripts/bump_formula.py Formula/issy.rb "$VERSION" "$SHA256" "$COMMIT"
           if git diff --quiet Formula/issy.rb; then
             echo "Formula/issy.rb already at v$VERSION — nothing to commit."
             exit 0

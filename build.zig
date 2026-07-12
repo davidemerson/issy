@@ -21,9 +21,18 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Build-info overrides for builds without a usable `.git` — chiefly
+    // the Homebrew stable build, which compiles the GitHub source
+    // tarball (no repo, so git rev-parse fails). The formula passes the
+    // release commit recorded at tag time via `-Dcommit`, plus
+    // `-Drelease=true`, so `issy --version` and the update-notify check
+    // work on brew installs instead of falling back to a "dev" stamp.
+    const commit_opt = b.option([]const u8, "commit", "Override the commit SHA embedded in build_info (40 hex chars)");
+    const release_opt = b.option(bool, "release", "Mark build_info as a release build") orelse false;
+
     // Generate src/build_info.zig with version + commit SHA + build type.
     // Runs at configure time so `@import("build_info.zig")` from main.zig works.
-    writeBuildInfo(b) catch |err| {
+    writeBuildInfo(b, commit_opt, release_opt) catch |err| {
         std.debug.print("warning: failed to write build_info.zig ({s}); using dev fallback\n", .{@errorName(err)});
     };
 
@@ -125,32 +134,45 @@ pub fn build(b: *std.Build) void {
 }
 
 // Writes src/build_info.zig with version, commit SHA, and build type.
-// On a clean release tree (CI or tagged builds), embeds the full 40-char SHA
-// and marks build_type = .release. On anything else, falls back to "dev".
-fn writeBuildInfo(b: *std.Build) !void {
+// Precedence: an explicit `-Dcommit` override (used by the Homebrew
+// stable build, which has no `.git`) wins; otherwise a clean git tree
+// embeds the full 40-char SHA and marks build_type = .release; anything
+// else falls back to "dev".
+fn writeBuildInfo(b: *std.Build, commit_override: ?[]const u8, release_override: bool) !void {
     const allocator = b.allocator;
 
     var version_buf: [32]u8 = undefined;
     const version = readVersionFromZon(&version_buf) catch "0.0.0";
 
-    // Try git rev-parse HEAD. On success, check if tree is clean.
-    const commit_sha: [40]u8, const is_release: bool = git_block: {
+    const commit_sha: [40]u8, const is_release: bool = blk: {
+        // 1. Explicit override (validated as 40 hex chars).
+        if (commit_override) |c| {
+            if (isHex40(c)) {
+                var sha: [40]u8 = undefined;
+                @memcpy(&sha, c[0..40]);
+                break :blk .{ sha, release_override };
+            }
+            // A malformed override falls through to git/dev rather than
+            // silently embedding garbage.
+        }
+
+        // 2. Try git rev-parse HEAD, then check whether the tree is clean.
         const git_head = runGitCommand(allocator, &.{ "git", "rev-parse", "HEAD" }) catch {
-            break :git_block .{ dev_sha_padded(), false };
+            break :blk .{ dev_sha_padded(), false };
         };
         defer allocator.free(git_head);
 
-        if (git_head.len < 40) break :git_block .{ dev_sha_padded(), false };
+        if (git_head.len < 40) break :blk .{ dev_sha_padded(), false };
         var sha: [40]u8 = undefined;
         @memcpy(&sha, git_head[0..40]);
 
-        // Check if tree is dirty. `git status --porcelain` returns empty on clean.
+        // `git status --porcelain` returns empty on a clean tree.
         const status = runGitCommand(allocator, &.{ "git", "status", "--porcelain" }) catch {
-            break :git_block .{ sha, false };
+            break :blk .{ sha, false };
         };
         defer allocator.free(status);
         const dirty = std.mem.trim(u8, status, " \t\r\n").len != 0;
-        break :git_block .{ sha, !dirty };
+        break :blk .{ sha, !dirty or release_override };
     };
 
     const content = try std.fmt.allocPrint(allocator,
@@ -208,6 +230,15 @@ fn runGitCommand(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
         },
     }
     return out;
+}
+
+fn isHex40(s: []const u8) bool {
+    if (s.len != 40) return false;
+    for (s) |c| {
+        const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+        if (!ok) return false;
+    }
+    return true;
 }
 
 fn dev_sha_padded() [40]u8 {

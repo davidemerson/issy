@@ -164,7 +164,7 @@ Holds the 32-byte Ed25519 public key that the auto-update path verifies `sha256s
 
 ### build_info.zig -- Generated
 
-Written by `build.zig` at configure time via `git rev-parse HEAD` and `git status --porcelain`. On a clean release build (e.g. CI), embeds the full 40-char commit SHA and `build_type = .release`. A dirty tree keeps its real SHA but is marked `build_type = .dev`; only an un-gitted tree (or git failure) falls back to the placeholder `"dev" ++ "0"*37`. Either way, `.dev` is the kill switch the update path checks. Always gitignored — never committed.
+Written by `build.zig` at configure time. Precedence: an explicit `-Dcommit=<sha>` (with `-Drelease=true`) wins — this is how the Homebrew stable build stamps the correct info, since it compiles a `.git`-less source tarball; otherwise `git rev-parse HEAD` + `git status --porcelain` embed the full 40-char SHA and mark `build_type = .release` on a clean tree. A dirty tree keeps its real SHA but is marked `build_type = .dev`; only an un-gitted tree with no override (or git failure) falls back to the placeholder `"dev" ++ "0"*37`. Either way, `.dev` is the kill switch the update path checks. Always gitignored — never committed.
 
 ### tools/keygen.zig -- Keypair Generator
 
@@ -183,6 +183,8 @@ Standalone program, built and run via `zig build keygen`. Generates a fresh Ed25
 ## macOS distribution
 
 macOS does not ship prebuilt binaries in GitHub releases. Cross-compiled Mach-O from Linux has no `LC_CODE_SIGNATURE` load command and the Apple Silicon kernel refuses to `execve` it. Rather than grow a cross-signing pipeline, macOS users install via a Homebrew formula (`Formula/issy.rb`) that depends on Zig and builds from source, producing a native host-signed binary that just works on both Intel and Apple Silicon.
+
+The stable formula records the release commit (a `STABLE_COMMIT` constant rewritten by `bump_formula.py` on each tag) and passes it to `build.zig` as `-Dcommit=<sha> -Drelease=true`. Without this the source-tarball build (no `.git`) would stamp `build_type = .dev`, which silently disables the update-notify check — so brew users would never see the "update available" notice. HEAD installs (`brew install --HEAD`) skip the override because their cloned checkout has real git metadata.
 
 The formula carries both a stable block (`url` + `sha256` pointing at a tagged source tarball) and a `head` spec. The stable block is regenerated on every `vX.Y.Z` tag push by the `release-tag` job in `.github/workflows/ci.yml`, which downloads the GitHub-generated source tarball, hashes it, and runs `.github/scripts/bump_formula.py` to rewrite the block between its `STABLE_BEGIN`/`STABLE_END` markers, then commits the result back to `main`. Upshot: `brew install issy` / `brew upgrade issy` behave like any other versioned formula, and `brew install --HEAD issy` remains available for users who want to track `main` between tags.
 

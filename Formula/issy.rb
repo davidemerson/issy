@@ -6,6 +6,11 @@ class Issy < Formula
   # STABLE_BEGIN — edited by .github/scripts/bump_formula.py on tag push. Do not edit by hand.
   url "https://github.com/davidemerson/issy/archive/refs/tags/v1.2.0.tar.gz"
   sha256 "f102fc5fa3c7234c18b164463b01fc6bdfb4f1b2219c5296a8acb6e34955b058"
+  # Commit the stable tarball was cut from. The GitHub source archive has
+  # no .git, so build.zig can't derive the SHA; passing it via -Dcommit
+  # stamps build_info so `issy --version` shows the real commit and the
+  # update-notify check runs (a "dev" stamp would silently disable it).
+  STABLE_COMMIT = "791b440debfee07f94ba043234904491c74d3e3f".freeze
   # STABLE_END
   head "https://github.com/davidemerson/issy.git", branch: "main"
 
@@ -17,12 +22,24 @@ class Issy < Formula
   depends_on "zig@0.15" => :build
 
   def install
-    system "zig", "build", "-Doptimize=ReleaseSafe"
+    args = ["-Doptimize=ReleaseSafe"]
+    # HEAD installs clone the repo, so build.zig reads the commit + clean
+    # status from git itself. The stable tarball has no .git, so hand it
+    # the recorded release commit and mark it a release build.
+    unless build.head?
+      args << "-Dcommit=#{STABLE_COMMIT}"
+      args << "-Drelease=true"
+    end
+    system "zig", "build", *args
     bin.install "zig-out/bin/issy"
     man1.install "issy.1"
   end
 
   test do
-    assert_match "issy", shell_output("#{bin}/issy --version")
+    # Stable builds must report the real version and a non-dev build type
+    # (so the update-notify path is active); HEAD builds just report "issy".
+    out = shell_output("#{bin}/issy --version")
+    assert_match "issy", out
+    assert_match version.to_s, out unless build.head?
   end
 end
