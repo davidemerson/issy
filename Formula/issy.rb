@@ -4,8 +4,8 @@ class Issy < Formula
   license "BSD-3-Clause"
 
   # STABLE_BEGIN — edited by .github/scripts/bump_formula.py on tag push. Do not edit by hand.
-  url "https://github.com/davidemerson/issy/archive/refs/tags/v1.2.2.tar.gz"
-  sha256 "51629bcd17002ee404c91f7c566cfa7d307b8409fd1f8a29f1ca899acd060453"
+  url "https://github.com/davidemerson/issy/archive/refs/tags/v1.2.3.tar.gz"
+  sha256 "42276675a99c9b76898dc5342d909efc617611c8d3277ab72db7eb2b1f2944fe"
   # Commit the stable tarball was cut from. The GitHub source archive has
   # no .git, so build.zig can't derive the SHA; passing it via -Dcommit
   # stamps build_info so `issy --version` shows the real commit and the
@@ -13,7 +13,7 @@ class Issy < Formula
   # A method (not a constant) avoids "already initialized constant"
   # warnings when Homebrew reloads the formula in one process.
   def stable_commit
-    "5b6bfa7e2524e3df5290dc9ffd8895372d35bfce"
+    "33881d5ce64cecad9356b8e1e15219be142b60b9"
   end
   # STABLE_END
   head "https://github.com/davidemerson/issy.git", branch: "main"
