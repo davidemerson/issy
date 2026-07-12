@@ -3,12 +3,9 @@ class Issy < Formula
   homepage "https://github.com/davidemerson/issy"
   license "BSD-3-Clause"
 
-  # STABLE_BEGIN — populated by .github/workflows/ci.yml on `vX.Y.Z` tag push.
-  # Until the first tag lands, this block is empty and the formula is head-only
-  # (`brew install --HEAD davidemerson/issy/issy`). Once populated it gains
-  # `url` + `sha256`, and plain `brew install` / `brew upgrade issy` work as
-  # they do for any versioned formula. Do not edit by hand — edits are
-  # overwritten by the release job in .github/scripts/bump_formula.py.
+  # STABLE_BEGIN — edited by .github/scripts/bump_formula.py on tag push. Do not edit by hand.
+  url "https://github.com/davidemerson/issy/archive/refs/tags/v1.1.0.tar.gz"
+  sha256 "a5b47e9d85441d0b25bc892b9cf2bfbff49e7b375bfa181a9eb6280998c29b37"
   # STABLE_END
   head "https://github.com/davidemerson/issy.git", branch: "main"
 
