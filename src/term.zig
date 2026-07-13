@@ -351,11 +351,15 @@ const max_csi_len = 32;
 fn parseEscape(buf: []const u8) ?EscParse {
     if (buf.len < 2) return null;
 
-    // SS3 sequences: ESC O <final> (F1-F4).
+    // SS3 sequences: ESC O <final> (F1-F4, and home/end as sent by
+    // macOS Terminal.app — nsterm terminfo has khome=\eOH, kend=\eOF —
+    // and by xterm-family terminals in application cursor mode).
     if (buf[1] == 'O') {
         if (buf.len < 3) return null;
         const key: Key = switch (buf[2]) {
             'P' => .f1,
+            'H' => .home,
+            'F' => .end,
             else => .unknown,
         };
         return .{ .key = key, .len = 3 };
@@ -820,6 +824,11 @@ test "key parsing - arrows and special keys" {
     try std.testing.expectEqual(Key.left, parseKey("\x1b[D"));
     try std.testing.expectEqual(Key.home, parseKey("\x1b[H"));
     try std.testing.expectEqual(Key.end, parseKey("\x1b[F"));
+    try std.testing.expectEqual(Key.home, parseKey("\x1b[1~"));
+    try std.testing.expectEqual(Key.end, parseKey("\x1b[4~"));
+    // macOS Terminal.app sends home/end as SS3 (nsterm khome/kend).
+    try std.testing.expectEqual(Key.home, parseKey("\x1bOH"));
+    try std.testing.expectEqual(Key.end, parseKey("\x1bOF"));
     try std.testing.expectEqual(Key.delete, parseKey("\x1b[3~"));
     try std.testing.expectEqual(Key.page_up, parseKey("\x1b[5~"));
     try std.testing.expectEqual(Key.page_down, parseKey("\x1b[6~"));
