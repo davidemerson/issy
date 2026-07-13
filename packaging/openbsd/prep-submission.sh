@@ -2,8 +2,9 @@
 # Prepare an OpenBSD ports submission tarball for editors/issy.
 #
 # What this script does (idempotent — safe to re-run):
-#   1. Creates the v1.0.0 git tag on HEAD if it does not already exist
-#      locally, and pushes it to origin.
+#   1. Creates the git tag (defaults to GH_TAGNAME from issy/Makefile)
+#      on HEAD if it does not already exist locally, and pushes it to
+#      origin.
 #   2. Downloads the GitHub archive tarball for that tag.
 #   3. Computes the base64 SHA256 and byte size of the tarball and
 #      writes them into packaging/openbsd/issy/distinfo, replacing
@@ -17,22 +18,33 @@
 # Usage (from the repo root):
 #   bash packaging/openbsd/prep-submission.sh
 #
-# If you need to re-cut the release at a different tag, override:
-#   TAG=v1.0.1 bash packaging/openbsd/prep-submission.sh
+# If you need to re-cut the release at a different tag, update
+# GH_TAGNAME in issy/Makefile first, then re-run. A TAG=vX.Y.Z
+# override is accepted but must match the Makefile.
 
 set -euo pipefail
-
-TAG="${TAG:-v1.0.0}"
-VERSION="${TAG#v}"
-DISTNAME="issy-${VERSION}"
-REPO_URL="https://github.com/davidemerson/issy"
-ARCHIVE_URL="${REPO_URL}/archive/refs/tags/${TAG}.tar.gz"
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 PORT_DIR="${REPO_ROOT}/packaging/openbsd/issy"
 DISTINFO="${PORT_DIR}/distinfo"
 MAKEFILE="${PORT_DIR}/Makefile"
 OUT_TARBALL="${REPO_ROOT}/packaging/openbsd/issy-port.tar.gz"
+
+# The port Makefile is the single source of truth for the tag; the
+# distinfo this script writes must describe the tarball that GH_TAGNAME
+# will fetch, or the port fails checksum at build time.
+MAKEFILE_TAG="$(awk '/^GH_TAGNAME/ { print $NF }' "$MAKEFILE")"
+TAG="${TAG:-$MAKEFILE_TAG}"
+if [ "$TAG" != "$MAKEFILE_TAG" ]; then
+    printf 'error: TAG=%s does not match GH_TAGNAME=%s in %s\n' \
+        "$TAG" "$MAKEFILE_TAG" "$MAKEFILE" >&2
+    printf '       Update the Makefile first, then re-run.\n' >&2
+    exit 1
+fi
+VERSION="${TAG#v}"
+DISTNAME="issy-${VERSION}"
+REPO_URL="https://github.com/davidemerson/issy"
+ARCHIVE_URL="${REPO_URL}/archive/refs/tags/${TAG}.tar.gz"
 
 say() { printf '==> %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }

@@ -20,9 +20,10 @@ packaging/openbsd/
 
 ## Submission workflow
 
-1. **Edit the MAINTAINER line** in `issy/Makefile` — replace
-   `REPLACE-WITH-YOUR-EMAIL@example.com` with your real email. The
-   prep script will refuse to build the tarball until you do.
+1. **Check `GH_TAGNAME`** in `issy/Makefile` — it must point at the
+   release being submitted. It is the single source of truth for the
+   version; the prep script reads it and refuses a mismatched `TAG=`
+   override.
 
 2. **Run the prep script** from the repo root:
 
@@ -30,9 +31,10 @@ packaging/openbsd/
    bash packaging/openbsd/prep-submission.sh
    ```
 
-   This tags `v1.0.0` on `HEAD`, pushes the tag to origin, downloads
-   the GitHub archive, computes the base64 SHA256 + byte size, writes
-   them into `distinfo`, and builds `packaging/openbsd/issy-port.tar.gz`.
+   This tags `GH_TAGNAME` on `HEAD` (if the tag doesn't already
+   exist), pushes the tag to origin, downloads the GitHub archive,
+   computes the base64 SHA256 + byte size, writes them into
+   `distinfo`, and builds `packaging/openbsd/issy-port.tar.gz`.
    It is idempotent — re-running is safe.
 
 3. **Send the email** to `ports@openbsd.org` with the subject
@@ -60,10 +62,10 @@ packaging/openbsd/
 ## Re-cutting a release
 
 If the first submission round needs revisions, iterate on the files
-under `issy/`, bump the tag:
+under `issy/`, bump `GH_TAGNAME` in `issy/Makefile`, and re-run:
 
 ```sh
-TAG=v1.0.1 bash packaging/openbsd/prep-submission.sh
+bash packaging/openbsd/prep-submission.sh
 ```
 
 The prep script will create the new tag, recompute hashes, and
@@ -71,7 +73,7 @@ rebuild the tarball.
 
 ## What's inside the port
 
-- **`Makefile`** — Pins to `GH_TAGNAME = v1.0.0` on the upstream
+- **`Makefile`** — Pins to `GH_TAGNAME = v1.2.4` on the upstream
   repo. Declares `BUILD_DEPENDS = lang/zig`, `WANTLIB += c`,
   `ONLY_FOR_ARCHS = amd64 arm64` (matching lang/zig). Invokes
   `zig build -Doptimize=ReleaseSafe` in `do-build` with
@@ -98,13 +100,14 @@ rebuild the tarball.
   maintainers may ask for a shared `lang/zig` consumer module
   analogous to `lang/go`. The email draft mentions this up front.
 
-- **Verified on a real OpenBSD 7.9 amd64 VM.** Issy builds with
-  `zig build -Doptimize=ReleaseSafe`, all 666 unit tests pass under
-  `zig build test`, and all 13 PTY-based integration suites in
-  `tests/run_tests.sh` (76 individual cases) pass. The VM uses
-  Zig 0.15.1+3db960767 from `pkg_add zig`. CI mirrors this
-  end-to-end via the `openbsd-test` job in `.github/workflows/ci.yml`,
-  using `cross-platform-actions/action@v1.0.0` with QEMU/KVM, so any
+- **Verified on a real OpenBSD 7.9 amd64 VM.** At v1.2.4, issy builds
+  with `zig build -Doptimize=ReleaseSafe`, all unit tests pass under
+  `zig build test` (252 test blocks; 1270 executions across
+  compilation units), and all 15 PTY-based integration suites in
+  `tests/run_tests.sh` (58 individual cases) pass. The VM uses
+  Zig 0.15.2+e4cbd752c from `pkg_add zig`. CI runs this end-to-end
+  via the `openbsd-test` job in `.github/workflows/ci.yml`, using
+  `cross-platform-actions/action@v1.3.0` with QEMU/KVM, so any
   regression that breaks the OpenBSD build will block the merge.
 
 - **The first ports-submission attempt failed** with

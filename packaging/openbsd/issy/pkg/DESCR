@@ -6,7 +6,7 @@ instead of rainbow colors, and a soft right margin that stops long
 lines from running into the terminal edge.
 
 It ships with a gap buffer for text storage, syntax highlighting for
-17 languages (including TeX/LaTeX), multi-cursor editing,
+20 languages (including TeX/LaTeX), multi-cursor editing,
 incremental search, undo/redo, and path auto-completion in the open
 prompt. It can also export the current buffer to a real PDF 1.4 file
 with TTF/OTF font embedding via a hand-rolled writer, with no

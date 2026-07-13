@@ -2,8 +2,7 @@ COMMENT =	tiny text editor that looks like a printed page
 
 GH_ACCOUNT =	davidemerson
 GH_PROJECT =	issy
-GH_TAGNAME =	v1.0.0
-DISTNAME =	issy-1.0.0
+GH_TAGNAME =	v1.2.4
 
 CATEGORIES =	editors
 HOMEPAGE =	https://github.com/davidemerson/issy
@@ -21,11 +20,6 @@ ONLY_FOR_ARCHS =	amd64 arm64
 BUILD_DEPENDS =		lang/zig
 
 WANTLIB +=		c
-
-# zig build is a self-contained build driver: no configure, no make.
-# The upstream project has its own test suite that runs under
-# `zig build test`.
-NO_TEST =		No
 
 # Keep zig's cache out of $HOME (ports builds run unprivileged without
 # a writable home). Mirrors the lang/zig port's own invocation style.
