@@ -3524,7 +3524,7 @@ test "byteColToVisualCol expands tabs to tab stops" {
     var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
 
-    // Same shape as the MAINTAINER line in packaging/openbsd/issy/Makefile:
+    // Same shape as a MAINTAINER line in a BSD port Makefile:
     // "MAINTAINER =\tDavid Emerson <REPLACE...>"
     try ed.buf.insert(0, "MAINTAINER =\tDavid\n");
 
