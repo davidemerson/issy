@@ -13,5 +13,9 @@ src/build_info.zig
 # OS files
 .DS_Store
 
+# Tcl `exec ... 2>&1` in the PDF integration tests writes stderr to a file
+# literally named "&1" (Tcl merges streams with 2>@1, not 2>&1).
+/&1
+
 # Python bytecode (from .github/scripts/)
 __pycache__/

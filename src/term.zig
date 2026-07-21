@@ -58,8 +58,20 @@ pub const Key = union(enum) {
     ctrl: u8,
     f1,
     help, // Ctrl+/ or Ctrl+Shift+?
-    paste_start, // DECSET 2004 — terminal is about to stream pasted bytes
-    paste_end, // DECSET 2004 — end of the pasted block
+    mouse_middle: struct { row: u16, col: u16 }, // middle button — primary-selection paste
+    /// A block of already-decoded text from a bracketed paste (DECSET 2004,
+    /// ESC[200~ … ESC[201~) — always the result of the user pasting. The
+    /// slice points into a module-static buffer valid only until the next
+    /// readKey call, so the caller must consume it before reading the next key.
+    paste: []const u8,
+    /// Decoded text from an OSC 52 clipboard-read reply (ESC]52;c|p;<base64>),
+    /// which the terminal sends only in answer to a query we emitted. The
+    /// caller should insert it only if it is still expecting a reply (a late
+    /// reply after the fallback fired must be ignored). Same buffer-lifetime
+    /// caveat as `.paste`.
+    clipboard_reply: []const u8,
+    paste_start, // internal: DECSET 2004 start marker (intercepted in readKeyPosix)
+    paste_end, // internal: DECSET 2004 end marker (intercepted in readKeyPosix)
     unknown,
     none,
 };
@@ -85,6 +97,40 @@ const READ_BUF_SIZE = 256;
 var read_buf: [READ_BUF_SIZE]u8 = undefined;
 var read_start: usize = 0;
 var read_end: usize = 0;
+
+// ── Paste / OSC-52 capture ──
+//
+// A bracketed paste body and an OSC-52 clipboard reply are both delivered
+// to the editor as a single `.paste` blob rather than streamed byte-by-byte
+// through the key parser — that is what keeps a pasted newline from firing
+// an Enter command, a pasted control byte from switching modes, and an ESC
+// inside pasted text from being mis-parsed as an escape sequence.
+//
+// `paste_buf` holds one chunk of decoded paste text. A paste larger than
+// the buffer is delivered as several consecutive `.paste` events. It is
+// module-static (not heap) so term stays allocation-free; the slice handed
+// to the editor is only valid until the next readKey call.
+const PASTE_BUF_SIZE = 64 * 1024;
+var paste_buf: [PASTE_BUF_SIZE]u8 = undefined;
+// True while inside a bracketed paste body (between ESC[200~ and ESC[201~).
+var paste_active: bool = false;
+
+// Raw OSC payload accumulation buffer (the `52;c;<base64>` bytes). Sized to
+// hold the base64 encoding of a PASTE_BUF_SIZE clipboard plus the short
+// `52;c;` prefix. A reply larger than this is refused (returns .none).
+const OSC_ACCUM_SIZE = 90 * 1024;
+var osc_accum: [OSC_ACCUM_SIZE]u8 = undefined;
+
+// How many empty ~100ms read windows to tolerate while waiting for the rest
+// of a split escape sequence before giving up. Bounds the worst case for a
+// slow link without stranding a lone Escape keypress.
+const max_split_waits: usize = 3;
+
+// How many empty ~100ms read windows to wait for the rest of a split
+// bracketed-paste end marker (ESC[201~) mid-body. More generous than
+// `max_split_waits` — we are certainly inside a paste and the terminator is
+// certainly coming, so this only bounds a pathological broken stream (~2s).
+const max_marker_waits: usize = 20;
 
 const is_posix = (builtin.os.tag == .linux or builtin.os.tag == .macos or
     builtin.os.tag == .openbsd or builtin.os.tag == .freebsd or
@@ -261,6 +307,10 @@ fn readBufSlice(start: usize, end: usize) []const u8 {
 }
 
 fn readKeyPosix() !Key {
+    // Inside a bracketed paste body: keep handing the editor decoded text
+    // chunks (never key events) until the ESC[201~ terminator is consumed.
+    if (paste_active) return capturePasteBody();
+
     // If no data in buffer, read from stdin
     if (readBufAvailable() == 0) {
         fillReadBuf();
@@ -297,22 +347,50 @@ fn readKeyPosix() !Key {
 
     // Escape sequences
     if (b == 0x1b) {
+        var split_waits: usize = 0;
         while (true) {
             const avail = readBufAvailable();
+
+            // OSC: ESC ] … (BEL | ST). Used here to catch an OSC 52
+            // clipboard-read reply and turn it into a `.paste` blob. Any
+            // other OSC is consumed and ignored.
+            if (avail >= 2 and readBufPeek(1) == ']') return captureOsc();
+
             if (parseEscape(readBufSlice(0, avail))) |r| {
                 readBufConsume(r.len);
-                return r.key;
+                switch (r.key) {
+                    // Bracketed paste start: switch to body-capture mode and
+                    // return the first decoded chunk. The editor never sees
+                    // the raw markers.
+                    .paste_start => {
+                        paste_active = true;
+                        return capturePasteBody();
+                    },
+                    // A stray end marker outside a paste (e.g. after a
+                    // split-recovery) — skip it and read the next key.
+                    .paste_end => return readKeyPosix(),
+                    else => return r.key,
+                }
             }
             // Valid-but-incomplete sequence (e.g. "ESC [" split across
             // reads over a slow connection). Try to pull more bytes —
             // fillReadBuf waits up to the 100ms termios timeout once.
             fillReadBuf();
             if (readBufAvailable() == avail) {
-                // Nothing more arrived — treat as a bare Escape key and
-                // leave any following bytes for the next readKey call.
+                // Nothing more arrived. Distinguish a lone Escape keypress
+                // (buffer is exactly ESC — bail immediately) from a genuine
+                // CSI/SS3 sequence straddling the timeout (ESC [ … / ESC O …
+                // — keep waiting a bounded number of windows so a paste
+                // marker split by a slow link isn't corrupted into literal
+                // text).
+                if (avail >= 2 and (readBufPeek(1) == '[' or readBufPeek(1) == 'O')) {
+                    split_waits += 1;
+                    if (split_waits < max_split_waits) continue;
+                }
                 readBufConsume(1);
                 return .escape;
             }
+            split_waits = 0; // progress made — reset patience
         }
     }
 
@@ -545,6 +623,17 @@ fn parseSgrMouse(buf: []const u8) Key {
         }
     }
 
+    // Middle button (SGR button 1). With mouse reporting enabled the
+    // terminal forwards the middle click to us instead of doing its own
+    // primary-selection paste, so we react on press by pasting the primary
+    // selection ourselves (via an OSC 52 read). Release is a no-op.
+    if (button == 1) {
+        if (is_press) {
+            return .{ .mouse_middle = .{ .row = row, .col = col } };
+        }
+        return .none;
+    }
+
     // SGR encodes modifier bits on the button: shift=4, meta=8,
     // ctrl=16. Left-click with shift held is button 0 | 4 = 4. Emit
     // a distinct key so the editor can extend the existing selection
@@ -566,6 +655,158 @@ fn parseSgrMouse(buf: []const u8) Key {
     }
 
     return .none;
+}
+
+// ── Paste / OSC-52 capture ──
+
+/// True when the 6 bytes are the bracketed-paste end marker ESC[201~.
+fn isPasteEnd(s: []const u8) bool {
+    return s.len >= 6 and s[0] == 0x1b and s[1] == '[' and
+        s[2] == '2' and s[3] == '0' and s[4] == '1' and s[5] == '~';
+}
+
+/// True when `s` is a (possibly partial) leading prefix of ESC[201~.
+fn isPasteEndPrefix(s: []const u8) bool {
+    const marker = "\x1b[201~";
+    if (s.len == 0 or s.len >= marker.len) return false;
+    return std.mem.eql(u8, s, marker[0..s.len]);
+}
+
+/// Capture the body of a bracketed paste into `paste_buf` and return it as a
+/// single `.paste` event. Called repeatedly while `paste_active`: a body
+/// larger than the buffer comes back as several consecutive `.paste` chunks,
+/// and `paste_active` is cleared once the ESC[201~ terminator is consumed.
+///
+/// ESC bytes inside the pasted text are captured literally (the terminal only
+/// filters the terminator, not other control bytes), and the terminator may
+/// arrive split across reads — both handled without ever tokenizing the
+/// content as key events.
+fn capturePasteBody() Key {
+    var n: usize = 0;
+    var waits: usize = 0;
+    while (n < PASTE_BUF_SIZE) {
+        if (readBufAvailable() == 0) {
+            fillReadBuf();
+            if (readBufAvailable() == 0) {
+                if (n > 0) break; // hand over what we have; resume next call
+                waits += 1;
+                if (waits >= max_split_waits) {
+                    // The stream stalled with nothing captured. Give up on
+                    // the paste rather than hang forever; the terminal
+                    // normally sends ESC[201~ promptly.
+                    paste_active = false;
+                    return .none;
+                }
+                continue;
+            }
+        }
+        const c = readBufPeek(0);
+        if (c == 0x1b) {
+            // Resolve, inline, whether this ESC begins the ESC[201~ terminator
+            // or is a literal ESC in the pasted text. A bracketed paste always
+            // ends with this terminator, so when the marker is split across
+            // reads we wait (bounded) for the rest — `isPasteEndPrefix` keeps
+            // us waiting only while the bytes still match the marker, so a
+            // literal ESC in content (which diverges) stops the wait at once.
+            // Resolving here rather than returning partial content keeps a
+            // slow-link split from ever stranding `paste_active`.
+            var marker_waits: usize = 0;
+            while (readBufAvailable() < 6 and
+                isPasteEndPrefix(readBufSlice(0, readBufAvailable())))
+            {
+                const before = readBufAvailable();
+                fillReadBuf();
+                if (readBufAvailable() == before) {
+                    marker_waits += 1;
+                    if (marker_waits >= max_marker_waits) break;
+                }
+            }
+            if (readBufAvailable() >= 6 and isPasteEnd(readBufSlice(0, 6))) {
+                readBufConsume(6);
+                paste_active = false;
+                break;
+            }
+            // Not the terminator — capture the ESC as literal content.
+            paste_buf[n] = c;
+            n += 1;
+            readBufConsume(1);
+            waits = 0;
+            continue;
+        }
+        paste_buf[n] = c;
+        n += 1;
+        readBufConsume(1);
+        waits = 0;
+    }
+    return .{ .paste = paste_buf[0..n] };
+}
+
+/// Consume an OSC sequence beginning at ESC ] and, if it is an OSC 52
+/// clipboard reply (`ESC ] 52 ; <sel> ; <base64> BEL|ST`), base64-decode the
+/// payload into `paste_buf` and return it as a `.paste` event. Any other OSC,
+/// a malformed reply, or an oversize payload returns `.none`.
+fn captureOsc() Key {
+    // Consume the leading ESC ].
+    readBufConsume(2);
+
+    var n: usize = 0;
+    var waits: usize = 0;
+    while (true) {
+        if (readBufAvailable() == 0) {
+            fillReadBuf();
+            if (readBufAvailable() == 0) {
+                waits += 1;
+                if (waits >= max_split_waits) return .none; // stalled
+                continue;
+            }
+            waits = 0;
+        }
+        const c = readBufPeek(0);
+        if (c == 0x07) { // BEL terminator
+            readBufConsume(1);
+            break;
+        }
+        if (c == 0x1b) { // possible ST terminator (ESC \)
+            if (readBufAvailable() < 2) {
+                fillReadBuf();
+                if (readBufAvailable() < 2) {
+                    waits += 1;
+                    if (waits >= max_split_waits) return .none;
+                    continue;
+                }
+            }
+            if (readBufPeek(1) == '\\') {
+                readBufConsume(2);
+                break;
+            }
+            // A bare ESC mid-OSC — malformed; stop here.
+            readBufConsume(1);
+            break;
+        }
+        if (n >= OSC_ACCUM_SIZE) return .none; // oversize — refuse
+        osc_accum[n] = c;
+        n += 1;
+        readBufConsume(1);
+    }
+
+    return decodeOsc52(osc_accum[0..n]);
+}
+
+/// Given the raw payload of an OSC (everything between `ESC ]` and the
+/// terminator), decode an OSC 52 clipboard reply into a `.paste` event.
+fn decodeOsc52(payload: []const u8) Key {
+    // Expect: 52 ; <selector> ; <base64>
+    if (!std.mem.startsWith(u8, payload, "52;")) return .none;
+    const after_kind = payload[3..];
+    const semi = std.mem.indexOfScalar(u8, after_kind, ';') orelse return .none;
+    const b64 = after_kind[semi + 1 ..];
+    if (b64.len == 0) return .none;
+
+    const decoder = std.base64.standard.Decoder;
+    const decoded_len = decoder.calcSizeForSlice(b64) catch return .none;
+    if (decoded_len == 0 or decoded_len > PASTE_BUF_SIZE) return .none;
+    decoder.decode(paste_buf[0..decoded_len], b64) catch return .none;
+    return .{ .clipboard_reply = paste_buf[0..decoded_len] };
 }
 
 // ── Output functions ──
@@ -630,6 +871,50 @@ pub fn writeOsc52Clipboard(data: []const u8) void {
     }
 
     writeStr("\x07");
+}
+
+/// Emit an OSC 52 clipboard *read* query. The terminal replies on stdin with
+/// `ESC ] 52 ; <sel> ; <base64> BEL`, which readKeyPosix turns into a `.paste`
+/// event. `primary` selects the primary selection (selector `p`, what
+/// middle-click pastes) instead of the clipboard (selector `c`). No-op if the
+/// terminal isn't initialized; the reply may never come if the terminal has
+/// OSC 52 read disabled, so callers must arrange a fallback.
+pub fn requestOsc52Read(primary: bool) void {
+    if (!initialized) return;
+    writeStr(if (primary) "\x1b]52;p;?\x07" else "\x1b]52;c;?\x07");
+    doFlush() catch {};
+}
+
+/// After requestOsc52Read, block up to `timeout_ms` for the terminal's reply
+/// and return its decoded text (into `paste_buf`), or null on timeout / if the
+/// terminal has OSC 52 read disabled (no reply). A local terminal answers in
+/// well under a millisecond, so the common path returns almost immediately;
+/// the timeout only bites on terminals that never answer.
+///
+/// Consumes only the reply itself — if the next input is an ordinary keypress
+/// (the user typed in the sub-millisecond window), it is left in the buffer
+/// for readKey, and we report timeout so the caller falls back to the internal
+/// clipboard rather than swallowing the keystroke.
+pub fn readOsc52Reply(timeout_ms: i64) ?[]const u8 {
+    if (!initialized) return null;
+    const start = std.time.milliTimestamp();
+    while (std.time.milliTimestamp() - start < timeout_ms) {
+        if (readBufAvailable() == 0) {
+            fillReadBuf(); // returns on the first byte, or after ~100ms
+            if (readBufAvailable() == 0) continue;
+        }
+        if (readBufPeek(0) != 0x1b) return null; // an ordinary key — leave it
+        if (readBufAvailable() < 2) {
+            fillReadBuf();
+            if (readBufAvailable() < 2) return null;
+        }
+        if (readBufPeek(1) != ']') return null; // some other escape — leave it
+        return switch (captureOsc()) {
+            .clipboard_reply => |t| t,
+            else => null, // a non-clipboard OSC or malformed reply
+        };
+    }
+    return null;
 }
 
 fn doFlush() !void {
@@ -925,4 +1210,49 @@ test "key parsing - SGR mouse release" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "key parsing - SGR middle-click emits mouse_middle on press only" {
+    switch (parseKey("\x1b[<1;3;1M")) {
+        .mouse_middle => |pos| {
+            try std.testing.expectEqual(@as(u16, 0), pos.row);
+            try std.testing.expectEqual(@as(u16, 2), pos.col);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    // Release (lowercase m) is a no-op.
+    try std.testing.expectEqual(Key.none, parseKey("\x1b[<1;3;1m"));
+}
+
+test "bracketed paste end-marker detection" {
+    try std.testing.expect(isPasteEnd("\x1b[201~"));
+    try std.testing.expect(isPasteEnd("\x1b[201~trailing")); // only first 6 matter
+    try std.testing.expect(!isPasteEnd("\x1b[200~")); // start marker, not end
+    try std.testing.expect(!isPasteEnd("\x1b[201"));
+
+    // Prefix predicate: a partial leading match keeps the reader waiting;
+    // a full or diverging sequence stops it.
+    try std.testing.expect(isPasteEndPrefix("\x1b"));
+    try std.testing.expect(isPasteEndPrefix("\x1b[2"));
+    try std.testing.expect(isPasteEndPrefix("\x1b[201"));
+    try std.testing.expect(!isPasteEndPrefix("\x1b[201~")); // complete, not a prefix
+    try std.testing.expect(!isPasteEndPrefix("\x1b[3")); // diverges
+    try std.testing.expect(!isPasteEndPrefix("")); // empty
+}
+
+test "OSC 52 reply decoding" {
+    // "hello" base64-encodes to "aGVsbG8=".
+    switch (decodeOsc52("52;c;aGVsbG8=")) {
+        .clipboard_reply => |t| try std.testing.expectEqualStrings("hello", t),
+        else => return error.TestUnexpectedResult,
+    }
+    // Primary-selection selector also decodes.
+    switch (decodeOsc52("52;p;aGVsbG8=")) {
+        .clipboard_reply => |t| try std.testing.expectEqualStrings("hello", t),
+        else => return error.TestUnexpectedResult,
+    }
+    // Non-clipboard OSC, empty payload, and malformed base64 are ignored.
+    try std.testing.expectEqual(Key.none, decodeOsc52("0;some title"));
+    try std.testing.expectEqual(Key.none, decodeOsc52("52;c;"));
+    try std.testing.expectEqual(Key.none, decodeOsc52("52;c;!!!not-base64"));
 }

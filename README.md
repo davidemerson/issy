@@ -176,12 +176,14 @@ issy --font /path/to/font.ttf --print output.pdf source.c
 | Ctrl+Y | Redo |
 | Ctrl+C | Copy selection (also pushes to OS clipboard via OSC 52) |
 | Ctrl+X | Cut selection (also pushes to OS clipboard via OSC 52) |
-| Ctrl+V | Paste from internal clipboard (OS paste comes via terminal paste: Cmd+V / Ctrl+Shift+V) |
+| Ctrl+V | Paste the system clipboard via OSC 52 (falls back to issy's internal clipboard if the terminal blocks OSC 52 read) |
 | Ctrl+A | Select all |
 | Tab | Insert tab or spaces (per config) |
 | Enter | Newline with auto-indent |
 
-Typing, Tab, or Enter while a selection is active replaces the selection. Terminal pastes use bracketed paste (DECSET 2004): during a paste, auto-indent is suppressed and tabs land as literal `\t`, so already-indented content comes in verbatim instead of compounding.
+Typing, Tab, or Enter while a selection is active replaces the selection.
+
+**Pasting.** `Ctrl+V` reads the system clipboard over OSC 52, so text copied in any other application pastes straight in; if the terminal has OSC 52 read disabled (common over SSH), it falls back to issy's own internal clipboard. Middle-click pastes the primary selection the same way. Your terminal's native paste keys always work too — **`Ctrl+Shift+V`** (clipboard) and **`Shift+Insert`** (primary selection) — arriving as a bracketed paste (DECSET 2004). However it arrives, pasted text is inserted verbatim as a single undo step: auto-indent is not applied and embedded newlines or tabs never trigger editor commands, so already-formatted content comes in exactly as copied. Set `system_clipboard = false` in `~/.issyrc` to keep `Ctrl+V` bound to the internal clipboard only.
 
 ### Navigation
 

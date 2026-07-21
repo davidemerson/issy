@@ -285,6 +285,17 @@ seed_rc() {
 # auto_detect_indent = true
 # scroll_margin = 5
 
+# ── Clipboard ──
+#
+# system_clipboard: when on (the default), Ctrl+V and middle-click read the
+# system clipboard / primary selection via OSC 52, so text copied in any
+# other application pastes in. Falls back to issy's internal clipboard if the
+# terminal has OSC 52 read disabled. Set false to keep Ctrl+V internal-only.
+# (Pasting via the terminal's own key — Ctrl+Shift+V / Shift+Insert — always
+# works regardless of this setting.)
+
+# system_clipboard = true
+
 # ── Display ──
 
 # line_numbers = true

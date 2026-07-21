@@ -1,0 +1,88 @@
+#!/usr/bin/expect -f
+# t16_paste.exp -- bracketed paste, OSC 52 clipboard read, and paste safety.
+#
+# Covers the paste overhaul: pasted content is inserted as one verbatim blob
+# (never streamed through the key parser), Ctrl+V reads the system clipboard
+# via OSC 52, and a paste containing a newline can no longer trigger commands
+# (the "discard unsaved changes?" data-loss bug).
+
+set timeout 8
+set issy [lindex $argv 0]
+set test_dir [lindex $argv 1]
+source "$test_dir/helpers.tcl"
+
+set tmpdir [exec mktemp -d]
+
+# --- P1: bracketed paste inserts text verbatim ---
+set f "$tmpdir/p1.txt"
+spawn $issy --no-config
+sleep 0.8
+send "\x1b\[200~pasted-verbatim\x1b\[201~"
+sleep 0.3
+save_as_quit $f
+record_result [assert_file $f "pasted-verbatim" "P1_bracketed_paste"]
+
+# --- P2: multiline paste keeps its own indentation (no auto-indent compounding) ---
+# The first line is indented; a streamed paste would auto-indent the second
+# line to match, doubling the leading whitespace. A blob insert must not.
+set f "$tmpdir/p2.txt"
+spawn $issy --no-config
+sleep 0.8
+send "\x1b\[200~    indented\nflush\x1b\[201~"
+sleep 0.3
+save_as_quit $f
+record_result [assert_file $f "    indented\nflush" "P2_multiline_no_autoindent"]
+
+# --- P3: a newline inside a paste must NOT confirm a destructive prompt ---
+# Make an unsaved edit, open the quit-confirm prompt, then paste text with a
+# newline. Previously the embedded newline confirmed the discard and quit,
+# losing the buffer. Now the paste is inert while the prompt is up.
+set f "$tmpdir/p3.txt"
+spawn $issy --no-config
+sleep 0.8
+send "keep-me"
+sleep 0.2
+send "\x11";  # Ctrl+Q -> confirm (buffer is modified)
+sleep 0.3
+send "\x1b\[200~X\nY\x1b\[201~";  # paste with newline -- must be ignored here
+sleep 0.3
+send "\x1b";  # Escape -> cancel the confirm prompt
+sleep 0.3
+save_as_quit $f
+record_result [assert_file $f "keep-me" "P3_paste_in_confirm_no_dataloss"]
+
+# --- P4: Ctrl+V reads the system clipboard via OSC 52 ---
+# issy emits the read query; we answer it the way a terminal would, and the
+# decoded text must land in the buffer.  base64("SYSTEM-CLIP") = U1lTVEVNLUNMSVA=
+set f "$tmpdir/p4.txt"
+spawn $issy --no-config
+sleep 0.8
+send "\x16";  # Ctrl+V
+expect {
+    -ex "\x1b]52;c;?\x07" {
+        send "\x1b]52;c;U1lTVEVNLUNMSVA=\x07"
+    }
+    timeout {}
+}
+sleep 0.3
+save_as_quit $f
+record_result [assert_file $f "SYSTEM-CLIP" "P4_osc52_clipboard_read"]
+
+# --- P5: middle-click pastes the primary selection via OSC 52 (selector p) ---
+set f "$tmpdir/p5.txt"
+spawn $issy --no-config
+sleep 0.8
+send "\x1b\[<1;1;1M";  # middle-button press at row 1, col 1
+expect {
+    -ex "\x1b]52;p;?\x07" {
+        send "\x1b]52;p;U1lTVEVNLUNMSVA=\x07"
+    }
+    timeout {}
+}
+send "\x1b\[<1;1;1m";  # middle-button release (no-op)
+sleep 0.3
+save_as_quit $f
+record_result [assert_file $f "SYSTEM-CLIP" "P5_middleclick_primary_read"]
+
+exec rm -rf $tmpdir
+report_results "t16_paste"

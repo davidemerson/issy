@@ -106,6 +106,12 @@ pub const Config = struct {
     /// bar. Best-effort; silent when the directory isn't writable.
     swap_files: bool = true,
     scroll_margin: u8 = 5,
+    /// When true, Ctrl+V and middle-click read the system clipboard / primary
+    /// selection via OSC 52, so text copied in any other application pastes
+    /// in. If the terminal has OSC 52 read disabled (common over SSH), the
+    /// paste falls back to issy's internal clipboard. Set false to keep
+    /// Ctrl+V bound to the internal clipboard only.
+    system_clipboard: bool = true,
 
     // Visual design
     gutter_padding: u8 = 3,
@@ -247,6 +253,8 @@ fn parseConfigKey(cfg: *Config, key: []const u8, val: []const u8) void {
         cfg.indent_mismatch = parseBool(val);
     } else if (std.mem.eql(u8, key, "swap_files")) {
         cfg.swap_files = parseBool(val);
+    } else if (std.mem.eql(u8, key, "system_clipboard")) {
+        cfg.system_clipboard = parseBool(val);
     } else if (std.mem.eql(u8, key, "scroll_margin")) {
         const v = std.fmt.parseInt(u8, val, 10) catch return;
         if (v <= max_scroll_margin) cfg.scroll_margin = v;

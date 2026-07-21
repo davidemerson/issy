@@ -38,6 +38,13 @@ const UndoEntry = struct {
 
 pub const LineCol = struct { line: usize, col: usize };
 
+/// How long Ctrl+V / middle-click waits for an OSC 52 clipboard-read reply
+/// before falling back to the internal clipboard. A terminal that supports the
+/// read answers in well under a millisecond (instant paste); this only bounds
+/// the wait on terminals with OSC 52 read disabled, kept to roughly one read
+/// window so the fallback paste there stays snappy.
+const osc52_read_timeout_ms: i64 = 100;
+
 pub const Editor = struct {
     buf: buffer_mod.Buffer,
     language: ?*const syntax_mod.Language = null,
@@ -124,11 +131,6 @@ pub const Editor = struct {
 
     confirm_action: enum { none, quit, new, open, reload } = .none,
     command_action: enum { open, save_as, goto_line } = .open,
-
-    // True between a bracketed-paste start and end marker. While set,
-    // insertNewline/insertTab skip their auto-indent and tab-expansion
-    // logic so already-formatted pasted content comes in verbatim.
-    in_paste: bool = false,
 
     // Swap-file autosave: timestamp of the last swap write, so the main
     // loop's 1/sec tick can throttle writes while the buffer is dirty.
@@ -490,6 +492,23 @@ pub const Editor = struct {
             }
         }
 
+        // Pasted text (bracketed paste or an OSC 52 clipboard-read reply) is
+        // handled centrally, before the per-mode dispatch, so it is treated
+        // as inert text in every mode. This is what stops a newline inside a
+        // paste from confirming a "discard changes?" prompt, exiting search,
+        // or submitting the open-file prompt — the whole class of bugs that
+        // came from streaming paste content through the key parser.
+        if (key == .paste) {
+            // A user-initiated bracketed paste — always inserted as inert text.
+            return self.handlePaste(key.paste);
+        }
+        if (key == .clipboard_reply) {
+            // OSC 52 read replies are consumed synchronously inside
+            // doSystemPaste; one reaching here is unsolicited or arrived after
+            // its query already timed out, so ignore it (never a spurious paste).
+            return .none;
+        }
+
         switch (self.mode) {
             .normal => return self.handleNormalKey(key),
             .search => return self.handleSearchKey(key),
@@ -502,6 +521,87 @@ pub const Editor = struct {
                 return .redraw;
             },
         }
+    }
+
+    /// Insert pasted text (from a bracketed paste or an OSC 52 clipboard read)
+    /// according to the active mode. Newlines and other control bytes are
+    /// treated as literal content in the document, and stripped when the
+    /// target is a single-line prompt field.
+    fn handlePaste(self: *Editor, text: []const u8) Action {
+        if (text.len == 0) return .redraw;
+        switch (self.mode) {
+            .normal => {
+                self.insertPastedText(text);
+                self.updateBracketMatch();
+                return .redraw;
+            },
+            .search => {
+                self.appendToPrompt(self.search_pattern[0..], &self.search_len, text);
+                self.incrementalSearch();
+                return .redraw;
+            },
+            .command => {
+                self.appendToPrompt(self.prompt_buf[0..], &self.prompt_len, text);
+                return .redraw;
+            },
+            .replace => {
+                if (self.replace_phase == .search) {
+                    self.appendToPrompt(self.search_pattern[0..], &self.search_len, text);
+                } else {
+                    self.appendToPrompt(self.replace_buf[0..], &self.replace_len, text);
+                }
+                return .redraw;
+            },
+            // Confirm and help prompts take no text; a paste there is ignored
+            // rather than being interpreted as a keypress.
+            .confirm, .help => return .redraw,
+        }
+    }
+
+    /// Append printable UTF-8 bytes from `text` to a fixed prompt buffer,
+    /// dropping control bytes (newline, tab, etc.) so a multi-line paste
+    /// collapses to a single line and can't submit or reconfigure the prompt.
+    /// Stops at the buffer's capacity.
+    fn appendToPrompt(_: *Editor, buf: []u8, len: *usize, text: []const u8) void {
+        for (text) |c| {
+            if (c < 0x20 or c == 0x7f) continue; // skip control bytes
+            if (len.* >= buf.len) break;
+            buf[len.*] = c;
+            len.* += 1;
+        }
+    }
+
+    /// Insert a verbatim blob at the cursor as one undo step — the shared
+    /// landing point for internal Ctrl+V paste, bracketed paste, and OSC 52
+    /// clipboard reads.
+    fn insertPastedText(self: *Editor, text: []const u8) void {
+        if (text.len == 0) return;
+        if (self.sel_active) self.deleteSelection();
+        const pos = self.cursorBytePos();
+        self.pushUndo(pos, null, text.len);
+        self.buf.insert(pos, text) catch return;
+        self.modified = true;
+        self.repositionCursorToBytePos(pos + text.len);
+    }
+
+    /// Paste the system clipboard (or the primary selection, for middle-click)
+    /// at the cursor. Emits an OSC 52 read query and waits briefly for the
+    /// terminal's reply; on any terminal without OSC 52 read — no reply — it
+    /// falls back to issy's internal clipboard so Ctrl+V still pastes. When
+    /// system-clipboard integration is disabled in config, pastes the internal
+    /// clipboard directly. Synchronous so it never depends on the main loop.
+    fn doSystemPaste(self: *Editor, primary: bool) void {
+        if (self.config.system_clipboard) {
+            term.requestOsc52Read(primary);
+            if (term.readOsc52Reply(osc52_read_timeout_ms)) |text| {
+                self.insertPastedText(text);
+            } else {
+                self.paste();
+            }
+        } else {
+            self.paste();
+        }
+        self.updateBracketMatch();
     }
 
     fn handleNormalKey(self: *Editor, key: term.Key) Action {
@@ -679,16 +779,20 @@ pub const Editor = struct {
                 self.mode = .help;
                 return .redraw;
             },
-            .paste_start => {
-                // Selection replacement happens once up front so a
-                // selection isn't re-deleted on every char of the paste.
-                if (self.sel_active) self.deleteSelection();
-                self.in_paste = true;
-                return .redraw;
-            },
-            .paste_end => {
-                self.in_paste = false;
-                self.updateBracketMatch();
+            .mouse_middle => |pos| {
+                // Middle-click pastes the primary selection (the last
+                // highlighted text) at the click point, matching the
+                // terminal/X11 convention. Position the caret there directly
+                // — not via handleMouseClick, whose click-count/drag state is
+                // only meaningful for the left button.
+                self.cursors.clearRetainingCapacity();
+                self.sel_active = false;
+                const bp = self.screenToBufferPos(pos.row, pos.col);
+                self.cursor.line = bp.line;
+                self.cursor.col = bp.col;
+                self.cursor.col_want = bp.col;
+                self.ensureCursorVisible();
+                self.doSystemPaste(true);
                 return .redraw;
             },
             else => return .none,
@@ -769,7 +873,11 @@ pub const Editor = struct {
                 return .redraw;
             },
             'v' => {
-                self.paste();
+                // Paste the system clipboard (via OSC 52 read) so Ctrl+V
+                // pulls in text copied from any other application, falling
+                // back to issy's internal clipboard if the terminal doesn't
+                // answer. With system_clipboard off, paste internal directly.
+                self.doSystemPaste(false);
                 return .redraw;
             },
             'n' => {
@@ -2297,10 +2405,11 @@ pub const Editor = struct {
         var indent_buf: [256]u8 = undefined;
         var indent_len: usize = 0;
 
-        // Auto-indent: copy leading whitespace from current line.
-        // Suppressed during a bracketed paste so the already-indented
-        // pasted content doesn't compound on every embedded newline.
-        if (self.config.auto_indent and !self.in_paste) {
+        // Auto-indent: copy leading whitespace from current line. Pasted
+        // content bypasses this path entirely — it is inserted as one
+        // verbatim blob (see handlePaste), not streamed a char at a time —
+        // so auto-indent only ever applies to real Enter keypresses.
+        if (self.config.auto_indent) {
             if (self.buf.getLine(self.cursor.line)) |line_info| {
                 var tmp: [256]u8 = undefined;
                 const data = self.buf.contiguousSlice(line_info.start, @min(line_info.len, 256), &tmp);
@@ -2336,18 +2445,6 @@ pub const Editor = struct {
         if (self.sel_active) self.deleteSelection();
 
         const pos = self.cursorBytePos();
-        // Pasted tabs should land as literal '\t' regardless of the
-        // expand-tabs setting, otherwise \t gets silently rewritten to
-        // N spaces as it streams in.
-        if (self.in_paste) {
-            self.pushUndo(pos, null, 1);
-            self.buf.insert(pos, "\t") catch return;
-            self.cursor.col += 1;
-            self.cursor.col_want = self.cursor.col;
-            self.modified = true;
-            self.ensureCursorVisible();
-            return;
-        }
         if (self.effectiveExpandTabs()) {
             // tab_width is validated to 1..8 at config parse time and the
             // detected width is always 2 or 4, but clamp anyway — an
@@ -2907,17 +3004,7 @@ pub const Editor = struct {
 
     fn paste(self: *Editor) void {
         const cb = self.clipboard orelse return;
-        if (cb.len == 0) return;
-
-        if (self.sel_active) self.deleteSelection();
-
-        const pos = self.cursorBytePos();
-        self.pushUndo(pos, null, cb.len);
-        self.buf.insert(pos, cb) catch return;
-        self.modified = true;
-
-        // Move cursor past pasted text
-        self.repositionCursorToBytePos(pos + cb.len);
+        self.insertPastedText(cb);
     }
 
     // ── Bracket matching ──

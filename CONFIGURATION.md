@@ -35,6 +35,7 @@ Blank lines and lines starting with `#` are ignored. Unknown keys are silently s
 | `trailing_whitespace` | bool | `true` | Faintly highlight trailing spaces/tabs on non-empty lines |
 | `indent_mismatch` | bool | `true` | Faintly highlight leading indent that doesn't match the detected file style |
 | `scroll_margin` | integer | `5` | Minimum lines between cursor and screen edge before scrolling. Valid range 0–100. |
+| `system_clipboard` | bool | `true` | When on, `Ctrl+V` and middle-click read the system clipboard / primary selection via OSC 52, so text copied in any other application pastes in. If the terminal has OSC 52 read disabled (common over SSH), the paste falls back to issy's internal clipboard. Set `false` to keep `Ctrl+V` bound to the internal clipboard only. The terminal's own paste keys (`Ctrl+Shift+V`, `Shift+Insert`) work regardless. |
 
 ## Visual Design
 

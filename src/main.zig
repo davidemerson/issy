@@ -169,6 +169,12 @@ pub fn main() !void {
             \\  Ctrl+C copy  Ctrl+X cut   Ctrl+V paste   Ctrl+A select all
             \\  Ctrl+O open  Ctrl+N new   Ctrl+P print   Ctrl+R reload
             \\
+            \\Pasting:
+            \\  Ctrl+V pastes the system clipboard (via OSC 52), falling back to
+            \\  issy's internal clipboard if the terminal has OSC 52 read disabled.
+            \\  Middle-click pastes the primary selection. The terminal's own paste
+            \\  keys — Ctrl+Shift+V and Shift+Insert — always work too.
+            \\
         );
         return;
     }

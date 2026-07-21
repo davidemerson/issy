@@ -1,4 +1,4 @@
-.TH ISSY 1 "July 11, 2026" "issy 1.2.4" "General Commands Manual"
+.TH ISSY 1 "July 21, 2026" "issy 1.3.0" "General Commands Manual"
 .SH NAME
 issy \- a text editor that looks like a printed page
 .SH SYNOPSIS
@@ -153,18 +153,27 @@ Copy the current selection to the internal clipboard.
 Cut the current selection.
 .TP
 .B Ctrl+V
-Paste from the internal clipboard.
-With multiple cursors active, the paste is applied at every cursor.
+Paste the system clipboard.
+The editor reads it from the terminal over OSC\ 52; if the terminal has
+OSC\ 52 read disabled (common over SSH), the paste falls back to issy's
+internal clipboard.
+Middle-click pastes the primary selection the same way.
+Set
+.B system_clipboard = false
+to keep
+.B Ctrl+V
+bound to the internal clipboard only.
 .PP
-Terminal pastes (for example, Cmd+V in a GUI terminal) use bracketed
-paste mode (DECSET\ 2004).
-While a paste is in progress,
-.B Enter
-and
-.B Tab
-keystreams are inserted verbatim \(em auto-indent is suppressed and
-tabs are not expanded to spaces \(em so already-indented pasted content
-comes through without its left margin compounding.
+The terminal's own paste keys work regardless of that setting:
+.B Ctrl+Shift+V
+pastes the clipboard and
+.B Shift+Insert
+pastes the primary selection, both arriving as a bracketed paste
+(DECSET\ 2004).
+However it arrives, pasted text is inserted verbatim as one undo step:
+auto-indent is not applied and embedded newlines or tabs never trigger
+editor commands, so already-indented content comes through without its
+left margin compounding.
 .TP
 .B Ctrl+A
 Select all text in the buffer.
@@ -475,6 +484,20 @@ for that file.
 .BR scroll_margin " (default: 5)"
 Minimum number of lines between the cursor and the top or bottom of
 the viewport before the view scrolls.
+.TP
+.BR system_clipboard " (default: true)"
+When true,
+.B Ctrl+V
+and middle-click read the system clipboard / primary selection via
+OSC\ 52, so text copied in another application pastes in; if the
+terminal has OSC\ 52 read disabled the paste falls back to the internal
+clipboard.
+Set false to keep
+.B Ctrl+V
+bound to the internal clipboard only.
+The terminal's own paste keys
+.RB ( Ctrl+Shift+V ", " Shift+Insert )
+work regardless.
 .SS Display settings
 .TP
 .BR line_numbers " (default: true)"
@@ -816,21 +839,27 @@ $ issy \-\-rollback
 .SH AUTHORS
 David Emerson
 .SH CAVEATS
-Copy and cut also emit OSC 52 so the text lands in the operating-
-system clipboard, subject to whatever the terminal allows.
-In iTerm2, Alacritty, Kitty, and modern versions of Terminal.app this
-works out of the box; in tmux, enable
+Copy and cut emit OSC 52 so the text lands in the operating-system
+clipboard, and
+.B Ctrl+V
+reads it back the same way, subject to whatever the terminal allows.
+In iTerm2, Alacritty, Kitty, foot, and modern versions of Terminal.app
+this works out of the box; in tmux, enable
 .B set -g set-clipboard on
 in
 .I ~/.tmux.conf
 for the forwarded clipboard to reach the host.
-Paste from outside
+A terminal that permits OSC 52
+.I write
+but not
+.I read
+still accepts copies but cannot answer
+.BR Ctrl+V ;
+in that case the paste falls back to issy's internal clipboard, and text
+copied outside
 .B issy
-arrives through the terminal's bracketed-paste mechanism
-.RB ( Ctrl+V
-inside
-.B issy
-still reads from the internal clipboard).
+must be pasted with the terminal's own key
+.RB ( Ctrl+Shift+V " or " Shift+Insert ).
 A selection larger than 100\ KB is truncated for the system push
 only; the internal clipboard keeps the full copy.
 .PP
