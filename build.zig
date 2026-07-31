@@ -1,19 +1,20 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-// Issy targets the Zig 0.15.x series. 0.16.0 moved most of `std.fs` under
-// `std.Io.Dir` with a threaded `io` argument and removed `std.fs.cwd()`,
-// which breaks every file op in this codebase. The check runs at comptime
-// so it fires before `writeBuildInfo` (which uses std.fs.cwd) is analyzed —
-// otherwise the user sees a cryptic stdlib error instead of this message.
+// Issy supports the Zig 0.15.x and 0.16.x series. 0.16 moved most of
+// `std.fs` under `std.Io.Dir` (with a threaded `io` argument), which
+// src/fsx.zig papers over; this file carries its own small comptime
+// branches for the std.Build API differences. The gate runs at comptime
+// so unsupported toolchains see this message instead of a cryptic
+// stdlib error.
+const zig_016 = builtin.zig_version.order(.{ .major = 0, .minor = 16, .patch = 0 }) != .lt;
 comptime {
-    const max_zig_version = std.SemanticVersion{ .major = 0, .minor = 16, .patch = 0 };
-    if (builtin.zig_version.order(max_zig_version) != .lt) {
-        @compileError(
-            "issy requires Zig < 0.16.0 (CI pins 0.15.2). On macOS with Homebrew, " ++
-                "install the keg-only formula and put it on PATH: " ++
-                "`brew install zig@0.15 && export PATH=\"/opt/homebrew/opt/zig@0.15/bin:$PATH\"`.",
-        );
+    const min_zig_version = std.SemanticVersion{ .major = 0, .minor = 15, .patch = 0 };
+    const max_zig_version = std.SemanticVersion{ .major = 0, .minor = 17, .patch = 0 };
+    if (builtin.zig_version.order(min_zig_version) == .lt or
+        builtin.zig_version.order(max_zig_version) != .lt)
+    {
+        @compileError("issy requires Zig 0.15.x or 0.16.x (CI exercises 0.15.2 and 0.16.0).");
     }
 }
 
@@ -53,7 +54,7 @@ pub fn build(b: *std.Build) void {
     // "best-effort, tolerate failure" semantics in .github/workflows/ci.yml.
     const os_tag = target.result.os.tag;
     if (os_tag == .linux or os_tag == .macos or os_tag == .openbsd) {
-        exe.linkLibC();
+        exe.root_module.link_libc = true;
     }
 
     b.installArtifact(exe);
@@ -80,7 +81,7 @@ pub fn build(b: *std.Build) void {
         });
         const cross_os = ct.os_tag orelse .linux;
         if (cross_os == .linux or cross_os == .macos) {
-            cross_exe.linkLibC();
+            cross_exe.root_module.link_libc = true;
         }
         const cross_install = b.addInstallArtifact(cross_exe, .{});
         cross_step.dependOn(&cross_install.step);
@@ -148,7 +149,7 @@ fn writeBuildInfo(b: *std.Build, commit_override: ?[]const u8, release_override:
     const allocator = b.allocator;
 
     var version_buf: [32]u8 = undefined;
-    const version = readVersionFromZon(&version_buf) catch "0.0.0";
+    const version = readVersionFromZon(b, &version_buf) catch "0.0.0";
 
     const commit_sha: [40]u8, const is_release: bool = blk: {
         // 1. Explicit override (validated as 40 hex chars).
@@ -163,7 +164,7 @@ fn writeBuildInfo(b: *std.Build, commit_override: ?[]const u8, release_override:
         }
 
         // 2. Try git rev-parse HEAD, then check whether the tree is clean.
-        const git_head = runGitCommand(allocator, &.{ "git", "rev-parse", "HEAD" }) catch {
+        const git_head = runGitCommand(b, allocator, &.{ "git", "rev-parse", "HEAD" }) catch {
             break :blk .{ dev_sha_padded(), false };
         };
         defer allocator.free(git_head);
@@ -173,7 +174,7 @@ fn writeBuildInfo(b: *std.Build, commit_override: ?[]const u8, release_override:
         @memcpy(&sha, git_head[0..40]);
 
         // `git status --porcelain` returns empty on a clean tree.
-        const status = runGitCommand(allocator, &.{ "git", "status", "--porcelain" }) catch {
+        const status = runGitCommand(b, allocator, &.{ "git", "status", "--porcelain" }) catch {
             break :blk .{ sha, false };
         };
         defer allocator.free(status);
@@ -197,19 +198,31 @@ fn writeBuildInfo(b: *std.Build, commit_override: ?[]const u8, release_override:
 
     // Write to src/build_info.zig. Only rewrite if content changed to keep caches happy.
     const path = "src/build_info.zig";
-    const existing = std.fs.cwd().readFileAlloc(allocator, path, 4096) catch null;
+    const existing = if (zig_016)
+        std.Io.Dir.cwd().readFileAlloc(b.graph.io, path, allocator, .limited(4096)) catch null
+    else
+        std.fs.cwd().readFileAlloc(allocator, path, 4096) catch null;
     if (existing) |buf| {
         defer allocator.free(buf);
         if (std.mem.eql(u8, buf, content)) return;
     }
 
-    const file = try std.fs.cwd().createFile(path, .{});
-    defer file.close();
-    try file.writeAll(content);
+    if (zig_016) {
+        const file = try std.Io.Dir.cwd().createFile(b.graph.io, path, .{});
+        defer file.close(b.graph.io);
+        try file.writeStreamingAll(b.graph.io, content);
+    } else {
+        const file = try std.fs.cwd().createFile(path, .{});
+        defer file.close();
+        try file.writeAll(content);
+    }
 }
 
-fn readVersionFromZon(out: []u8) ![]const u8 {
-    const zon = try std.fs.cwd().readFileAlloc(std.heap.page_allocator, "build.zig.zon", 4096);
+fn readVersionFromZon(b: *std.Build, out: []u8) ![]const u8 {
+    const zon = if (zig_016)
+        try std.Io.Dir.cwd().readFileAlloc(b.graph.io, "build.zig.zon", std.heap.page_allocator, .limited(4096))
+    else
+        try std.fs.cwd().readFileAlloc(std.heap.page_allocator, "build.zig.zon", 4096);
     defer std.heap.page_allocator.free(zon);
     const needle = ".version = \"";
     const start = std.mem.indexOf(u8, zon, needle) orelse return error.NotFound;
@@ -221,7 +234,21 @@ fn readVersionFromZon(out: []u8) ![]const u8 {
     return out[0..v.len];
 }
 
-fn runGitCommand(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
+fn runGitCommand(b: *std.Build, allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
+    if (zig_016) {
+        const result = try std.process.run(allocator, b.graph.io, .{
+            .argv = argv,
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        allocator.free(result.stderr);
+        errdefer allocator.free(result.stdout);
+        switch (result.term) {
+            .exited => |code| if (code != 0) return error.GitFailed,
+            else => return error.GitFailed,
+        }
+        return result.stdout;
+    }
     var child = std.process.Child.init(argv, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;

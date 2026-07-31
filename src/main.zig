@@ -5,6 +5,7 @@
 //! and cleans up on exit.
 
 const std = @import("std");
+const fsx = @import("fsx.zig");
 const builtin = @import("builtin");
 const config_mod = @import("config.zig");
 const term = @import("term.zig");
@@ -36,7 +37,11 @@ fn issyPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
 /// cleanly — restoring the terminal and persisting the cursor position.
 var shutdown_requested = std.atomic.Value(bool).init(false);
 
-fn handleFatalSignal(_: c_int) callconv(.c) void {
+/// 0.16 turned the sigaction handler's parameter from c_int into the
+/// std.c.SIG enum; the handler ignores it either way.
+const SigArg = if (fsx.is_zig_016) std.c.SIG else c_int;
+
+fn handleFatalSignal(_: SigArg) callconv(.c) void {
     shutdown_requested.store(true, .release);
 }
 
@@ -82,9 +87,16 @@ fn applyCliOverrides(cfg: *config_mod.Config, args: Args) void {
     }
 }
 
+/// On 0.16 argv arrives through main's `Init.Minimal` parameter
+/// instead of a std.process.args() global; main016 stashes it here.
+var args_016: if (fsx.is_zig_016) std.process.Args else void = undefined;
+
 fn parseArgs() Args {
     var args_result = Args{};
-    var args_iter = std.process.args();
+    var args_iter = if (comptime fsx.is_zig_016)
+        std.process.Args.Iterator.init(args_016)
+    else
+        std.process.args();
     _ = args_iter.skip(); // skip program name
 
     while (args_iter.next()) |arg| {
@@ -114,17 +126,28 @@ fn parseArgs() Args {
     return args_result;
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub const main = if (fsx.is_zig_016) main016 else main015;
+
+fn main016(init: std.process.Init.Minimal) !void {
+    args_016 = init.args;
+    return realMain();
+}
+
+fn main015() !void {
+    return realMain();
+}
+
+fn realMain() !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     const args = parseArgs();
 
     if (args.rollback) {
-        const stdout = std.fs.File.stdout();
+        const stdout = fsx.File.stdout();
         update_mod.rollback(allocator) catch |e| {
-            const stderr = std.fs.File.stderr();
+            const stderr = fsx.File.stderr();
             var msg_buf: [256]u8 = undefined;
             const msg = std.fmt.bufPrint(&msg_buf, "issy --rollback failed: {s}\n", .{@errorName(e)}) catch "issy --rollback failed\n";
             stderr.writeAll(msg) catch {};
@@ -135,7 +158,7 @@ pub fn main() !void {
     }
 
     if (args.show_version) {
-        const stdout = std.fs.File.stdout();
+        const stdout = fsx.File.stdout();
         var buf: [128]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, "issy {s} ({s} {s})\n", .{
             build_info.version,
@@ -147,7 +170,7 @@ pub fn main() !void {
     }
 
     if (args.show_help) {
-        const stdout = std.fs.File.stdout();
+        const stdout = fsx.File.stdout();
         try stdout.writeAll(
             \\issy — a minimal text editor
             \\
@@ -183,7 +206,7 @@ pub fn main() !void {
     // We hold on to the path + mtime so the main loop can auto-reload
     // when the user edits the config file in another window (or in issy
     // itself).
-    var cfg_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var cfg_path_buf: [fsx.max_path_bytes]u8 = undefined;
     var cfg_path_len: usize = 0;
     var cfg_mtime: i128 = 0;
 
@@ -226,7 +249,7 @@ pub fn main() !void {
     // Print mode: generate PDF and exit
     if (args.print_output) |output| {
         print_mod.toPdf(&ed, output) catch |e| {
-            const stderr = std.fs.File.stderr();
+            const stderr = fsx.File.stderr();
             var buf: [256]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "Error generating PDF: {s}\n", .{@errorName(e)}) catch "Error\n";
             stderr.writeAll(msg) catch {};
@@ -236,8 +259,8 @@ pub fn main() !void {
     }
 
     // Init terminal — requires a real tty
-    if (!std.posix.isatty(std.fs.File.stdin().handle)) {
-        const stderr = std.fs.File.stderr();
+    if (!fsx.isatty(fsx.File.stdin().handle)) {
+        const stderr = fsx.File.stderr();
         stderr.writeAll("issy: stdin is not a terminal\n") catch {};
         std.process.exit(1);
     }
@@ -300,7 +323,7 @@ pub fn main() !void {
         // Periodic checks, throttled to 1/sec and running while idle
         // too, so external file edits and config changes surface
         // without waiting for a keypress.
-        const now = std.time.milliTimestamp();
+        const now = fsx.nowMillis();
         if (now - last_stat_check > 1000) {
             if (ed.checkFileChanged()) needs_redraw = true;
             // Periodically autosave unsaved changes to a swap file so a
@@ -379,7 +402,7 @@ pub fn main() !void {
                 // "<filename>.pdf" alongside the source; failures land
                 // as a status-bar message rather than a crash.
                 const filename = ed.getFilename();
-                var out_buf: [std.fs.max_path_bytes]u8 = undefined;
+                var out_buf: [fsx.max_path_bytes]u8 = undefined;
                 const out_path = std.fmt.bufPrint(&out_buf, "{s}.pdf", .{filename}) catch {
                     ed.setStatusMessage("PDF export: path too long");
                     continue;
@@ -390,7 +413,7 @@ pub fn main() !void {
                     ed.setStatusMessage(msg);
                     continue;
                 };
-                var msg_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
+                var msg_buf: [fsx.max_path_bytes + 32]u8 = undefined;
                 const msg = std.fmt.bufPrint(&msg_buf, "Wrote {s}", .{out_path}) catch "Wrote PDF";
                 ed.setStatusMessage(msg);
             },

@@ -5,6 +5,7 @@
 //! advance widths, and retains raw font data for embedding.
 
 const std = @import("std");
+const fsx = @import("fsx.zig");
 const Allocator = std.mem.Allocator;
 
 pub const FontError = error{
@@ -44,7 +45,7 @@ pub const Font = struct {
     allocator: Allocator,
 
     pub fn load(allocator: Allocator, path: []const u8) FontError!Font {
-        const file = std.fs.cwd().openFile(path, .{}) catch return error.FileNotFound;
+        const file = fsx.openFile(path) catch return error.FileNotFound;
         defer file.close();
 
         const stat = file.stat() catch return error.ReadError;

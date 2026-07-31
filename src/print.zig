@@ -6,6 +6,7 @@
 //! tuned for ink — never inherits the dark TUI theme.
 
 const std = @import("std");
+const fsx = @import("fsx.zig");
 const Allocator = std.mem.Allocator;
 const editor_mod = @import("editor.zig");
 const config_mod = @import("config.zig");
@@ -27,8 +28,8 @@ const PdfWriter = struct {
 
     fn init(allocator: Allocator) PdfWriter {
         return .{
-            .out = .{},
-            .offsets = .{},
+            .out = .empty,
+            .offsets = .empty,
             .allocator = allocator,
         };
     }
@@ -197,7 +198,7 @@ pub fn toPdf(ed: *editor_mod.Editor, output_path: []const u8) !void {
     // yields real characters (the old identity map produced garbage).
     _ = try pdf.beginObj();
     {
-        var cmap_body: std.ArrayList(u8) = .{};
+        var cmap_body: std.ArrayList(u8) = .empty;
         defer cmap_body.deinit(ed.allocator);
 
         try cmap_body.appendSlice(ed.allocator, "/CIDInit /ProcSet findresource begin\n" ++
@@ -220,7 +221,7 @@ pub fn toPdf(ed: *editor_mod.Editor, output_path: []const u8) !void {
 
             // Gather mapped glyphs, then emit bfchar blocks of at most
             // 100 entries (spec limit), each declaring its exact count.
-            var mapped: std.ArrayList(u16) = .{};
+            var mapped: std.ArrayList(u16) = .empty;
             defer mapped.deinit(ed.allocator);
             for (rev, 0..) |cp, gid| {
                 if (cp != 0) try mapped.append(ed.allocator, @intCast(gid));
@@ -263,7 +264,7 @@ pub fn toPdf(ed: *editor_mod.Editor, output_path: []const u8) !void {
     try pdf.endObj();
 
     // Generate pages
-    var page_obj_ids: std.ArrayList(usize) = .{};
+    var page_obj_ids: std.ArrayList(usize) = .empty;
     defer page_obj_ids.deinit(ed.allocator);
 
     // Content width in points. The continuation indent is computed
@@ -284,7 +285,7 @@ pub fn toPdf(ed: *editor_mod.Editor, output_path: []const u8) !void {
     const draw_header = margin_top >= line_height * 1.8;
 
     var y: f32 = page_h - margin_top;
-    var page_lines: std.ArrayList(u8) = .{};
+    var page_lines: std.ArrayList(u8) = .empty;
     defer page_lines.deinit(ed.allocator);
 
     // Tokenization state carried across the whole document. Tokens for
@@ -484,7 +485,7 @@ pub fn toPdf(ed: *editor_mod.Editor, output_path: []const u8) !void {
     try pdf.writeRaw("%%EOF\n");
 
     // Write to file
-    const file = try std.fs.cwd().createFile(output_path, .{});
+    const file = try fsx.createFile(output_path, .{});
     defer file.close();
     try file.writeAll(pdf.out.items);
 }
@@ -772,7 +773,7 @@ test "encodeGlyphs expands tabs relative to the running column" {
         .cmap = &cmap_data,
     };
 
-    var list: std.ArrayList(u8) = .{};
+    var list: std.ArrayList(u8) = .empty;
     defer list.deinit(std.testing.allocator);
 
     // Column 2, tab width 4 → tab expands to 2 spaces, not 4.

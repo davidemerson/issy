@@ -5,6 +5,7 @@
 //! (Linux, macOS, OpenBSD).
 
 const std = @import("std");
+const fsx = @import("fsx.zig");
 const builtin = @import("builtin");
 const posix = std.posix;
 const unicode = @import("unicode.zig");
@@ -141,7 +142,7 @@ var orig_termios: if (is_posix) posix.termios else void = if (is_posix) undefine
 /// Initialize the terminal for raw mode editing.
 pub fn init() !void {
     if (is_posix) {
-        const stdin_fd = std.fs.File.stdin().handle;
+        const stdin_fd = fsx.File.stdin().handle;
 
         orig_termios = try posix.tcgetattr(stdin_fd);
 
@@ -176,10 +177,9 @@ pub fn init() !void {
         updateSize();
 
         // Check truecolor support
-        if (std.process.getEnvVarOwned(std.heap.page_allocator, "COLORTERM")) |val| {
+        if (fsx.getenv("COLORTERM")) |val| {
             truecolor_supported = std.mem.eql(u8, val, "truecolor") or std.mem.eql(u8, val, "24bit");
-            std.heap.page_allocator.free(val);
-        } else |_| {
+        } else {
             truecolor_supported = false;
         }
 
@@ -219,7 +219,7 @@ pub fn deinit() void {
 
         doFlush() catch {};
 
-        const stdin_fd = std.fs.File.stdin().handle;
+        const stdin_fd = fsx.File.stdin().handle;
         posix.tcsetattr(stdin_fd, .FLUSH, orig_termios) catch {};
     }
 
@@ -241,15 +241,15 @@ pub fn emergencyRestore() void {
             "\x1b[?1049l" ++ // leave alternate screen
             "\x1b[0m" ++ // reset styles
             "\x1b[?25h"; // show cursor
-        std.fs.File.stdout().writeAll(seq) catch {};
-        const stdin_fd = std.fs.File.stdin().handle;
+        fsx.File.stdout().writeAll(seq) catch {};
+        const stdin_fd = fsx.File.stdin().handle;
         posix.tcsetattr(stdin_fd, .FLUSH, orig_termios) catch {};
     }
 }
 
 fn updateSize() void {
     if (is_posix) {
-        const stdin_fd = std.fs.File.stdin().handle;
+        const stdin_fd = fsx.File.stdin().handle;
         var wsz: posix.winsize = undefined;
         const rc = posix.system.ioctl(stdin_fd, posix.T.IOCGWINSZ, @intFromPtr(&wsz));
         if (rc == 0) {
@@ -285,7 +285,7 @@ fn fillReadBuf() void {
         read_start = 0;
         read_end = n;
     }
-    const stdin = std.fs.File.stdin();
+    const stdin = fsx.File.stdin();
     const n = stdin.read(read_buf[read_end..]) catch 0;
     read_end += n;
 }
@@ -897,8 +897,8 @@ pub fn requestOsc52Read(primary: bool) void {
 /// clipboard rather than swallowing the keystroke.
 pub fn readOsc52Reply(timeout_ms: i64) ?[]const u8 {
     if (!initialized) return null;
-    const start = std.time.milliTimestamp();
-    while (std.time.milliTimestamp() - start < timeout_ms) {
+    const start = fsx.nowMillis();
+    while (fsx.nowMillis() - start < timeout_ms) {
         if (readBufAvailable() == 0) {
             fillReadBuf(); // returns on the first byte, or after ~100ms
             if (readBufAvailable() == 0) continue;
@@ -919,7 +919,7 @@ pub fn readOsc52Reply(timeout_ms: i64) ?[]const u8 {
 
 fn doFlush() !void {
     if (write_pos == 0) return;
-    const stdout = std.fs.File.stdout();
+    const stdout = fsx.File.stdout();
     var written: usize = 0;
     while (written < write_pos) {
         written += try stdout.write(write_buf[written..write_pos]);

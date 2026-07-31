@@ -13,6 +13,12 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      # issy supports both series (src/fsx.zig); 0.15.2 matches the
+      # OpenBSD 7.9 package, 0.16.0 matches OpenBSD -current and
+      # Homebrew's unversioned zig formula.
+      matrix:
+        zig: ["0.15.2", "0.16.0"]
     steps:
       - uses: actions/checkout@v4
 
@@ -21,12 +27,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/zig
-          key: zig-x86_64-linux-${{ env.ZIG_VERSION }}
+          key: zig-x86_64-linux-${{ matrix.zig }}
 
       - name: Install Zig
         if: steps.cache-zig.outputs.cache-hit != 'true'
         run: |
-          curl -L -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          curl -L -o zig.tar.xz "https://ziglang.org/download/${{ matrix.zig }}/zig-x86_64-linux-${{ matrix.zig }}.tar.xz"
           mkdir -p ~/zig
           tar xf zig.tar.xz -C ~/zig --strip-components=1
 

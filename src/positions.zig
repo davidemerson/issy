@@ -14,6 +14,7 @@
 //! one-entry-per-line invariant).
 
 const std = @import("std");
+const fsx = @import("fsx.zig");
 
 pub const Position = struct {
     line: usize,
@@ -41,7 +42,7 @@ fn resolveFilePath(buf: []u8) ?[]const u8 {
         @memcpy(buf[0..p.len], p);
         return buf[0..p.len];
     }
-    const home = std.posix.getenv("HOME") orelse return null;
+    const home = fsx.getenv("HOME") orelse return null;
     const suffix = "/.cache/issy/positions.txt";
     const needed = home.len + suffix.len;
     if (needed > buf.len) return null;
@@ -80,10 +81,10 @@ fn parseEntry(text: []const u8) ?ParsedEntry {
 pub fn lookup(abs_path: []const u8) ?Position {
     if (abs_path.len == 0) return null;
 
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [fsx.max_path_bytes]u8 = undefined;
     const positions_path = resolveFilePath(&path_buf) orelse return null;
 
-    const file = std.fs.cwd().openFile(positions_path, .{}) catch return null;
+    const file = fsx.openFile(positions_path) catch return null;
     defer file.close();
 
     var content_buf: [file_cap]u8 = undefined;
@@ -107,7 +108,7 @@ pub fn lookup(abs_path: []const u8) ?Position {
 
 fn ensureCacheDir(positions_path: []const u8) void {
     const last_slash = std.mem.lastIndexOfScalar(u8, positions_path, '/') orelse return;
-    std.fs.cwd().makePath(positions_path[0..last_slash]) catch {};
+    fsx.makePath(positions_path[0..last_slash]) catch {};
 }
 
 /// Record `line`/`col` for `abs_path`. The updated entry goes to the top
@@ -119,7 +120,7 @@ pub fn record(abs_path: []const u8, line: usize, col: usize) void {
     // Paths with embedded newlines would corrupt the file format.
     if (std.mem.indexOfScalar(u8, abs_path, '\n') != null) return;
 
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [fsx.max_path_bytes]u8 = undefined;
     const positions_path = resolveFilePath(&path_buf) orelse return;
 
     ensureCacheDir(positions_path);
@@ -127,7 +128,7 @@ pub fn record(abs_path: []const u8, line: usize, col: usize) void {
     // Read existing file (may not exist).
     var in_buf: [file_cap]u8 = undefined;
     var in_len: usize = 0;
-    if (std.fs.cwd().openFile(positions_path, .{})) |f| {
+    if (fsx.openFile(positions_path)) |f| {
         defer f.close();
         in_len = f.readAll(&in_buf) catch 0;
     } else |_| {}
@@ -167,23 +168,23 @@ pub fn record(abs_path: []const u8, line: usize, col: usize) void {
     // the existing file. The pid+timestamp suffix keeps two issy
     // processes exiting at once from truncating the same temp and racing
     // the rename (which could delete each other's temp mid-flight).
-    var tmp_path_buf: [std.fs.max_path_bytes + 48]u8 = undefined;
+    var tmp_path_buf: [fsx.max_path_bytes + 48]u8 = undefined;
     const tmp_path = std.fmt.bufPrint(
         &tmp_path_buf,
         "{s}.tmp.{d}.{d}",
-        .{ positions_path, std.c.getpid(), std.time.nanoTimestamp() },
+        .{ positions_path, std.c.getpid(), fsx.nowNanos() },
     ) catch return;
 
-    const tmp_file = std.fs.cwd().createFile(tmp_path, .{ .truncate = true }) catch return;
+    const tmp_file = fsx.createFile(tmp_path, .{ .truncate = true }) catch return;
     {
         defer tmp_file.close();
         tmp_file.writeAll(out_buf[0..out_len]) catch {
-            std.fs.cwd().deleteFile(tmp_path) catch {};
+            fsx.deleteFile(tmp_path) catch {};
             return;
         };
     }
-    std.fs.cwd().rename(tmp_path, positions_path) catch {
-        std.fs.cwd().deleteFile(tmp_path) catch {};
+    fsx.rename(tmp_path, positions_path) catch {
+        fsx.deleteFile(tmp_path) catch {};
     };
 }
 
@@ -224,10 +225,10 @@ test "record + lookup round-trip under a scratch path" {
     // places the directory at .zig-cache/tmp/<sub_path> relative to cwd.
     // Dir.realpath would be simpler but is unsupported on OpenBSD (uses
     // /proc/self/fd/N), and the rest of the codebase avoids it too.
-    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd = try std.posix.getcwd(&cwd_buf);
+    var cwd_buf: [fsx.max_path_bytes]u8 = undefined;
+    const cwd = try fsx.getcwd(&cwd_buf);
 
-    var pos_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var pos_path_buf: [fsx.max_path_bytes]u8 = undefined;
     const pos_path = try std.fmt.bufPrint(
         &pos_path_buf,
         "{s}/.zig-cache/tmp/{s}/positions.txt",
