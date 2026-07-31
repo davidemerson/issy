@@ -25,6 +25,7 @@
 //! run picks up the cached state.
 
 const std = @import("std");
+const fsx = @import("fsx.zig");
 const builtin = @import("builtin");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Ed25519 = std.crypto.sign.Ed25519;
@@ -122,15 +123,15 @@ pub fn startupCheck(
 }
 
 fn ensureCacheDir(allocator: std.mem.Allocator) ![]u8 {
-    const home = std.posix.getenv("HOME") orelse return error.NoHome;
+    const home = fsx.getenv("HOME") orelse return error.NoHome;
     const path = try std.fmt.allocPrint(allocator, "{s}/.cache/issy", .{home});
     errdefer allocator.free(path);
-    std.fs.cwd().makePath(path) catch {};
+    fsx.makePath(path) catch {};
     return path;
 }
 
 fn readCachedState(state: *UpdateState, commit_path: []const u8) void {
-    const file = std.fs.cwd().openFile(commit_path, .{}) catch return;
+    const file = fsx.openFile(commit_path) catch return;
     defer file.close();
     var buf: [128]u8 = undefined;
     const n = file.readAll(&buf) catch return;
@@ -163,7 +164,7 @@ fn upgradeToStagedIfReady(
     const staged_path = std.fmt.allocPrint(allocator, "{s}/issy.staged", .{cache_dir}) catch return;
     defer allocator.free(staged_path);
 
-    const file = std.fs.cwd().openFile(staged_path, .{}) catch return;
+    const file = fsx.openFile(staged_path) catch return;
     defer file.close();
     const stat = file.stat() catch return;
     if (stat.kind != .file) return;
@@ -184,22 +185,27 @@ fn spawnWorker(
     commit_path: []const u8,
     autoupdate: bool,
 ) void {
-    const pid = std.posix.fork() catch return;
+    // Raw libc process control: 0.16 dropped std.posix.fork/waitpid/
+    // setsid/exit, and issy always links libc on its supported targets.
+    const pid = std.c.fork();
+    if (pid < 0) return;
     if (pid != 0) {
-        _ = std.posix.waitpid(pid, 0);
+        var status: c_int = 0;
+        _ = std.c.waitpid(pid, &status, 0);
         return;
     }
 
-    // Intermediate child: fork again and exit so the grandchild is orphaned.
-    const pid2 = std.posix.fork() catch std.posix.exit(0);
-    if (pid2 != 0) std.posix.exit(0);
+    // Intermediate child: fork again and exit so the grandchild is
+    // orphaned (a failed second fork exits too — pid2 < 0).
+    const pid2 = std.c.fork();
+    if (pid2 != 0) std.c._exit(0);
 
     // Grandchild: detach from the tty and do the work.
-    _ = std.posix.setsid() catch {};
+    _ = std.c.setsid();
     setAlarm(fetch_timeout_seconds);
 
     doWork(allocator, cache_dir, commit_path, autoupdate);
-    std.posix.exit(0);
+    std.c._exit(0);
 }
 
 fn setAlarm(seconds: u32) void {
@@ -214,7 +220,10 @@ fn doWork(
     commit_path: []const u8,
     autoupdate: bool,
 ) void {
-    var client = std.http.Client{ .allocator = allocator };
+    var client = if (comptime fsx.is_zig_016)
+        std.http.Client{ .allocator = allocator, .io = fsx.io() }
+    else
+        std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
     // 1. Fetch commit.txt → cache.
@@ -294,13 +303,13 @@ fn downloadAndStage(
     // 7. Atomic write: unique staged.tmp → chmod +x → rename to staged.
     const final_path = try std.fmt.allocPrint(allocator, "{s}/issy.staged", .{cache_dir});
     defer allocator.free(final_path);
-    var tmp_buf: [std.fs.max_path_bytes + 48]u8 = undefined;
+    var tmp_buf: [fsx.max_path_bytes + 48]u8 = undefined;
     const tmp_path = try uniqueTmpPath(&tmp_buf, final_path);
 
     var staged_ok = false;
-    defer if (!staged_ok) std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer if (!staged_ok) fsx.deleteFile(tmp_path) catch {};
     {
-        const f = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true, .mode = 0o755 });
+        const f = try fsx.createFile(tmp_path, .{ .truncate = true, .mode = 0o755 });
         defer f.close();
         try f.writeAll(binary);
     }
@@ -321,7 +330,7 @@ fn downloadAndStage(
         try writeAtomic(epoch_path, epoch_str);
     }
 
-    try std.fs.cwd().rename(tmp_path, final_path);
+    try fsx.rename(tmp_path, final_path);
     staged_ok = true;
 }
 
@@ -355,7 +364,7 @@ fn epochAllows(cached: ?u64, incoming: ?u64) bool {
 }
 
 fn readCachedEpoch(path: []const u8) ?u64 {
-    const file = std.fs.cwd().openFile(path, .{}) catch return null;
+    const file = fsx.openFile(path) catch return null;
     defer file.close();
     var buf: [64]u8 = undefined;
     const n = file.readAll(&buf) catch return null;
@@ -387,7 +396,7 @@ fn findAssetHash(manifest: []const u8, asset_name: []const u8) ?[]const u8 {
         if (trimmed.len < 66) continue;
         // Hash is the first 64 chars, then whitespace, then filename (possibly prefixed with "*" for binary mode).
         const hash = trimmed[0..64];
-        var rest = std.mem.trimLeft(u8, trimmed[64..], " \t*");
+        var rest = std.mem.trimStart(u8, trimmed[64..], " \t*");
         // Some sha256sum implementations keep a "./" prefix or a full path.
         // Accept any match where the trailing component equals asset_name.
         const base = if (std.mem.lastIndexOfScalar(u8, rest, '/')) |slash| rest[slash + 1 ..] else rest;
@@ -440,22 +449,22 @@ fn httpGet(
 /// workers would otherwise truncate the same fixed `.tmp` sibling and
 /// corrupt each other's in-flight writes before the rename.
 fn uniqueTmpPath(buf: []u8, path: []const u8) ![]const u8 {
-    return std.fmt.bufPrint(buf, "{s}.tmp.{d}.{d}", .{ path, std.c.getpid(), std.time.nanoTimestamp() });
+    return std.fmt.bufPrint(buf, "{s}.tmp.{d}.{d}", .{ path, std.c.getpid(), fsx.nowNanos() });
 }
 
 /// Atomic file write: create a unique `.tmp` sibling, write, rename.
 fn writeAtomic(path: []const u8, content: []const u8) !void {
-    var tmp_path_buf: [std.fs.max_path_bytes + 48]u8 = undefined;
+    var tmp_path_buf: [fsx.max_path_bytes + 48]u8 = undefined;
     const tmp_path = try uniqueTmpPath(&tmp_path_buf, path);
 
     var ok = false;
-    defer if (!ok) std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer if (!ok) fsx.deleteFile(tmp_path) catch {};
     {
-        const f = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+        const f = try fsx.createFile(tmp_path, .{ .truncate = true });
         defer f.close();
         try f.writeAll(content);
     }
-    try std.fs.cwd().rename(tmp_path, path);
+    try fsx.rename(tmp_path, path);
     ok = true;
 }
 
@@ -509,14 +518,14 @@ pub fn apply(
     const cache_dir = ensureCacheDir(allocator) catch return ApplyError.NoCacheDir;
     defer allocator.free(cache_dir);
 
-    var argv0_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const argv0 = std.fs.selfExePath(&argv0_buf) catch return ApplyError.SelfExePathFailed;
+    var argv0_buf: [fsx.max_path_bytes]u8 = undefined;
+    const argv0 = fsx.selfExePath(&argv0_buf) catch return ApplyError.SelfExePathFailed;
 
     // Writability check — the binary swap uses rename(2), which needs the
     // parent directory to be writable. faccessat with W_OK on the file
     // itself is a reasonable proxy on Linux/macOS; fails for root-owned
     // installs like /usr/bin/issy.
-    std.posix.access(argv0, std.posix.W_OK) catch return ApplyError.NotWritable;
+    fsx.accessWritable(argv0) catch return ApplyError.NotWritable;
 
     const staged_path = std.fmt.allocPrint(allocator, "{s}/issy.staged", .{cache_dir}) catch return ApplyError.OutOfMemory;
     defer allocator.free(staged_path);
@@ -524,7 +533,7 @@ pub fn apply(
     defer allocator.free(prev_path);
 
     // Confirm staged binary still exists and looks sane.
-    const staged_stat = std.fs.cwd().statFile(staged_path) catch return ApplyError.NoStagedBinary;
+    const staged_stat = fsx.statFile(staged_path) catch return ApplyError.NoStagedBinary;
     if (staged_stat.kind != .file) return ApplyError.NoStagedBinary;
     if (staged_stat.size < 1024) return ApplyError.NoStagedBinary;
 
@@ -533,7 +542,7 @@ pub fn apply(
     // in the user-writable cache for days. A failure deletes the staged
     // binary so a fresh worker run can re-download it.
     verifyStagedBinary(allocator, cache_dir, staged_path) catch {
-        std.fs.cwd().deleteFile(staged_path) catch {};
+        fsx.deleteFile(staged_path) catch {};
         return ApplyError.NoStagedBinary;
     };
 
@@ -541,7 +550,7 @@ pub fn apply(
     // wrong we haven't broken the running instance. The name carries the
     // pid so two instances applying in the same second don't collide on
     // one path (and clobber/double-delete each other's record).
-    const now_ns = std.time.nanoTimestamp();
+    const now_ns = fsx.nowNanos();
     const resume_path = std.fmt.allocPrint(allocator, "{s}/resume.{d}.{d}.txt", .{ cache_dir, std.c.getpid(), @as(i64, @intCast(@divTrunc(now_ns, std.time.ns_per_s))) }) catch return ApplyError.OutOfMemory;
     defer allocator.free(resume_path);
 
@@ -556,7 +565,7 @@ pub fn apply(
     // Atomic binary swap. From this point the next execve call is the only
     // reasonable way forward — the current in-memory image is out of sync
     // with the file that argv0 now points to.
-    std.fs.cwd().rename(staged_path, argv0) catch {
+    fsx.rename(staged_path, argv0) catch {
         // Keep the resume file around so the user can restart manually.
         return ApplyError.RenameFailed;
     };
@@ -576,8 +585,8 @@ pub fn apply(
     argv_slice[3] = filename_slice;
     const argv = if (filename_slice.len == 0) argv_slice[0..3] else argv_slice[0..4];
 
-    // std.process.execv replaces the current process image on success.
-    std.process.execv(allocator, argv) catch {
+    // fsx.execv replaces the current process image on success.
+    fsx.execv(allocator, argv) catch {
         // execve failed after rename + term.deinit. The terminal is in
         // cooked mode, the binary on disk is the new version but our
         // in-memory process is the old one. Best we can do: try to
@@ -589,29 +598,28 @@ pub fn apply(
 }
 
 fn writeResumeFile(path: []const u8, ed: *const editor_mod.Editor, now_ns: i128) !void {
-    var tmp_path_buf: [std.fs.max_path_bytes + 48]u8 = undefined;
+    var tmp_path_buf: [fsx.max_path_bytes + 48]u8 = undefined;
     const tmp_path = try uniqueTmpPath(&tmp_path_buf, path);
 
-    const f = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+    const f = try fsx.createFile(tmp_path, .{ .truncate = true });
     defer f.close();
 
     var buf: [4096]u8 = undefined;
-    var fw = f.writer(&buf);
-    const w = &fw.interface;
+    const content = try std.fmt.bufPrint(&buf, "v{d}\n{d}\n{d}\n{d}\n{d}\n{s}\n", .{
+        resume_file_version,
+        now_ns,
+        ed.file_mtime orelse 0,
+        ed.cursor.line,
+        ed.cursor.col,
+        ed.getFilename(),
+    });
+    try f.writeAll(content);
 
-    try w.print("v{d}\n", .{resume_file_version});
-    try w.print("{d}\n", .{now_ns});
-    try w.print("{d}\n", .{ed.file_mtime orelse 0});
-    try w.print("{d}\n", .{ed.cursor.line});
-    try w.print("{d}\n", .{ed.cursor.col});
-    try w.print("{s}\n", .{ed.getFilename()});
-    try w.flush();
-
-    try std.fs.cwd().rename(tmp_path, path);
+    try fsx.rename(tmp_path, path);
 }
 
 fn copyFileBestEffort(src: []const u8, dst: []const u8) void {
-    std.fs.cwd().copyFile(src, std.fs.cwd(), dst, .{}) catch {};
+    fsx.copyFile(src, dst) catch {};
 }
 
 /// Verify the staged binary's SHA-256 against the cached signed
@@ -627,9 +635,9 @@ fn verifyStagedBinary(
     const sig_path = try std.fmt.allocPrint(allocator, "{s}/sha256sums.txt.sig", .{cache_dir});
     defer allocator.free(sig_path);
 
-    const manifest = try std.fs.cwd().readFileAlloc(allocator, manifest_path, max_manifest_size);
+    const manifest = try fsx.readFileAlloc(allocator, manifest_path, max_manifest_size);
     defer allocator.free(manifest);
-    const sig_bytes = try std.fs.cwd().readFileAlloc(allocator, sig_path, max_sig_size);
+    const sig_bytes = try fsx.readFileAlloc(allocator, sig_path, max_sig_size);
     defer allocator.free(sig_bytes);
 
     try verifyManifestSignature(manifest, sig_bytes);
@@ -639,7 +647,7 @@ fn verifyStagedBinary(
     var expected_hash: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&expected_hash, expected_hex) catch return error.BadHexHash;
 
-    const staged = try std.fs.cwd().readFileAlloc(allocator, staged_path, max_binary_size);
+    const staged = try fsx.readFileAlloc(allocator, staged_path, max_binary_size);
     defer allocator.free(staged);
     var actual_hash: [32]u8 = undefined;
     Sha256.hash(staged, &actual_hash, .{});
@@ -652,7 +660,7 @@ fn writePrevChecksum(allocator: std.mem.Allocator, cache_dir: []const u8, src: [
     const sha_path = std.fmt.allocPrint(allocator, "{s}/issy.prev.sha256", .{cache_dir}) catch return;
     defer allocator.free(sha_path);
 
-    const data = std.fs.cwd().readFileAlloc(allocator, src, max_binary_size) catch return;
+    const data = fsx.readFileAlloc(allocator, src, max_binary_size) catch return;
     defer allocator.free(data);
 
     var hash: [32]u8 = undefined;
@@ -676,8 +684,8 @@ fn writePrevChecksum(allocator: std.mem.Allocator, cache_dir: []const u8, src: [
 /// looks like a resume record (`resume.*.txt`). Guards `tryResume`
 /// against deleting or reading an arbitrary user-supplied path.
 fn isResumePathSafe(path: []const u8) bool {
-    const home = std.posix.getenv("HOME") orelse return false;
-    var prefix_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = fsx.getenv("HOME") orelse return false;
+    var prefix_buf: [fsx.max_path_bytes]u8 = undefined;
     const prefix = std.fmt.bufPrint(&prefix_buf, "{s}/.cache/issy/", .{home}) catch return false;
     if (!std.mem.startsWith(u8, path, prefix)) return false;
     const base = path[prefix.len..];
@@ -697,7 +705,7 @@ pub fn tryResume(
     // (below), never an unrelated or malformed file.
     if (!isResumePathSafe(resume_path)) return;
 
-    const f = std.fs.cwd().openFile(resume_path, .{}) catch return;
+    const f = fsx.openFile(resume_path) catch return;
     defer f.close();
 
     var buf: [1024]u8 = undefined;
@@ -712,12 +720,12 @@ pub fn tryResume(
 
     // From here the file is a recognizable resume record (correct
     // version header), so removing it on the way out is safe.
-    defer std.fs.cwd().deleteFile(resume_path) catch {};
+    defer fsx.deleteFile(resume_path) catch {};
 
     const created_str = lines.next() orelse return;
     const created_ns = std.fmt.parseInt(i128, std.mem.trim(u8, created_str, " \r\t"), 10) catch return;
 
-    const now_ns = std.time.nanoTimestamp();
+    const now_ns = fsx.nowNanos();
     if (now_ns - created_ns > resume_max_age_ns) return;
 
     const mtime_str = lines.next() orelse return;
@@ -760,23 +768,23 @@ pub fn rollback(allocator: std.mem.Allocator) !void {
     const prev_path = try std.fmt.allocPrint(allocator, "{s}/issy.prev", .{cache_dir});
     defer allocator.free(prev_path);
 
-    var argv0_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const argv0 = try std.fs.selfExePath(&argv0_buf);
+    var argv0_buf: [fsx.max_path_bytes]u8 = undefined;
+    const argv0 = try fsx.selfExePath(&argv0_buf);
 
-    std.posix.access(argv0, std.posix.W_OK) catch return error.NotWritable;
-    _ = std.fs.cwd().statFile(prev_path) catch return error.NoPreviousBinary;
+    fsx.accessWritable(argv0) catch return error.NotWritable;
+    _ = fsx.statFile(prev_path) catch return error.NoPreviousBinary;
 
     // If apply() recorded a checksum for the snapshot, require it to
     // still match — a tampered issy.prev must not be swapped in. A
     // missing checksum file (pre-checksum snapshots) skips the check.
     const sha_path = try std.fmt.allocPrint(allocator, "{s}/issy.prev.sha256", .{cache_dir});
     defer allocator.free(sha_path);
-    if (std.fs.cwd().readFileAlloc(allocator, sha_path, 128)) |expected_hex_raw| {
+    if (fsx.readFileAlloc(allocator, sha_path, 128)) |expected_hex_raw| {
         defer allocator.free(expected_hex_raw);
         const expected_hex = std.mem.trim(u8, expected_hex_raw, " \t\r\n");
         var expected_hash: [32]u8 = undefined;
         if (std.fmt.hexToBytes(&expected_hash, expected_hex)) |_| {
-            const data = try std.fs.cwd().readFileAlloc(allocator, prev_path, max_binary_size);
+            const data = try fsx.readFileAlloc(allocator, prev_path, max_binary_size);
             defer allocator.free(data);
             var actual: [32]u8 = undefined;
             Sha256.hash(data, &actual, .{});
@@ -784,7 +792,7 @@ pub fn rollback(allocator: std.mem.Allocator) !void {
         } else |_| {}
     } else |_| {}
 
-    try std.fs.cwd().rename(prev_path, argv0);
+    try fsx.rename(prev_path, argv0);
 }
 
 // ── Tests ──
@@ -834,7 +842,10 @@ test "findAssetHash locates a matching line" {
 test "verifyManifestSignature accepts valid sig and rejects tampered one" {
     // Generate an ephemeral keypair for the test — we deliberately don't
     // use update_key.public_key here so the test is self-contained.
-    const kp = Ed25519.KeyPair.generate();
+    const kp = if (comptime fsx.is_zig_016)
+        Ed25519.KeyPair.generate(fsx.io())
+    else
+        Ed25519.KeyPair.generate();
     const manifest = "abc  issy-linux-amd64\n";
     const sig = try kp.sign(manifest, null);
 
@@ -915,7 +926,7 @@ test "epoch anti-rollback decisions" {
 }
 
 test "isResumePathSafe only accepts cache-dir resume records" {
-    const home = std.posix.getenv("HOME") orelse return error.SkipZigTest;
+    const home = fsx.getenv("HOME") orelse return error.SkipZigTest;
     var buf: [1024]u8 = undefined;
 
     const good = try std.fmt.bufPrint(&buf, "{s}/.cache/issy/resume.123.456.txt", .{home});

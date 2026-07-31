@@ -6,6 +6,7 @@
 //! indent detection.
 
 const std = @import("std");
+const fsx = @import("fsx.zig");
 const Allocator = std.mem.Allocator;
 const buffer_mod = @import("buffer.zig");
 const syntax_mod = @import("syntax.zig");
@@ -59,7 +60,7 @@ pub const Editor = struct {
     visible_rows: u16 = 24,
     visible_cols: u16 = 80,
 
-    filename: [std.fs.max_path_bytes]u8 = undefined,
+    filename: [fsx.max_path_bytes]u8 = undefined,
     filename_len: usize = 0,
     modified: bool = false,
 
@@ -158,9 +159,9 @@ pub const Editor = struct {
             .buf = try buffer_mod.Buffer.init(allocator),
             .config = config,
             .allocator = allocator,
-            .cursors = .{},
-            .undo_stack = .{},
-            .redo_stack = .{},
+            .cursors = .empty,
+            .undo_stack = .empty,
+            .redo_stack = .empty,
         };
     }
 
@@ -188,7 +189,7 @@ pub const Editor = struct {
                 if (std.fmt.parseInt(usize, path[colon + 1 ..], 10)) |line_num| {
                     // Check that the part before colon is a valid file
                     const prefix = path[0..colon];
-                    if (std.fs.cwd().access(prefix, .{})) |_| {
+                    if (fsx.access(prefix)) |_| {
                         actual_path = prefix;
                         goto_line = if (line_num > 0) line_num - 1 else 0;
                     } else |_| {}
@@ -289,7 +290,7 @@ pub const Editor = struct {
             @memcpy(buf[0..fname.len], fname);
             return buf[0..fname.len];
         }
-        const cwd = std.posix.getcwd(buf) catch return null;
+        const cwd = fsx.getcwd(buf) catch return null;
         const needed = cwd.len + 1 + fname.len;
         if (needed > buf.len) return null;
         buf[cwd.len] = '/';
@@ -302,7 +303,7 @@ pub const Editor = struct {
     /// save, on open (for the outgoing buffer), and on quit. No-op if
     /// the file has no resolvable path yet.
     pub fn persistCursor(self: *const Editor) void {
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var path_buf: [fsx.max_path_bytes]u8 = undefined;
         const abs = self.absFilename(&path_buf) orelse return;
         positions_mod.record(abs, self.cursor.line, self.cursor.col);
     }
@@ -341,11 +342,11 @@ pub const Editor = struct {
     /// since the last write. Best-effort; any error is ignored.
     pub fn maybeAutosaveSwap(self: *Editor) void {
         if (!self.config.swap_files or !self.modified or self.filename_len == 0) return;
-        const now = std.time.milliTimestamp();
+        const now = fsx.nowMillis();
         if (now - self.last_swap_ms < SWAP_INTERVAL_MS) return;
         self.last_swap_ms = now;
 
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        var buf: [fsx.max_path_bytes]u8 = undefined;
         const path = self.swapPath(&buf) orelse return;
         const contents = self.buf.contents(self.allocator) catch return;
         defer self.allocator.free(contents);
@@ -355,9 +356,7 @@ pub const Editor = struct {
         // file (the classic swap-symlink attack). O_NOFOLLOW makes the
         // open fail (ELOOP) rather than following the link; we then just
         // skip the autosave for this tick.
-        const flags: std.posix.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .NOFOLLOW = true };
-        const fd = std.posix.open(path, flags, 0o600) catch return;
-        const file = std.fs.File{ .handle = fd };
+        const file = fsx.openSwapNoFollow(path) catch return;
         defer file.close();
         file.writeAll(contents) catch {};
     }
@@ -366,9 +365,9 @@ pub const Editor = struct {
     /// quit, new buffer, and before switching files.
     pub fn removeSwap(self: *const Editor) void {
         if (self.filename_len == 0) return;
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        var buf: [fsx.max_path_bytes]u8 = undefined;
         const path = self.swapPath(&buf) orelse return;
-        std.fs.cwd().deleteFile(path) catch {};
+        fsx.deleteFile(path) catch {};
     }
 
     /// If a swap file exists for the just-opened file (left by a crash),
@@ -376,16 +375,16 @@ pub const Editor = struct {
     /// that would be surprising — but the user is told where it is.
     fn notifySwapIfPresent(self: *Editor) void {
         if (!self.config.swap_files or self.filename_len == 0) return;
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        var buf: [fsx.max_path_bytes]u8 = undefined;
         const path = self.swapPath(&buf) orelse return;
-        std.fs.cwd().access(path, .{}) catch return;
-        var msg_buf: [std.fs.max_path_bytes + 48]u8 = undefined;
+        fsx.access(path) catch return;
+        var msg_buf: [fsx.max_path_bytes + 48]u8 = undefined;
         const msg = std.fmt.bufPrint(&msg_buf, "Recovered edits may exist in {s}", .{path}) catch "Recovered edits swap file exists.";
         self.setStatusMessage(msg);
     }
 
     fn restoreCursorFromPositions(self: *Editor) void {
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var path_buf: [fsx.max_path_bytes]u8 = undefined;
         const abs = self.absFilename(&path_buf) orelse return;
         const pos = positions_mod.lookup(abs) orelse return;
         const max_line = if (self.buf.lineCount() > 0) self.buf.lineCount() - 1 else 0;
@@ -402,7 +401,7 @@ pub const Editor = struct {
     fn updateMtime(self: *Editor) void {
         if (self.filename_len == 0) return;
         const fname = self.filename[0..self.filename_len];
-        if (std.fs.cwd().openFile(fname, .{})) |file| {
+        if (fsx.openFile(fname)) |file| {
             defer file.close();
             if (file.stat()) |stat| {
                 self.file_mtime = stat.mtime;
@@ -416,7 +415,7 @@ pub const Editor = struct {
     pub fn checkFileChanged(self: *Editor) bool {
         if (self.filename_len == 0) return false;
         const fname = self.filename[0..self.filename_len];
-        if (std.fs.cwd().openFile(fname, .{})) |file| {
+        if (fsx.openFile(fname)) |file| {
             defer file.close();
             if (file.stat()) |stat| {
                 if (self.file_mtime) |saved| {
@@ -486,7 +485,7 @@ pub const Editor = struct {
     pub fn handleKey(self: *Editor, key: term.Key) Action {
         // Clear old status messages
         if (self.status_msg_len > 0) {
-            const now = std.time.milliTimestamp();
+            const now = fsx.nowMillis();
             if (now - self.status_msg_time > 5000) {
                 self.status_msg_len = 0;
             }
@@ -1179,7 +1178,7 @@ pub const Editor = struct {
         self.status_msg_len = 0;
         // Seed prompt with CWD so Tab-completion starts somewhere useful.
         self.prompt_len = 0;
-        if (std.posix.getcwd(self.prompt_buf[0..])) |cwd| {
+        if (fsx.getcwd(self.prompt_buf[0..])) |cwd| {
             self.prompt_len = cwd.len;
             if (self.prompt_len < 255) {
                 self.prompt_buf[self.prompt_len] = '/';
@@ -1627,7 +1626,7 @@ pub const Editor = struct {
         // Exact-cell matching is deliberate: at terminal cell
         // granularity a one-column tolerance would misread two clicks
         // on adjacent characters as a double-click.
-        const now = std.time.milliTimestamp();
+        const now = fsx.nowMillis();
         if (now - self.last_click_ms < CLICK_TIMEOUT_MS and
             pos.line == self.last_click_line and
             pos.col == self.last_click_col)
@@ -2305,7 +2304,7 @@ pub const Editor = struct {
             // a 3-byte codepoint like ─ stepping by 1 would leave the
             // cursor on a continuation byte.
             const pos = self.cursorBytePos();
-            const now = std.time.milliTimestamp();
+            const now = fsx.nowMillis();
             const this_is_word = isCodepointWordChar(cp);
             if (!self.tryCoalesceInsert(pos, len, now, this_is_word)) {
                 self.pushUndo(pos, null, len);
@@ -3285,7 +3284,7 @@ pub const Editor = struct {
             self.mode = .command;
             self.command_action = .save_as;
             self.prompt_len = 0;
-            if (std.posix.getcwd(self.prompt_buf[0..])) |cwd| {
+            if (fsx.getcwd(self.prompt_buf[0..])) |cwd| {
                 self.prompt_len = cwd.len;
                 if (self.prompt_len < 255) {
                     self.prompt_buf[self.prompt_len] = '/';
@@ -3329,14 +3328,14 @@ pub const Editor = struct {
         const prefix = if (last_slash) |s| path[s + 1 ..] else path;
 
         // Open directory
-        var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var dir_buf: [fsx.max_path_bytes]u8 = undefined;
         const dir_slice = if (dir_path.len <= dir_buf.len)
             dir_buf[0..dir_path.len]
         else
             return;
         @memcpy(dir_slice, dir_path);
 
-        var dir = std.fs.cwd().openDir(dir_slice, .{ .iterate = true }) catch return;
+        var dir = fsx.openDirIterable(dir_slice) catch return;
         defer dir.close();
 
         var iter = dir.iterate();
@@ -3445,7 +3444,7 @@ pub const Editor = struct {
         const len = @min(msg.len, 256);
         @memcpy(self.status_msg[0..len], msg[0..len]);
         self.status_msg_len = len;
-        self.status_msg_time = std.time.milliTimestamp();
+        self.status_msg_time = fsx.nowMillis();
     }
 
     pub fn getFilename(self: *const Editor) []const u8 {
@@ -5248,9 +5247,9 @@ test "swap file writes while dirty and is removed on save" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd = try std.posix.getcwd(&cwd_buf);
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var cwd_buf: [fsx.max_path_bytes]u8 = undefined;
+    const cwd = try fsx.getcwd(&cwd_buf);
+    var path_buf: [fsx.max_path_bytes]u8 = undefined;
     const fpath = try std.fmt.bufPrint(&path_buf, "{s}/.zig-cache/tmp/{s}/note.txt", .{ cwd, &tmp.sub_path });
 
     @memcpy(ed.filename[0..fpath.len], fpath);
@@ -5263,22 +5262,22 @@ test "swap file writes while dirty and is removed on save" {
     ed.last_swap_ms = 0;
     ed.maybeAutosaveSwap();
 
-    var swap_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var swap_buf: [fsx.max_path_bytes]u8 = undefined;
     const swap = ed.swapPath(&swap_buf).?;
     // Swap basename is ".note.txt.swp" in the same dir.
     try std.testing.expect(std.mem.endsWith(u8, swap, "/.note.txt.swp"));
-    std.fs.cwd().access(swap, .{}) catch return error.SwapNotWritten;
+    fsx.access(swap) catch return error.SwapNotWritten;
 
     // Saving removes it.
     ed.save();
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(swap, .{}));
+    try std.testing.expectError(error.FileNotFound, fsx.access(swap));
 }
 
 test "swap path is null without a filename" {
     var cfg = config_mod.Config.init();
     var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var buf: [fsx.max_path_bytes]u8 = undefined;
     try std.testing.expectEqual(@as(?[]const u8, null), ed.swapPath(&buf));
 }
 
@@ -5305,21 +5304,27 @@ test "swap autosave refuses to follow a planted symlink" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd = try std.posix.getcwd(&cwd_buf);
+    var cwd_buf: [fsx.max_path_bytes]u8 = undefined;
+    const cwd = try fsx.getcwd(&cwd_buf);
     const dir_rel = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer std.testing.allocator.free(dir_rel);
 
     // Victim file the attacker wants overwritten.
-    const victim = try tmp.dir.createFile("victim.txt", .{});
-    try victim.writeAll("precious");
-    victim.close();
+    const victim_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/victim.txt", .{dir_rel});
+    defer std.testing.allocator.free(victim_path);
+    {
+        const victim = try fsx.createFile(victim_path, .{});
+        defer victim.close();
+        try victim.writeAll("precious");
+    }
 
     // Plant a symlink at the swap path (.note.txt.swp) → victim.txt.
-    try tmp.dir.symLink("victim.txt", ".note.txt.swp", .{});
+    const swp_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.note.txt.swp", .{dir_rel});
+    defer std.testing.allocator.free(swp_path);
+    try fsx.symLink("victim.txt", swp_path);
 
     // Point the editor at <cwd>/<dir_rel>/note.txt and make it dirty.
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [fsx.max_path_bytes]u8 = undefined;
     const fpath = try std.fmt.bufPrint(&path_buf, "{s}/{s}/note.txt", .{ cwd, dir_rel });
     @memcpy(ed.filename[0..fpath.len], fpath);
     ed.filename_len = fpath.len;
@@ -5329,7 +5334,7 @@ test "swap autosave refuses to follow a planted symlink" {
     ed.maybeAutosaveSwap(); // must refuse (O_NOFOLLOW) — no write through the link
 
     // Victim must be untouched.
-    const check = try tmp.dir.openFile("victim.txt", .{});
+    const check = try fsx.openFile(victim_path);
     defer check.close();
     var vbuf: [64]u8 = undefined;
     const n = try check.readAll(&vbuf);

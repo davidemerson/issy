@@ -81,7 +81,7 @@ less install.sh
 sh install.sh
 ```
 
-**How it decides what to do.** On Linux amd64/arm64 and OpenBSD amd64 the installer downloads a prebuilt binary, verifies an Ed25519 signature over `sha256sums.txt` against a public key baked into the script, then verifies the binary's SHA-256 against that manifest, and finally installs with `install -m 0755`. On macOS (and any platform without a prebuilt) it falls through to a source build: clones the repo, runs `zig build -Doptimize=ReleaseSafe`, and installs the resulting binary. Source builds require Zig 0.15.x on `PATH` (0.16 changed the std APIs issy depends on; `build.zig` rejects it with an actionable error).
+**How it decides what to do.** On Linux amd64/arm64 and OpenBSD amd64 the installer downloads a prebuilt binary, verifies an Ed25519 signature over `sha256sums.txt` against a public key baked into the script, then verifies the binary's SHA-256 against that manifest, and finally installs with `install -m 0755`. On macOS (and any platform without a prebuilt) it falls through to a source build: clones the repo, runs `zig build -Doptimize=ReleaseSafe`, and installs the resulting binary. Source builds require Zig 0.15.x or 0.16.x on `PATH` (`src/fsx.zig` bridges the two series' std APIs; anything else is rejected at compile time with an actionable error).
 
 ### macOS via Homebrew
 
@@ -109,7 +109,7 @@ Building from source on OpenBSD: `pkg_add zig` then `zig build -Doptimize=Releas
 
 ### Build from source
 
-Requires [Zig 0.15.x](https://ziglang.org/download/) (0.15.2 recommended; 0.16 is rejected at compile time).
+Requires [Zig 0.15.x or 0.16.x](https://ziglang.org/download/) (CI exercises 0.15.2 and 0.16.0).
 
 ```sh
 git clone https://github.com/davidemerson/issy
@@ -307,7 +307,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full flow, the cache layout, and 
 ## Architecture, testing, man page
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — tour of the source code and the major subsystems
-- `zig build test` — 252-test unit suite (gap buffer, Unicode, tokenizer, editor operations, mouse/selection, search, auto-close, swap files, update verification, hostile-input hardening, etc.); each source file compiles and runs as its own test unit, so imported modules' tests re-run per unit
+- `zig build test` — 258-test unit suite (gap buffer, Unicode, tokenizer, editor operations, mouse/selection, search, auto-close, swap files, update verification, hostile-input hardening, etc.); each source file compiles and runs as its own test unit, so imported modules' tests re-run per unit
 - `bash tests/run_tests.sh` — end-to-end integration suite via `expect`, launches the real binary in a PTY
 - `man ./issy.1` — man page
 

@@ -56,7 +56,7 @@ pub const Renderer = struct {
             .rows = rows,
             .cols = cols,
             .allocator = allocator,
-            .syn_states = .{},
+            .syn_states = .empty,
             .syn_valid = 0,
             .syn_lang = null,
         };
@@ -464,7 +464,7 @@ pub const Renderer = struct {
                     break :blk (sr.start < line_end and sel_end > line_info.start);
                 } else false;
                 if (at_line_end and ed.config.trailing_whitespace and line_data.len > 0 and !line_in_sel) {
-                    const stripped = std.mem.trimRight(u8, line_data, " \t\n\r");
+                    const stripped = std.mem.trimEnd(u8, line_data, " \t\n\r");
                     if (stripped.len > 0 and stripped.len < line_data.len) {
                         // Highlight trailing whitespace cells on this row
                         if (stripped.len >= row_start_buf_col) {

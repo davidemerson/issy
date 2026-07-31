@@ -4,6 +4,7 @@
 //! configuration from a file. Includes theme definitions for syntax colors.
 
 const std = @import("std");
+const fsx = @import("fsx.zig");
 const term = @import("term.zig");
 
 pub const Color = term.Color;
@@ -165,7 +166,7 @@ pub fn load(path: ?[]const u8) Config {
 
     const actual_path = path orelse return cfg;
 
-    const file = std.fs.cwd().openFile(actual_path, .{}) catch return cfg;
+    const file = fsx.openFile(actual_path) catch return cfg;
     defer file.close();
 
     const stat = file.stat() catch return cfg;
@@ -357,7 +358,7 @@ pub fn parseHexColor(s: []const u8) ?Color {
 /// file actually exists — callers that need that signal should stat
 /// the returned path themselves.
 pub fn resolveDefaultPath(buf: []u8) ?[]const u8 {
-    const home = std.posix.getenv("HOME") orelse return null;
+    const home = fsx.getenv("HOME") orelse return null;
     const suffix = "/.issyrc";
     const needed = home.len + suffix.len;
     if (needed > buf.len) return null;
@@ -369,7 +370,7 @@ pub fn resolveDefaultPath(buf: []u8) ?[]const u8 {
 /// Stat `path` and return its mtime, or null on any error. Used by
 /// the config-reload watcher to decide when ~/.issyrc has changed.
 pub fn statMtime(path: []const u8) ?i128 {
-    const file = std.fs.cwd().openFile(path, .{}) catch return null;
+    const file = fsx.openFile(path) catch return null;
     defer file.close();
     const s = file.stat() catch return null;
     return s.mtime;
@@ -380,7 +381,7 @@ pub fn statMtime(path: []const u8) ?i128 {
 /// zero-byte read would otherwise `load()` back to compiled-in defaults
 /// and flash the user's settings away for ~1s until the write finishes.
 pub fn hasContent(path: []const u8) bool {
-    const file = std.fs.cwd().openFile(path, .{}) catch return false;
+    const file = fsx.openFile(path) catch return false;
     defer file.close();
     const s = file.stat() catch return false;
     return s.size > 0;
@@ -418,7 +419,7 @@ test "parseHexColor invalid" {
 test "resolveDefaultPath returns HOME/.issyrc when HOME is set" {
     // std.posix.getenv reads the real environment; for a deterministic
     // test we only assert the shape of the result when HOME is present.
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var buf: [fsx.max_path_bytes]u8 = undefined;
     const maybe = resolveDefaultPath(&buf);
     if (maybe) |p| {
         try std.testing.expect(std.mem.endsWith(u8, p, "/.issyrc"));

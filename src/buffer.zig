@@ -16,6 +16,7 @@
 //! with mixed endings are left byte-for-byte untouched.
 
 const std = @import("std");
+const fsx = @import("fsx.zig");
 const Allocator = std.mem.Allocator;
 
 const initial_capacity = 4096;
@@ -52,7 +53,7 @@ pub const Buffer = struct {
             .allocator = allocator,
             .dirty = false,
             .line_ending = .lf,
-            .line_index = .{},
+            .line_index = .empty,
             .line_index_valid = false,
             .dirty_min_pos = null,
         };
@@ -68,7 +69,7 @@ pub const Buffer = struct {
     /// Allocates the replacement backing array before freeing the old one,
     /// so an allocation failure leaves the buffer untouched.
     pub fn load(self: *Buffer, path: []const u8) !void {
-        const file = try std.fs.cwd().openFile(path, .{});
+        const file = try fsx.openFile(path);
         defer file.close();
 
         const stat = try file.stat();
@@ -103,34 +104,32 @@ pub const Buffer = struct {
     /// leave a truncated file behind. CRLF line endings detected at load
     /// time are re-applied on the way out.
     pub fn save(self: *Buffer, path: []const u8) !void {
-        var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var link_buf: [fsx.max_path_bytes]u8 = undefined;
         const target = resolveSymlinks(path, &link_buf);
 
         // Build tmp path: target ++ ".tmp"
-        var tmp_buf: [std.fs.max_path_bytes + 4]u8 = undefined;
+        var tmp_buf: [fsx.max_path_bytes + 4]u8 = undefined;
         if (target.len + 4 > tmp_buf.len) return error.PathTooLong;
         @memcpy(tmp_buf[0..target.len], target);
         @memcpy(tmp_buf[target.len..][0..4], ".tmp");
         const tmp_path = tmp_buf[0 .. target.len + 4];
 
-        const dir = std.fs.cwd();
-
         // Capture the original permission bits (if the file exists) so the
         // rename doesn't silently reset them to the umask default.
-        const orig_mode: ?std.fs.File.Mode = blk: {
-            const st = dir.statFile(target) catch break :blk null;
+        const orig_mode: ?u32 = blk: {
+            const st = fsx.statFile(target) catch break :blk null;
             break :blk st.mode;
         };
 
-        const tmp_file = try dir.createFile(tmp_path, .{});
+        const tmp_file = try fsx.createFile(tmp_path, .{});
         var tmp_open = true;
         errdefer {
             if (tmp_open) tmp_file.close();
-            dir.deleteFile(tmp_path) catch {};
+            fsx.deleteFile(tmp_path) catch {};
         }
 
         if (orig_mode) |m| {
-            std.posix.fchmod(tmp_file.handle, @intCast(m & 0o7777)) catch {};
+            _ = std.c.fchmod(tmp_file.handle, @intCast(m & 0o7777));
         }
 
         try self.writeContents(tmp_file);
@@ -142,11 +141,11 @@ pub const Buffer = struct {
         tmp_open = false;
 
         // Atomic rename.
-        try dir.rename(tmp_path, target);
+        try fsx.rename(tmp_path, target);
         self.dirty = false;
     }
 
-    fn writeContents(self: *const Buffer, file: std.fs.File) !void {
+    fn writeContents(self: *const Buffer, file: fsx.File) !void {
         if (self.line_ending == .lf) {
             if (self.gap_start > 0) try file.writeAll(self.data[0..self.gap_start]);
             if (self.gap_end < self.data.len) try file.writeAll(self.data[self.gap_end..]);
@@ -156,7 +155,7 @@ pub const Buffer = struct {
         try writeSegmentCrlf(file, self.data[self.gap_end..]);
     }
 
-    fn writeSegmentCrlf(file: std.fs.File, seg: []const u8) !void {
+    fn writeSegmentCrlf(file: fsx.File, seg: []const u8) !void {
         var i: usize = 0;
         while (i < seg.len) {
             const nl = std.mem.indexOfScalarPos(u8, seg, i, '\n') orelse {
@@ -455,14 +454,14 @@ fn stripCrBeforeLf(buf: []u8) usize {
 /// directory. On any error (not a link, too many hops, path too long)
 /// returns the deepest path resolved so far. Uses readlink(2) directly
 /// instead of realpath, which is not portable to OpenBSD without libc.
-fn resolveSymlinks(path: []const u8, out: *[std.fs.max_path_bytes]u8) []const u8 {
-    var bufs: [2][std.fs.max_path_bytes]u8 = undefined;
-    var scratch: [std.fs.max_path_bytes]u8 = undefined;
+fn resolveSymlinks(path: []const u8, out: *[fsx.max_path_bytes]u8) []const u8 {
+    var bufs: [2][fsx.max_path_bytes]u8 = undefined;
+    var scratch: [fsx.max_path_bytes]u8 = undefined;
     var cur: []const u8 = path;
     var flip: u1 = 0;
     var hops: u8 = 0;
     while (hops < 8) : (hops += 1) {
-        const target = std.fs.cwd().readLink(cur, &scratch) catch break;
+        const target = fsx.readLink(cur, &scratch) catch break;
         if (target.len == 0) break;
         const dst = &bufs[flip];
         var n: usize = 0;
@@ -762,16 +761,11 @@ test "load and save round-trip" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    // Write test file.
-    const file = try tmp_dir.dir.createFile("test.txt", .{});
-    try file.writeAll(test_content);
-    file.close();
-
     // Build absolute path to the test file.  Avoid Dir.realpath which
     // is unsupported on OpenBSD; the tmpDir lives under
     // .zig-cache/tmp/<sub_path> relative to cwd.
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd = try std.posix.getcwd(&path_buf);
+    var path_buf: [fsx.max_path_bytes]u8 = undefined;
+    const cwd = try fsx.getcwd(&path_buf);
     const real_path = try std.fmt.bufPrint(
         path_buf[cwd.len..],
         "/.zig-cache/tmp/{s}/test.txt",
@@ -780,6 +774,13 @@ test "load and save round-trip" {
     // bufPrint wrote into path_buf starting at cwd.len; the full
     // absolute path is path_buf[0 .. cwd.len + real_path.len].
     const real_path_full = path_buf[0 .. cwd.len + real_path.len];
+
+    // Write test file.
+    {
+        const file = try fsx.createFile(real_path_full, .{});
+        defer file.close();
+        try file.writeAll(test_content);
+    }
 
     try buf.load(real_path_full);
     try std.testing.expectEqual(@as(usize, test_content.len), buf.logicalLen());
@@ -795,9 +796,7 @@ test "load and save round-trip" {
     try std.testing.expect(!buf.dirty);
 
     // Read back and verify.
-    const saved_file = try tmp_dir.dir.openFile("test.txt", .{});
-    defer saved_file.close();
-    const saved = try saved_file.readToEndAlloc(std.testing.allocator, 1024 * 1024);
+    const saved = try fsx.readFileAlloc(std.testing.allocator, real_path_full, 1024 * 1024);
     defer std.testing.allocator.free(saved);
     try std.testing.expectEqualStrings("NEW: line one\nline two\nline three\n", saved);
 }
@@ -809,18 +808,20 @@ test "CRLF file normalizes on load and round-trips on save" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("dos.txt", .{});
-    try file.writeAll("one\r\ntwo\r\nthree\r\n");
-    file.close();
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd = try std.posix.getcwd(&path_buf);
+    var path_buf: [fsx.max_path_bytes]u8 = undefined;
+    const cwd = try fsx.getcwd(&path_buf);
     const rel = try std.fmt.bufPrint(
         path_buf[cwd.len..],
         "/.zig-cache/tmp/{s}/dos.txt",
         .{&tmp_dir.sub_path},
     );
     const full = path_buf[0 .. cwd.len + rel.len];
+
+    {
+        const file = try fsx.createFile(full, .{});
+        defer file.close();
+        try file.writeAll("one\r\ntwo\r\nthree\r\n");
+    }
 
     try buf.load(full);
     try std.testing.expectEqual(LineEnding.crlf, buf.line_ending);
@@ -835,9 +836,7 @@ test "CRLF file normalizes on load and round-trips on save" {
     try buf.insert(0, "zero\n");
     try buf.save(full);
 
-    const saved_file = try tmp_dir.dir.openFile("dos.txt", .{});
-    defer saved_file.close();
-    const saved = try saved_file.readToEndAlloc(std.testing.allocator, 1024);
+    const saved = try fsx.readFileAlloc(std.testing.allocator, full, 1024);
     defer std.testing.allocator.free(saved);
     try std.testing.expectEqualStrings("zero\r\none\r\ntwo\r\nthree\r\n", saved);
 }
@@ -856,12 +855,8 @@ test "save preserves permission bits" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("exec.sh", .{ .mode = 0o755 });
-    try file.writeAll("#!/bin/sh\n");
-    file.close();
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd = try std.posix.getcwd(&path_buf);
+    var path_buf: [fsx.max_path_bytes]u8 = undefined;
+    const cwd = try fsx.getcwd(&path_buf);
     const rel = try std.fmt.bufPrint(
         path_buf[cwd.len..],
         "/.zig-cache/tmp/{s}/exec.sh",
@@ -869,11 +864,17 @@ test "save preserves permission bits" {
     );
     const full = path_buf[0 .. cwd.len + rel.len];
 
+    {
+        const file = try fsx.createFile(full, .{ .mode = 0o755 });
+        defer file.close();
+        try file.writeAll("#!/bin/sh\n");
+    }
+
     try buf.load(full);
     try buf.insert(buf.logicalLen(), "echo hi\n");
     try buf.save(full);
 
-    const st = try tmp_dir.dir.statFile("exec.sh");
+    const st = try fsx.statFile(full);
     try std.testing.expectEqual(@as(u32, 0o755), @as(u32, @intCast(st.mode & 0o7777)));
 }
 
@@ -884,13 +885,8 @@ test "save through a symlink rewrites the target, not the link" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("real.txt", .{});
-    try file.writeAll("original\n");
-    file.close();
-    try tmp_dir.dir.symLink("real.txt", "link.txt", .{});
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd = try std.posix.getcwd(&path_buf);
+    var path_buf: [fsx.max_path_bytes]u8 = undefined;
+    const cwd = try fsx.getcwd(&path_buf);
     const rel = try std.fmt.bufPrint(
         path_buf[cwd.len..],
         "/.zig-cache/tmp/{s}/link.txt",
@@ -898,19 +894,33 @@ test "save through a symlink rewrites the target, not the link" {
     );
     const full = path_buf[0 .. cwd.len + rel.len];
 
+    var real_buf: [fsx.max_path_bytes]u8 = undefined;
+    const cwd2 = try fsx.getcwd(&real_buf);
+    const rel2 = try std.fmt.bufPrint(
+        real_buf[cwd2.len..],
+        "/.zig-cache/tmp/{s}/real.txt",
+        .{&tmp_dir.sub_path},
+    );
+    const real_full = real_buf[0 .. cwd2.len + rel2.len];
+
+    {
+        const file = try fsx.createFile(real_full, .{});
+        defer file.close();
+        try file.writeAll("original\n");
+    }
+    try fsx.symLink("real.txt", full);
+
     try buf.load(full);
     try buf.insert(0, "edited ");
     try buf.save(full);
 
     // The link must still be a symlink…
-    var lbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const target = try tmp_dir.dir.readLink("link.txt", &lbuf);
+    var lbuf: [fsx.max_path_bytes]u8 = undefined;
+    const target = try fsx.readLink(full, &lbuf);
     try std.testing.expectEqualStrings("real.txt", target);
 
     // …and the target must hold the new content.
-    const real = try tmp_dir.dir.openFile("real.txt", .{});
-    defer real.close();
-    const saved = try real.readToEndAlloc(std.testing.allocator, 1024);
+    const saved = try fsx.readFileAlloc(std.testing.allocator, real_full, 1024);
     defer std.testing.allocator.free(saved);
     try std.testing.expectEqualStrings("edited original\n", saved);
 }
