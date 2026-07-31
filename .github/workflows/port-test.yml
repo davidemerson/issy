@@ -1,0 +1,59 @@
+# One-off verification for the OpenBSD ports submission: build the
+# port skeleton in a real OpenBSD 7.9 ports tree the same way a ports
+# reviewer would (make checksum/build/fake/package, install the built
+# package, run portcheck).  Lives only on the openbsd-port-test
+# branch; not part of regular CI.
+name: OpenBSD port test
+
+# Trigger manually (workflow_dispatch) after the tag named in
+# packaging/openbsd/issy/Makefile GH_TAGNAME exists and
+# prep-submission.sh has regenerated distinfo.
+on:
+  workflow_dispatch:
+
+jobs:
+  port-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build editors/issy from the port skeleton on OpenBSD 7.9
+        uses: cross-platform-actions/action@v1.3.0
+        with:
+          operating_system: openbsd
+          version: '7.9'
+          architecture: x86-64
+          memory: 4G
+          cpu_count: 2
+          shell: bash
+          run: |
+            set -euxo pipefail
+            # BUILD_DEPENDS = lang/zig resolves against installed
+            # packages; preinstall so the framework doesn't try to
+            # build zig (LLVM) from source.
+            sudo pkg_add -I zig
+            # Fetch and extract the pristine 7.9 ports tree.
+            cd /tmp
+            ftp -o ports.tar.gz https://cdn.openbsd.org/pub/OpenBSD/7.9/ports.tar.gz
+            sudo tar -C /usr -xzf ports.tar.gz
+            cd -
+            # Drop the submitted skeleton in exactly as a committer would.
+            sudo cp -R packaging/openbsd/issy /usr/ports/editors/issy
+            cd /usr/ports/editors/issy
+            # Fetch the distfile from GitHub and verify our distinfo.
+            sudo make checksum
+            sudo make build
+            # Regression guard for the DESTDIR bug: do-build must NOT
+            # have installed anything into the live system.
+            test ! -e /usr/bin/issy
+            test ! -e /usr/local/bin/issy
+            sudo make fake
+            sudo make package
+            # Lint the port; report-only (output reviewed in the log).
+            /usr/ports/infrastructure/bin/portcheck || true
+            sudo make port-lib-depends-check
+            # Install from the freshly built package and smoke-test.
+            sudo make install
+            issy --version
+            man -w issy
+            pkg_info issy
