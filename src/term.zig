@@ -113,6 +113,14 @@ var read_end: usize = 0;
 // to the editor is only valid until the next readKey call.
 const PASTE_BUF_SIZE = 64 * 1024;
 var paste_buf: [PASTE_BUF_SIZE]u8 = undefined;
+
+// Upper bound on one bracketed-paste session. A terminal that never
+// delivers the ESC[201~ terminator while the user keeps typing (with
+// <300ms gaps, so the stall detection never fires) would otherwise
+// absorb every subsequent keystroke — Ctrl+S included — as paste
+// content forever. Generous enough that no real paste hits it.
+const MAX_PASTE_SESSION_BYTES: usize = 16 * 1024 * 1024;
+var paste_session_bytes: usize = 0;
 // True while inside a bracketed paste body (between ESC[200~ and ESC[201~).
 var paste_active: bool = false;
 
@@ -364,6 +372,7 @@ fn readKeyPosix() !Key {
                     // the raw markers.
                     .paste_start => {
                         paste_active = true;
+                        paste_session_bytes = 0;
                         return capturePasteBody();
                     },
                     // A stray end marker outside a paste (e.g. after a
@@ -737,6 +746,13 @@ fn capturePasteBody() Key {
         n += 1;
         readBufConsume(1);
         waits = 0;
+    }
+    paste_session_bytes +|= n;
+    if (paste_session_bytes > MAX_PASTE_SESSION_BYTES) {
+        // Runaway session (terminator lost): stop treating input as
+        // paste content. The tail of an over-cap paste tokenizes as
+        // keys, which beats swallowing keystrokes indefinitely.
+        paste_active = false;
     }
     return .{ .paste = paste_buf[0..n] };
 }

@@ -331,6 +331,30 @@ pub fn openSwapNoFollow(path: []const u8) !File {
     return .{ .handle = fd };
 }
 
+/// Best-effort fsync of the directory containing `path`, making a
+/// rename that just landed there durable. Failures are deliberately
+/// ignored: some filesystems refuse directory fsync (EINVAL), and once
+/// the file data itself is synced, losing the rename on a crash is
+/// strictly better than failing a save whose bytes are already safe.
+pub fn syncDirOf(path: []const u8) void {
+    const dir_path = std.fs.path.dirname(path) orelse ".";
+    const flags: std.posix.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true };
+    if (comptime !is_zig_016) {
+        const fd = std.posix.open(dir_path, flags, 0) catch return;
+        defer std.posix.close(fd);
+        _ = std.c.fsync(fd);
+        return;
+    }
+    var dir_z: [max_path_bytes]u8 = undefined;
+    if (dir_path.len >= dir_z.len) return;
+    @memcpy(dir_z[0..dir_path.len], dir_path);
+    dir_z[dir_path.len] = 0;
+    const fd = std.c.open(dir_z[0..dir_path.len :0], @bitCast(flags), @as(std.c.mode_t, 0));
+    if (fd < 0) return;
+    _ = std.c.fsync(fd);
+    _ = std.c.close(fd);
+}
+
 pub fn nowMillis() i64 {
     if (comptime !is_zig_016) return std.time.milliTimestamp();
     return std.Io.Timestamp.now(io(), .real).toMilliseconds();

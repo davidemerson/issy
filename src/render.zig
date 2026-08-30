@@ -481,10 +481,18 @@ pub const Renderer = struct {
                 // the bracket-match block above: cursor.col is a byte
                 // offset, the buf_col window is visual.
                 for (ed.cursors.items) |cursor| {
-                    if (cursor.line == file_line) {
-                        const cursor_visual = ed.byteColToVisualCol(file_line, cursor.col);
-                        if (cursor_visual >= row_start_buf_col and cursor_visual < buf_col) {
-                            const offset = cursor_visual - row_start_buf_col;
+                    if (cursor.line != file_line) continue;
+                    const cursor_visual = ed.byteColToVisualCol(file_line, cursor.col);
+                    // With a Ctrl+D rename armed, highlight the whole
+                    // word at each secondary (word chars are ASCII, so
+                    // bytes == columns) so it reads as "these will be
+                    // replaced"; otherwise just the cursor cell.
+                    const span: usize = @max(1, ed.mc_word_len);
+                    var k: usize = 0;
+                    while (k < span) : (k += 1) {
+                        const vis = cursor_visual + k;
+                        if (vis >= row_start_buf_col and vis < buf_col) {
+                            const offset = vis - row_start_buf_col;
                             const mc_col = screenColSat(code_start + this_indent, offset);
                             if (mc_col < self.cols) {
                                 const cell = self.cellAt(screen_row, mc_col);
@@ -558,28 +566,54 @@ pub const Renderer = struct {
             self.cellAt(row, bgc).bg = theme.status_bg;
         }
 
-        // Left: filename (aligned with code area)
-        var col = self.putTextUtf8(row, center_offset, ed.getFilename(), theme.status_fg, self.cols);
-        if (ed.modified) {
-            col = self.putTextUtf8(row, col, " *", theme.status_fg, self.cols);
-        }
-
         // Right: line:col
         var pos_buf: [32]u8 = undefined;
         const pos_str = std.fmt.bufPrint(&pos_buf, "{d}:{d}", .{
             ed.cursor.line + 1,
             ed.cursor.col + 1,
         }) catch "";
+        const right_edge = code_end;
+
+        // Left: filename (aligned with code area). A pending status
+        // message outranks the filename: a long path used to push the
+        // message — save errors, swap warnings, "file changed on disk" —
+        // clean off the row, turning every notification into a silent
+        // one. Truncate the filename to its tail (leading ellipsis) so
+        // the message and line:col always stay visible.
+        const msg = ed.getStatusMsg();
+        var name = ed.getFilename();
+        var ellipsized = false;
+        if (msg.len > 0) {
+            const overhead: usize = pos_str.len + 5 + @as(usize, if (ed.modified) 2 else 0);
+            const budget = @as(usize, right_edge) -| msg.len -| overhead;
+            if (name.len > budget) {
+                ellipsized = true;
+                if (budget <= 1) {
+                    name = name[name.len..];
+                } else {
+                    var cut = name.len - (budget - 1);
+                    // Never start the tail mid-codepoint.
+                    while (cut < name.len and (name[cut] & 0xC0) == 0x80) cut += 1;
+                    name = name[cut..];
+                }
+            }
+        }
+        var col = center_offset;
+        if (ellipsized) {
+            col = self.putTextUtf8(row, col, "…", theme.status_fg, self.cols);
+        }
+        col = self.putTextUtf8(row, col, name, theme.status_fg, self.cols);
+        if (ed.modified) {
+            col = self.putTextUtf8(row, col, " *", theme.status_fg, self.cols);
+        }
 
         // Right-align line:col at the code_end boundary
-        const right_edge = code_end;
         if (pos_str.len < right_edge) {
             const start = right_edge - @as(u16, @intCast(pos_str.len));
             _ = self.putTextUtf8(row, start, pos_str, theme.status_fg, self.cols);
         }
 
         // Status message (if any)
-        const msg = ed.getStatusMsg();
         if (msg.len > 0) {
             const msg_cap = right_edge -| @as(u16, @intCast(pos_str.len)) -| 1;
             _ = self.putTextUtf8(row, col + 2, msg, theme.status_fg, msg_cap);
@@ -658,6 +692,9 @@ pub const Renderer = struct {
                 if (ed.completion_hint_len > 0) {
                     const hint = ed.completion_hint[0..ed.completion_hint_len];
                     col_c = self.putTextAttr(row, col_c, hint, theme.comment, self.cols, true);
+                    // Mark the ghost text as a suggestion: Enter submits
+                    // the literal typed text; only Tab accepts the hint.
+                    col_c = self.putTextAttr(row, col_c + 1, "[Tab]", theme.comment, self.cols, true);
                 }
             },
             .confirm => {
@@ -1254,4 +1291,38 @@ test "status row is filled with the status background" {
     const status_row: u16 = 3;
     try std.testing.expect(colorEq(renderer.cellAt(status_row, 0).bg, cfg.theme.status_bg));
     try std.testing.expect(colorEq(renderer.cellAt(status_row, 19).bg, cfg.theme.status_bg));
+}
+
+test "status message stays visible past a long filename" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+
+    var ed = try editor_mod.Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // A filename far wider than the terminal used to push the status
+    // message clean off the row, silencing save errors and warnings.
+    const name = [_]u8{'a'} ** 120;
+    @memcpy(ed.filename[0..name.len], &name);
+    ed.filename_len = name.len;
+    ed.setStatusMessage("Save failed: AccessDenied");
+    ed.visible_cols = 60;
+    ed.visible_rows = 4;
+
+    var renderer = try Renderer.init(std.testing.allocator, 4, 60);
+    defer renderer.deinit();
+    _ = renderer.paintFrame(&ed);
+
+    const status_row: u16 = 3;
+    var row_text: [60]u8 = undefined;
+    var i: u16 = 0;
+    while (i < 60) : (i += 1) {
+        const ch = renderer.cellAt(status_row, i).char;
+        row_text[i] = if (ch < 128) @intCast(ch) else '?';
+    }
+    try std.testing.expect(std.mem.indexOf(u8, &row_text, "Save failed: AccessDenied") != null);
+    // The truncated filename leads with an ellipsis.
+    try std.testing.expectEqual(@as(u21, 0x2026), renderer.cellAt(status_row, 0).char);
 }

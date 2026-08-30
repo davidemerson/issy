@@ -1,0 +1,193 @@
+#!/usr/bin/expect -f
+# t17_save_modes.exp -- regressions for the silent-save-failure class:
+# Ctrl+S must work (or say why not) in every mode, Save-As must never
+# no-op silently, file:line must never bind a literal colon name, and a
+# failing save must leave the original bytes untouched.
+
+set timeout 8
+set issy [lindex $argv 0]
+set test_dir [lindex $argv 1]
+source "$test_dir/helpers.tcl"
+
+set tmpdir [exec mktemp -d]
+
+# Wait for the editor to exit; if it doesn't (e.g. a regression swallows
+# the quit key again), kill it and fail the case instead of hanging the
+# whole suite on `wait`.
+proc exit_or_kill {testname} {
+    set ok 1
+    expect {
+        eof {}
+        timeout {
+            puts stderr "FAIL ${testname}_exit (editor did not exit; killed)"
+            exec kill -9 [exp_pid]
+            expect eof
+            set ok 0
+        }
+    }
+    wait
+    return $ok
+}
+
+# --- S1: Ctrl+S inside search mode saves (the original bug report) ---
+set f "$tmpdir/s1.txt"
+exec printf "needle haystack" > $f
+spawn $issy --no-config $f
+sleep 0.8
+send "edit "
+sleep 0.3
+send "\x06"
+sleep 0.2
+send "needle"
+sleep 0.3
+send "\x13"
+sleep 0.4
+send "\x11"
+set alive [exit_or_kill "S1"]
+record_result [expr {$alive && [assert_file $f "edit needle haystack" "S1_ctrl_s_in_search_saves"]}]
+
+# --- S2: Ctrl+S at the quit-confirm prompt saves and stays ---
+set f "$tmpdir/s2.txt"
+exec printf "base" > $f
+spawn $issy --no-config $f
+sleep 0.8
+send "!"
+sleep 0.3
+send "\x11"
+sleep 0.3
+send "\x13"
+sleep 0.4
+# Save-and-stay: the editor must still be running; a clean quit follows.
+send "\x11"
+set alive [exit_or_kill "S2"]
+record_result [expr {$alive && [assert_file $f "!base" "S2_ctrl_s_in_confirm_saves_and_stays"]}]
+
+# --- S3: Ctrl+S with the help overlay open saves ---
+set f "$tmpdir/s3.txt"
+exec printf "help" > $f
+spawn $issy --no-config $f
+sleep 0.8
+send "!"
+sleep 0.3
+send "\x1f"
+sleep 0.3
+send "\x13"
+sleep 0.4
+send "\x11"
+set alive [exit_or_kill "S3"]
+record_result [expr {$alive && [assert_file $f "!help" "S3_ctrl_s_in_help_saves"]}]
+
+# --- S4: Ctrl+S in replace mode saves ---
+set f "$tmpdir/s4.txt"
+exec printf "repl" > $f
+spawn $issy --no-config $f
+sleep 0.8
+send "!"
+sleep 0.3
+send "\x08"
+sleep 0.3
+send "\x13"
+sleep 0.4
+send "\x11"
+set alive [exit_or_kill "S4"]
+record_result [expr {$alive && [assert_file $f "!repl" "S4_ctrl_s_in_replace_saves"]}]
+
+# --- S5: empty Save-As prompt cancels, editor keeps running, content survives ---
+set f "$tmpdir/s5.txt"
+spawn $issy --no-config
+sleep 0.8
+send "abc"
+sleep 0.3
+send "\x13"
+sleep 0.4
+for {set i 0} {$i < 200} {incr i} { send "\x7f" }
+sleep 0.2
+send "\r"
+sleep 0.4
+# Cancelled, still dirty and still running: a second Save-As must work.
+send "\x13"
+sleep 0.4
+for {set i 0} {$i < 200} {incr i} { send "\x7f" }
+sleep 0.2
+send "$f"
+sleep 0.2
+send "\r"
+sleep 0.4
+send "\x11"
+set alive [exit_or_kill "S5"]
+record_result [expr {$alive && [assert_file $f "abc" "S5_empty_save_as_cancels_cleanly"]}]
+
+# --- S6: issy new.txt:5 creates new.txt, never a literal "new.txt:5" ---
+set f "$tmpdir/fresh.txt"
+spawn $issy --no-config "$f:5"
+sleep 0.8
+send "x"
+sleep 0.3
+send "\x13"
+sleep 0.4
+send "\x11"
+set alive [exit_or_kill "S6"]
+set ok [expr {$alive && [assert_file $f "x" "S6_file_line_new_file_prefix"]}]
+if {[file exists "$f:5"]} {
+    puts stderr "FAIL S6_no_literal_colon_file (literal fresh.txt:5 exists)"
+    set ok 0
+} else {
+    puts stderr "PASS S6_no_literal_colon_file"
+}
+record_result $ok
+
+# --- S7: failing save surfaces and never touches the original bytes ---
+if {[exec id -u] != 0} {
+    set rodir "$tmpdir/ro"
+    exec mkdir -p $rodir
+    set f "$rodir/precious.txt"
+    exec printf "precious" > $f
+    exec chmod 500 $rodir
+    spawn $issy --no-config $f
+    sleep 0.8
+    send "!"
+    sleep 0.3
+    send "\x13"
+    sleep 0.6
+    # Save failed; buffer still dirty, so quitting takes the confirm path.
+    send "\x11"
+    sleep 0.3
+    send "\x11"
+    set alive [exit_or_kill "S7"]
+    exec chmod 700 $rodir
+    record_result [expr {$alive && [assert_file $f "precious" "S7_failed_save_preserves_original"]}]
+} else {
+    puts stderr "SKIP S7_failed_save_preserves_original (running as root)"
+}
+
+# --- S8: CRLF line endings round-trip through an edit + save ---
+set f "$tmpdir/s8.txt"
+exec printf "a\r\nb\r\n" > $f
+spawn $issy --no-config $f
+sleep 0.8
+send "!"
+sleep 0.3
+send "\x13"
+sleep 0.4
+send "\x11"
+set alive [exit_or_kill "S8"]
+record_result [expr {$alive && [assert_file $f "!a\r\nb\r\n" "S8_crlf_round_trip"]}]
+
+# --- S9: a file without a trailing newline keeps not having one ---
+set f "$tmpdir/s9.txt"
+exec printf "abc" > $f
+spawn $issy --no-config $f
+sleep 0.8
+send "\x1b\[F"
+sleep 0.2
+send "!"
+sleep 0.3
+send "\x13"
+sleep 0.4
+send "\x11"
+set alive [exit_or_kill "S9"]
+record_result [expr {$alive && [assert_file $f "abc!" "S9_no_trailing_newline_preserved"]}]
+
+# Cleanup
+exec rm -rf $tmpdir
+report_results "t17_save_modes"

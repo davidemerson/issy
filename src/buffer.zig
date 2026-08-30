@@ -97,22 +97,20 @@ pub const Buffer = struct {
         self.invalidateFrom(0);
     }
 
-    /// Save buffer contents to a file atomically (write .tmp then rename).
-    /// Follows symlinks so saving through a link rewrites the target file
-    /// instead of replacing the link itself, preserves the original file's
-    /// permission bits, and fsyncs before the rename so a crash can't
-    /// leave a truncated file behind. CRLF line endings detected at load
-    /// time are re-applied on the way out.
+    /// Save buffer contents to a file atomically (write a unique temp
+    /// sibling, fsync, then rename over the target). Follows symlinks so
+    /// saving through a link rewrites the target file instead of replacing
+    /// the link itself, and preserves the original file's permission bits.
+    /// File data is fsynced before the rename, so after a crash the path
+    /// holds either the complete old or the complete new contents — and a
+    /// failed sync aborts the save (temp removed, original untouched)
+    /// instead of renaming a possibly-truncated temp into place. A
+    /// best-effort directory fsync afterward makes the rename itself
+    /// durable. CRLF line endings detected at load time are re-applied
+    /// on the way out.
     pub fn save(self: *Buffer, path: []const u8) !void {
         var link_buf: [fsx.max_path_bytes]u8 = undefined;
         const target = resolveSymlinks(path, &link_buf);
-
-        // Build tmp path: target ++ ".tmp"
-        var tmp_buf: [fsx.max_path_bytes + 4]u8 = undefined;
-        if (target.len + 4 > tmp_buf.len) return error.PathTooLong;
-        @memcpy(tmp_buf[0..target.len], target);
-        @memcpy(tmp_buf[target.len..][0..4], ".tmp");
-        const tmp_path = tmp_buf[0 .. target.len + 4];
 
         // Capture the original permission bits (if the file exists) so the
         // rename doesn't silently reset them to the umask default.
@@ -121,7 +119,40 @@ pub const Buffer = struct {
             break :blk st.mode;
         };
 
-        const tmp_file = try fsx.createFile(tmp_path, .{});
+        // Unique hidden temp in the same directory (rename must stay on
+        // one filesystem): "<dir>/.<basename>.<8 hex>.issy-tmp". O_EXCL
+        // refuses to open through a planted symlink and never clobbers an
+        // existing file (a user's real "foo.tmp" included), and the random
+        // suffix keeps two issy instances saving the same file from racing
+        // over one temp name. An existing target's temp starts private
+        // (0600) until fchmod copies the real bits — no window where old
+        // content is exposed under wider permissions; a brand-new file
+        // keeps the umask-mediated default the old code had.
+        var tmp_buf: [fsx.max_path_bytes + 32]u8 = undefined;
+        var tmp_file: fsx.File = undefined;
+        var tmp_path: []const u8 = undefined;
+        var attempt: u8 = 0;
+        while (true) : (attempt += 1) {
+            var rand: [4]u8 = undefined;
+            std.crypto.random.bytes(&rand);
+            const hex = std.fmt.bytesToHex(rand, .lower);
+            tmp_path = if (std.fs.path.dirname(target)) |dir|
+                std.fmt.bufPrint(&tmp_buf, "{s}/.{s}.{s}.issy-tmp", .{
+                    dir, std.fs.path.basename(target), &hex,
+                }) catch return error.PathTooLong
+            else
+                std.fmt.bufPrint(&tmp_buf, ".{s}.{s}.issy-tmp", .{
+                    std.fs.path.basename(target), &hex,
+                }) catch return error.PathTooLong;
+            tmp_file = fsx.createFile(tmp_path, .{
+                .exclusive = true,
+                .mode = if (orig_mode != null) 0o600 else 0o666,
+            }) catch |e| switch (e) {
+                error.PathAlreadyExists => if (attempt < 2) continue else return e,
+                else => return e,
+            };
+            break;
+        }
         var tmp_open = true;
         errdefer {
             if (tmp_open) tmp_file.close();
@@ -133,15 +164,20 @@ pub const Buffer = struct {
         }
 
         try self.writeContents(tmp_file);
-        // Flush file data to disk before the rename; on some filesystems a
-        // crash between rename and writeback would otherwise leave a
-        // zero-length file where the original used to be.
-        tmp_file.sync() catch {};
+        // Flush file data to disk before the rename. With delayed
+        // allocation a full disk or I/O error often surfaces here rather
+        // than at write(); propagating it is what keeps a truncated temp
+        // from being renamed over the good original while the editor
+        // reports success. (close() can't report errors on either Zig
+        // version; syncing first is what makes that acceptable.)
+        try tmp_file.sync();
         tmp_file.close();
         tmp_open = false;
 
-        // Atomic rename.
+        // Atomic rename, then best-effort directory fsync so the new
+        // directory entry survives a crash right after the save.
         try fsx.rename(tmp_path, target);
+        fsx.syncDirOf(target);
         self.dirty = false;
     }
 
@@ -923,6 +959,98 @@ test "save through a symlink rewrites the target, not the link" {
     const saved = try fsx.readFileAlloc(std.testing.allocator, real_full, 1024);
     defer std.testing.allocator.free(saved);
     try std.testing.expectEqualStrings("edited original\n", saved);
+}
+
+test "save does not clobber a sibling .tmp file" {
+    var buf = try Buffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.insert(0, "content\n");
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [fsx.max_path_bytes]u8 = undefined;
+    const cwd = try fsx.getcwd(&path_buf);
+    const rel = try std.fmt.bufPrint(
+        path_buf[cwd.len..],
+        "/.zig-cache/tmp/{s}/doc.txt",
+        .{&tmp_dir.sub_path},
+    );
+    const target = path_buf[0 .. cwd.len + rel.len];
+
+    // A user file that happens to carry the old fixed temp suffix must
+    // survive a save of its sibling untouched.
+    var tmp_name_buf: [fsx.max_path_bytes]u8 = undefined;
+    const bystander = try std.fmt.bufPrint(&tmp_name_buf, "{s}.tmp", .{target});
+    {
+        const f = try fsx.createFile(bystander, .{});
+        defer f.close();
+        try f.writeAll("sentinel");
+    }
+
+    try buf.save(target);
+
+    const kept = try fsx.readFileAlloc(std.testing.allocator, bystander, 64);
+    defer std.testing.allocator.free(kept);
+    try std.testing.expectEqualStrings("sentinel", kept);
+    const saved = try fsx.readFileAlloc(std.testing.allocator, target, 64);
+    defer std.testing.allocator.free(saved);
+    try std.testing.expectEqualStrings("content\n", saved);
+}
+
+test "failed save propagates the error and leaves the target and directory intact" {
+    // Root bypasses permission checks and the chmod setup below would
+    // silently pass; skip there (some CI containers).
+    if (std.c.geteuid() == 0) return error.SkipZigTest;
+
+    var buf = try Buffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.insert(0, "new bytes that must not land\n");
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [fsx.max_path_bytes]u8 = undefined;
+    const cwd = try fsx.getcwd(&path_buf);
+    const rel = try std.fmt.bufPrint(
+        path_buf[cwd.len..],
+        "/.zig-cache/tmp/{s}/ro",
+        .{&tmp_dir.sub_path},
+    );
+    const dir_path = path_buf[0 .. cwd.len + rel.len];
+    try fsx.makePath(dir_path);
+
+    var target_buf: [fsx.max_path_bytes]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buf, "{s}/precious.txt", .{dir_path});
+    {
+        const f = try fsx.createFile(target, .{});
+        defer f.close();
+        try f.writeAll("precious");
+    }
+
+    var dir_z: [fsx.max_path_bytes]u8 = undefined;
+    @memcpy(dir_z[0..dir_path.len], dir_path);
+    dir_z[dir_path.len] = 0;
+    _ = std.c.chmod(dir_z[0..dir_path.len :0], 0o500);
+    defer _ = std.c.chmod(dir_z[0..dir_path.len :0], 0o700);
+
+    // The temp can't be created in a read-only directory: the save must
+    // fail loudly, not silently, and must not touch the original.
+    try std.testing.expectError(error.AccessDenied, buf.save(target));
+
+    _ = std.c.chmod(dir_z[0..dir_path.len :0], 0o700);
+    const kept = try fsx.readFileAlloc(std.testing.allocator, target, 64);
+    defer std.testing.allocator.free(kept);
+    try std.testing.expectEqualStrings("precious", kept);
+
+    // And no temp file may be left behind.
+    var d = try fsx.openDirIterable(dir_path);
+    defer d.close();
+    var it = d.iterate();
+    var count: usize = 0;
+    while (try it.next()) |entry| {
+        try std.testing.expectEqualStrings("precious.txt", entry.name);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
 }
 
 test "insert/delete sequence" {

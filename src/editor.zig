@@ -136,6 +136,16 @@ pub const Editor = struct {
     // Swap-file autosave: timestamp of the last swap write, so the main
     // loop's 1/sec tick can throttle writes while the buffer is dirty.
     last_swap_ms: i64 = 0,
+    /// True once THIS session has written the swap file. removeSwap only
+    /// deletes swaps we own: a clean quit (or file switch) must never
+    /// destroy a crash-recovery swap left by a previous session that this
+    /// session never superseded.
+    swap_written: bool = false,
+    /// Armed by Ctrl+D: the byte length of the word each cursor sits at
+    /// the start of. The first character typed while armed REPLACES that
+    /// word at every cursor (multi-cursor rename); any other key disarms
+    /// it so a later insert can never eat bytes at stale positions.
+    mc_word_len: usize = 0,
 
     // Coalesced-undo state. A run of consecutive word-char inserts,
     // each arriving within COALESCE_WINDOW_MS of the previous one at
@@ -180,6 +190,11 @@ pub const Editor = struct {
     }
 
     pub fn openFile(self: *Editor, path: []const u8) !void {
+        // Reject paths that can't be stored, before any state changes —
+        // loading content while keeping the previous file's name would
+        // make Ctrl+S silently write to the wrong file.
+        if (path.len > self.filename.len) return error.NameTooLong;
+
         // Parse file:line syntax
         var actual_path = path;
         var goto_line: ?usize = null;
@@ -187,12 +202,19 @@ pub const Editor = struct {
         if (std.mem.lastIndexOfScalar(u8, path, ':')) |colon| {
             if (colon > 0 and colon + 1 < path.len) {
                 if (std.fmt.parseInt(usize, path[colon + 1 ..], 10)) |line_num| {
-                    // Check that the part before colon is a valid file
-                    const prefix = path[0..colon];
-                    if (fsx.access(prefix)) |_| {
-                        actual_path = prefix;
+                    // Three-tier resolution: a file literally named
+                    // "a.md:1" (it exists on disk) opens literally;
+                    // otherwise ":N" means a line number — both when the
+                    // prefix exists (jump into it) and when it doesn't
+                    // (create it as a new file). Previously a missing
+                    // prefix kept the literal colon name bound, so
+                    // `issy draft.md:1` saved a file named "draft.md:1"
+                    // and no draft.md ever appeared.
+                    const literal_exists = if (fsx.access(path)) |_| true else |_| false;
+                    if (!literal_exists) {
+                        actual_path = path[0..colon];
                         goto_line = if (line_num > 0) line_num - 1 else 0;
-                    } else |_| {}
+                    }
                 } else |_| {}
             }
         }
@@ -228,11 +250,10 @@ pub const Editor = struct {
         self.cursors.clearRetainingCapacity();
         self.sel_active = false;
 
-        // Store filename
-        if (actual_path.len <= self.filename.len) {
-            @memcpy(self.filename[0..actual_path.len], actual_path);
-            self.filename_len = actual_path.len;
-        }
+        // Store filename (always fits — checked at the top before any
+        // state changed).
+        @memcpy(self.filename[0..actual_path.len], actual_path);
+        self.filename_len = actual_path.len;
 
         // Detect syntax
         self.language = syntax_mod.detect(actual_path);
@@ -358,12 +379,20 @@ pub const Editor = struct {
         // skip the autosave for this tick.
         const file = fsx.openSwapNoFollow(path) catch return;
         defer file.close();
+        // The open (O_CREAT|O_TRUNC) already replaced whatever was at the
+        // swap path — from here on the swap is this session's.
+        self.swap_written = true;
         file.writeAll(contents) catch {};
     }
 
     /// Remove the swap file for the current buffer. Called on save, clean
-    /// quit, new buffer, and before switching files.
-    pub fn removeSwap(self: *const Editor) void {
+    /// quit, new buffer, and before switching files — but only ever
+    /// deletes a swap this session wrote. A foreign swap (crash recovery
+    /// from an earlier session) is left in place: opening a file and
+    /// quitting again must not destroy the only copy of recovered edits.
+    pub fn removeSwap(self: *Editor) void {
+        if (!self.swap_written) return;
+        self.swap_written = false;
         if (self.filename_len == 0) return;
         var buf: [fsx.max_path_bytes]u8 = undefined;
         const path = self.swapPath(&buf) orelse return;
@@ -515,8 +544,12 @@ pub const Editor = struct {
             .confirm => return self.handleConfirmKey(key),
             .replace => return self.handleReplaceKey(key),
             .help => {
-                // Any key dismisses the help overlay
+                // Any key dismisses the help overlay — except Ctrl+S,
+                // which also performs the save the overlay advertises.
+                // No other key is routed onward: generalizing would make
+                // a dismissal keystroke edit the buffer.
                 self.mode = .normal;
+                if (key == .ctrl and key.ctrl == 's') self.save();
                 return .redraw;
             },
         }
@@ -527,6 +560,8 @@ pub const Editor = struct {
     /// treated as literal content in the document, and stripped when the
     /// target is a single-line prompt field.
     fn handlePaste(self: *Editor, text: []const u8) Action {
+        // A paste is never the "replace the armed word" keystroke.
+        self.mc_word_len = 0;
         if (text.len == 0) return .redraw;
         switch (self.mode) {
             .normal => {
@@ -575,10 +610,21 @@ pub const Editor = struct {
     /// clipboard reads.
     fn insertPastedText(self: *Editor, text: []const u8) void {
         if (text.len == 0) return;
+        // Paste applies at every cursor, like typing and deletion do.
+        if (self.cursors.items.len > 0) {
+            self.multiCursorInsert(text);
+            return;
+        }
         if (self.sel_active) self.deleteSelection();
         const pos = self.cursorBytePos();
+        self.buf.insert(pos, text) catch {
+            self.setStatusMessage("Paste failed: out of memory.");
+            return;
+        };
+        // Undo record only after the insert succeeded — recording first
+        // left an entry claiming bytes that never landed, and a later
+        // undo then deleted real content.
         self.pushUndo(pos, null, text.len);
-        self.buf.insert(pos, text) catch return;
         self.modified = true;
         self.repositionCursorToBytePos(pos + text.len);
     }
@@ -610,6 +656,14 @@ pub const Editor = struct {
         switch (key) {
             .char => {},
             else => self.last_insert_ms = 0,
+        }
+        // A pending Ctrl+D rename survives only further Ctrl presses
+        // (handleCtrl re-checks for 'd') and the first typed character;
+        // anything else — motion, clicks, deletes — disarms it so a
+        // later insert can never eat bytes at stale positions.
+        switch (key) {
+            .char, .ctrl => {},
+            else => self.mc_word_len = 0,
         }
         switch (key) {
             .char => |cp| {
@@ -799,12 +853,15 @@ pub const Editor = struct {
     }
 
     fn handleCtrl(self: *Editor, c: u8) Action {
+        // Any control key except another Ctrl+D disarms a pending
+        // multi-cursor rename (see handleNormalKey).
+        if (c != 'd') self.mc_word_len = 0;
         switch (c) {
             'q', 'w' => {
                 if (self.modified) {
                     self.mode = .confirm;
                     self.confirm_action = .quit;
-                    self.setStatusMessage("Unsaved changes. Enter or Ctrl+Q to discard, Esc to cancel.");
+                    self.setStatusMessage("Unsaved changes. Ctrl+S saves; Enter/Ctrl+Q discards; Esc cancels.");
                     return .redraw;
                 }
                 return .quit;
@@ -883,7 +940,7 @@ pub const Editor = struct {
                 if (self.modified) {
                     self.mode = .confirm;
                     self.confirm_action = .new;
-                    self.setStatusMessage("Unsaved changes. Enter or Ctrl+Q to discard and start new, Esc to cancel.");
+                    self.setStatusMessage("Unsaved changes. Ctrl+S saves; Enter/Ctrl+Q discards and starts new; Esc cancels.");
                     return .redraw;
                 }
                 self.newBuffer();
@@ -893,7 +950,7 @@ pub const Editor = struct {
                 if (self.modified) {
                     self.mode = .confirm;
                     self.confirm_action = .open;
-                    self.setStatusMessage("Unsaved changes. Enter or Ctrl+Q to discard and open another file, Esc to cancel.");
+                    self.setStatusMessage("Unsaved changes. Ctrl+S saves; Enter/Ctrl+Q discards and opens; Esc cancels.");
                     return .redraw;
                 }
                 self.enterOpenPrompt();
@@ -907,7 +964,7 @@ pub const Editor = struct {
                 if (self.modified) {
                     self.mode = .confirm;
                     self.confirm_action = .reload;
-                    self.setStatusMessage("Unsaved changes. Enter or Ctrl+Q to discard and reload, Esc to cancel.");
+                    self.setStatusMessage("Unsaved changes. Ctrl+S saves; Enter/Ctrl+Q discards and reloads; Esc cancels.");
                     return .redraw;
                 }
                 self.doReload();
@@ -977,6 +1034,16 @@ pub const Editor = struct {
                     self.findNext();
                     return .redraw;
                 }
+                // Ctrl+S saves, leaving search first (like Enter, the
+                // cursor stays at the match) — the prompt row overdraws
+                // status messages, so staying in search would hide the
+                // save feedback and the keystroke used to be swallowed
+                // entirely.
+                if (c == 's') {
+                    self.mode = .normal;
+                    self.save();
+                    return .redraw;
+                }
                 return .none;
             },
             .enter => {
@@ -1026,6 +1093,11 @@ pub const Editor = struct {
                 if (self.prompt_len + len <= self.prompt_buf.len) {
                     @memcpy(self.prompt_buf[self.prompt_len..][0..len], enc_buf[0..len]);
                     self.prompt_len += len;
+                } else {
+                    // The prompt row overdraws status messages, so this
+                    // only shows once the prompt closes — still better
+                    // than dropping keystrokes without a trace.
+                    self.setStatusMessage("Prompt is full (256 bytes max).");
                 }
                 if (is_path_prompt) self.updateCompletions();
                 return .redraw;
@@ -1039,67 +1111,26 @@ pub const Editor = struct {
                 if (is_path_prompt) self.applyTabCompletion();
                 return .redraw;
             },
-            .enter => {
-                const path = self.prompt_buf[0..self.prompt_len];
-                switch (self.command_action) {
-                    .open => {
-                        self.openFile(path) catch {
-                            self.setStatusMessage("Failed to open file.");
-                        };
-                    },
-                    .save_as => {
-                        // Set filename and save
-                        if (path.len > 0 and path.len <= self.filename.len) {
-                            // Remove the OLD file's swap before the filename
-                            // is reassigned — removeSwap derives its path from
-                            // the current filename, so doing it after the swap
-                            // over the new name would orphan `.oldname.swp`.
-                            self.removeSwap();
-                            @memcpy(self.filename[0..path.len], path);
-                            self.filename_len = path.len;
-                            self.last_swap_ms = 0;
-                            self.language = syntax_mod.detect(path);
-                            self.buf.save(path) catch {
-                                self.setStatusMessage("Save failed!");
-                                self.mode = .normal;
-                                return .redraw;
-                            };
-                            self.modified = false;
-                            self.updateMtime();
-                            // Also drop any swap under the new name (the
-                            // buffer is now clean on disk).
-                            self.removeSwap();
-                            self.persistCursor();
-                            self.setStatusMessage("Saved.");
-                        } else if (path.len > self.filename.len) {
-                            // Don't silently swallow an over-long path — the
-                            // user typed something and got no save and no
-                            // error otherwise.
-                            self.setStatusMessage("Path too long.");
-                        }
-                    },
-                    .goto_line => {
-                        const trimmed = std.mem.trim(u8, path, " \t");
-                        if (std.fmt.parseInt(usize, trimmed, 10)) |n| {
-                            // 1-indexed input; clamp into the buffer.
-                            const last = if (self.buf.lineCount() > 0) self.buf.lineCount() - 1 else 0;
-                            const target = if (n == 0) 0 else @min(n - 1, last);
-                            self.sel_active = false;
-                            self.cursor.line = target;
-                            self.cursor.col = 0;
-                            self.cursor.col_want = 0;
-                            self.ensureCursorVisible();
-                        } else |_| {
-                            if (trimmed.len > 0) self.setStatusMessage("Not a line number.");
-                        }
-                    },
+            .enter => return self.submitPrompt(),
+            .ctrl => |c| {
+                // Ctrl+S in the Save-As prompt submits it — the natural
+                // end of the Ctrl+S → type name → Ctrl+S flow. Open and
+                // goto prompts keep their own submit keys: a reflex
+                // Ctrl+S there must not act on half-typed input.
+                if (c == 's' and self.command_action == .save_as) {
+                    return self.submitPrompt();
                 }
-                self.mode = .normal;
-                self.completion_match_count = 0;
-                self.completion_hint_len = 0;
-                return .redraw;
+                return .none;
             },
             .escape => {
+                if (self.command_action == .save_as) {
+                    // A cancelled Save-As used to look exactly like a
+                    // successful save — say what happened.
+                    self.setStatusMessage(if (self.modified)
+                        "Save cancelled: unsaved changes remain."
+                    else
+                        "Save cancelled.");
+                }
                 self.mode = .normal;
                 self.completion_match_count = 0;
                 self.completion_hint_len = 0;
@@ -1109,7 +1140,102 @@ pub const Editor = struct {
         }
     }
 
+    /// Submit the minibuffer (Enter, or Ctrl+S in the Save-As prompt).
+    fn submitPrompt(self: *Editor) Action {
+        const path = self.prompt_buf[0..self.prompt_len];
+        switch (self.command_action) {
+            .open => {
+                self.openFile(path) catch |e| {
+                    var msg_buf: [64]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&msg_buf, "Open failed: {s}", .{@errorName(e)}) catch "Open failed!";
+                    self.setStatusMessage(msg);
+                };
+            },
+            .save_as => {
+                if (path.len == 0) {
+                    // Enter on an emptied prompt used to silently do
+                    // nothing (modified stayed set, no file, no message).
+                    self.setStatusMessage("Save cancelled: empty filename.");
+                } else {
+                    // No over-long branch: the prompt buffer (256 bytes)
+                    // is far smaller than the filename buffer
+                    // (max_path_bytes), so path always fits; over-long
+                    // *input* is reported at the keystroke instead.
+                    //
+                    // Save FIRST — only a successful write may commit the
+                    // new filename, drop the old file's swap, or clear
+                    // the modified flag. Mutating before the write used
+                    // to strand a failed Save-As on the bad path with
+                    // the recovery swap already deleted.
+                    self.buf.save(path) catch |e| {
+                        var msg_buf: [64]u8 = undefined;
+                        const msg = std.fmt.bufPrint(&msg_buf, "Save failed: {s}", .{@errorName(e)}) catch "Save failed!";
+                        self.setStatusMessage(msg);
+                        self.mode = .normal;
+                        self.completion_match_count = 0;
+                        self.completion_hint_len = 0;
+                        return .redraw;
+                    };
+                    // Remove the OLD file's swap before the filename is
+                    // reassigned — removeSwap derives its path from the
+                    // current filename, so doing it later would orphan
+                    // `.oldname.swp`.
+                    self.removeSwap();
+                    @memcpy(self.filename[0..path.len], path);
+                    self.filename_len = path.len;
+                    self.last_swap_ms = 0;
+                    self.language = syntax_mod.detect(path);
+                    self.modified = false;
+                    self.updateMtime();
+                    // Also drop any swap under the new name (the
+                    // buffer is now clean on disk).
+                    self.removeSwap();
+                    self.persistCursor();
+                    // Name the path actually written: an unaccepted
+                    // completion hint otherwise reads as a save under
+                    // the hinted name.
+                    var msg_buf: [272]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&msg_buf, "Saved {s}.", .{path}) catch "Saved.";
+                    self.setStatusMessage(msg);
+                }
+            },
+            .goto_line => {
+                const trimmed = std.mem.trim(u8, path, " \t");
+                if (std.fmt.parseInt(usize, trimmed, 10)) |n| {
+                    // 1-indexed input; clamp into the buffer.
+                    const last = if (self.buf.lineCount() > 0) self.buf.lineCount() - 1 else 0;
+                    const target = if (n == 0) 0 else @min(n - 1, last);
+                    self.sel_active = false;
+                    self.cursor.line = target;
+                    self.cursor.col = 0;
+                    self.cursor.col_want = 0;
+                    self.ensureCursorVisible();
+                } else |_| {
+                    if (trimmed.len > 0) self.setStatusMessage("Not a line number.");
+                }
+            },
+        }
+        self.mode = .normal;
+        self.completion_match_count = 0;
+        self.completion_hint_len = 0;
+        return .redraw;
+    }
+
     fn handleConfirmKey(self: *Editor, key: term.Key) Action {
+        // Ctrl+S saves right from the confirmation prompt — the reflex
+        // keystroke an "unsaved changes" warning invites must never be a
+        // silent no-op. The pending quit/new/open/reload is dropped: on
+        // success the buffer is clean, so re-issuing it proceeds without
+        // a prompt; on failure the error stays visible and nothing
+        // destructive happens. An untitled buffer lands in the Save-As
+        // prompt instead.
+        if (key == .ctrl and key.ctrl == 's') {
+            self.confirm_action = .none;
+            self.mode = .normal;
+            self.status_msg_len = 0;
+            self.save();
+            return .redraw;
+        }
         const confirmed = switch (key) {
             .enter => true,
             .ctrl => |c| c == 'q' or c == 'w',
@@ -1232,6 +1358,13 @@ pub const Editor = struct {
                 if (c == 'a') {
                     self.replaceAll();
                     self.mode = .normal;
+                    return .redraw;
+                }
+                // Ctrl+S saves and leaves replace mode so the feedback
+                // is visible (the prompt row overdraws status messages).
+                if (c == 's') {
+                    self.mode = .normal;
+                    self.save();
                     return .redraw;
                 }
             },
@@ -2306,6 +2439,10 @@ pub const Editor = struct {
             const pos = self.cursorBytePos();
             const now = fsx.nowMillis();
             const this_is_word = isCodepointWordChar(cp);
+            // NOTE: undo is recorded before the insert here (the same
+            // shape insertPastedText fixed), because tryCoalesceInsert
+            // mutates the top entry in place; reordering needs a larger
+            // refactor and this allocation is 1-4 bytes.
             if (!self.tryCoalesceInsert(pos, len, now, this_is_word)) {
                 self.pushUndo(pos, null, len);
             }
@@ -2320,7 +2457,16 @@ pub const Editor = struct {
             return;
         }
 
-        self.multiCursorInsert(enc[0..len]);
+        if (self.mc_word_len > 0) {
+            // Armed Ctrl+D rename: this first character replaces the
+            // word at every cursor; the arm is consumed so following
+            // characters insert normally.
+            const wlen = self.mc_word_len;
+            self.mc_word_len = 0;
+            self.multiCursorReplaceWord(wlen, enc[0..len]);
+        } else {
+            self.multiCursorInsert(enc[0..len]);
+        }
         // Multi-cursor edits already group themselves; they should
         // never fold into a coalesced run.
         self.last_insert_ms = 0;
@@ -3161,6 +3307,56 @@ pub const Editor = struct {
         self.ensureCursorVisible();
     }
 
+    /// Replace the armed word (`word_len` bytes at each cursor, which
+    /// addCursorAtNextOccurrence left at the word's start) with `bytes`
+    /// at every cursor — the first keystroke of a Ctrl+D rename. Every
+    /// undo entry is a replace (deleted word + inserted bytes) sharing
+    /// one group_id, so a single Ctrl+Z restores every occurrence.
+    fn multiCursorReplaceWord(self: *Editor, word_len: usize, bytes: []const u8) void {
+        var positions: [MAX_CURSORS]usize = undefined;
+        const n = self.collectCursorPositionsDesc(&positions);
+        if (n == 0 or bytes.len == 0 or word_len == 0) return;
+
+        const group_id = self.nextUndoGroupId();
+
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const pos = positions[i];
+            // Never delete past the buffer end (stale-arm paranoia; the
+            // disarm rules should make this unreachable).
+            const avail = self.buf.logicalLen() -| pos;
+            const del_len = @min(word_len, avail);
+            var saved: ?[]u8 = null;
+            if (del_len > 0) {
+                if (self.allocator.alloc(u8, del_len)) |dst| {
+                    const got = self.buf.contiguousSlice(pos, del_len, dst);
+                    if (got.ptr != dst.ptr) @memcpy(dst, got);
+                    saved = dst;
+                } else |_| {}
+                self.buf.delete(pos, del_len);
+            }
+            self.buf.insert(pos, bytes) catch {
+                // Roll the deletion back — without this the word would
+                // be gone with no undo record.
+                if (saved) |s| {
+                    self.buf.insert(pos, s) catch {};
+                    self.allocator.free(s);
+                }
+                return;
+            };
+            self.pushUndoGrouped(pos, saved, bytes.len, group_id);
+            // Higher (already-processed) positions shift by the net
+            // size change at this site. Descending order guarantees
+            // positions[j] > pos + del_len, so no underflow.
+            for (0..i) |j| positions[j] = positions[j] + bytes.len - del_len;
+            positions[i] = pos + bytes.len;
+        }
+
+        self.assignCursorPositions(positions[0..n]);
+        self.modified = true;
+        self.ensureCursorVisible();
+    }
+
     const DeleteDir = enum { forward, backward };
 
     /// Delete one byte at every active cursor. `.backward` is Backspace
@@ -3258,7 +3454,16 @@ pub const Editor = struct {
                 .line = lc.line,
                 .col = lc.col,
                 .col_want = lc.col,
-            }) catch {};
+            }) catch return;
+            // Rename semantics: snap the primary onto the start of its
+            // word and arm the pending word length. The next typed
+            // character replaces the word at every cursor instead of
+            // inserting beside it — the rename flow the multi-cursor
+            // feature exists for. Word chars are ASCII, so byte length
+            // and column width agree.
+            self.cursor.col = start;
+            self.cursor.col_want = start;
+            self.mc_word_len = word.len;
         }
     }
 
@@ -3295,8 +3500,10 @@ pub const Editor = struct {
             return;
         }
 
-        self.buf.save(self.filename[0..self.filename_len]) catch {
-            self.setStatusMessage("Save failed!");
+        self.buf.save(self.filename[0..self.filename_len]) catch |e| {
+            var msg_buf: [64]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "Save failed: {s}", .{@errorName(e)}) catch "Save failed!";
+            self.setStatusMessage(msg);
             return;
         };
         self.modified = false;
@@ -3684,7 +3891,7 @@ test "tab-bearing short line reports single visual row" {
     try std.testing.expectEqual(@as(usize, 1), ed.visualLinesForBufferLine(2));
 }
 
-test "multi-cursor insert types at every cursor" {
+test "multi-cursor rename replaces the word at every cursor" {
     var cfg = config_mod.Config.init();
     var ed = try Editor.init(&cfg, std.testing.allocator);
     defer ed.deinit();
@@ -3696,17 +3903,20 @@ test "multi-cursor insert types at every cursor" {
     ed.cursor.line = 0;
     ed.cursor.col = 0;
 
-    // Ctrl+D twice adds cursors at the next two "aa" occurrences.
+    // Ctrl+D twice adds cursors at the next two "aa" occurrences and
+    // arms the rename.
     _ = ed.handleKey(.{ .ctrl = 'd' });
     _ = ed.handleKey(.{ .ctrl = 'd' });
     try std.testing.expectEqual(@as(usize, 2), ed.cursors.items.len);
 
-    // Type "X" — should insert at all three cursor positions.
+    // The first typed character replaces the word at every cursor
+    // (multi-cursor rename); following characters insert normally.
     _ = ed.handleKey(.{ .char = 'X' });
+    _ = ed.handleKey(.{ .char = 'Y' });
 
     var tmp: [32]u8 = undefined;
     const got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
-    try std.testing.expectEqualStrings("Xaa Xaa Xaa", got);
+    try std.testing.expectEqualStrings("XY XY XY", got);
 }
 
 test "multi-cursor delete removes at every cursor" {
@@ -3744,14 +3954,15 @@ test "multi-cursor edit is a single undo group" {
     ed.cursor.col = 0;
     _ = ed.handleKey(.{ .ctrl = 'd' });
 
-    // Type "Z" at both cursors.
+    // Type "Z" — the armed rename replaces "aa" at both cursors.
     _ = ed.handleKey(.{ .char = 'Z' });
 
     var tmp: [32]u8 = undefined;
     var got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
-    try std.testing.expectEqualStrings("Zaa Zaa", got);
+    try std.testing.expectEqualStrings("Z Z", got);
 
-    // One Ctrl+Z undoes the whole multi-cursor tick.
+    // One Ctrl+Z undoes the whole multi-cursor tick, restoring the
+    // replaced word at every position.
     _ = ed.handleKey(.{ .ctrl = 'z' });
     got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
     try std.testing.expectEqualStrings("aa aa", got);
@@ -3759,7 +3970,7 @@ test "multi-cursor edit is a single undo group" {
     // Ctrl+Y re-applies the whole group.
     _ = ed.handleKey(.{ .ctrl = 'y' });
     got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
-    try std.testing.expectEqualStrings("Zaa Zaa", got);
+    try std.testing.expectEqualStrings("Z Z", got);
 }
 
 test "editor search mode" {
@@ -5377,4 +5588,371 @@ test "PageUp and PageDown clear an active selection" {
     try std.testing.expect(ed.sel_active);
     _ = ed.handleKey(.page_up);
     try std.testing.expect(!ed.sel_active);
+}
+
+// ── Silent-save-failure regression tests (v1.4.0 audit) ──
+
+/// Build "<cwd>/.zig-cache/tmp/<sub>/<name>" into buf (tmpDir paths are
+/// cwd-relative; Dir.realpath is unsupported on OpenBSD).
+fn testTmpFilePath(tmp: *std.testing.TmpDir, buf: *[fsx.max_path_bytes]u8, name: []const u8) ![]const u8 {
+    const cwd = try fsx.getcwd(buf);
+    const rel = try std.fmt.bufPrint(
+        buf[cwd.len..],
+        "/.zig-cache/tmp/{s}/{s}",
+        .{ &tmp.sub_path, name },
+    );
+    return buf[0 .. cwd.len + rel.len];
+}
+
+test "Ctrl+S in the quit-confirm prompt saves and stays" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [fsx.max_path_bytes]u8 = undefined;
+    const fpath = try testTmpFilePath(&tmp, &path_buf, "note.txt");
+    @memcpy(ed.filename[0..fpath.len], fpath);
+    ed.filename_len = fpath.len;
+
+    for ("hello") |c| _ = ed.handleKey(.{ .char = c });
+    try std.testing.expect(ed.modified);
+
+    // Ctrl+Q on a dirty buffer warns instead of quitting.
+    try std.testing.expectEqual(Action.redraw, ed.handleKey(.{ .ctrl = 'q' }));
+    try std.testing.expectEqual(Mode.confirm, ed.mode);
+
+    // The reflex Ctrl+S must save (user decision: save-and-stay).
+    try std.testing.expectEqual(Action.redraw, ed.handleKey(.{ .ctrl = 's' }));
+    try std.testing.expectEqual(Mode.normal, ed.mode);
+    try std.testing.expect(!ed.modified);
+    const saved = try fsx.readFileAlloc(std.testing.allocator, fpath, 64);
+    defer std.testing.allocator.free(saved);
+    try std.testing.expectEqualStrings("hello", saved);
+
+    // Buffer is clean now, so quitting again proceeds directly.
+    try std.testing.expectEqual(Action.quit, ed.handleKey(.{ .ctrl = 'q' }));
+}
+
+test "Ctrl+S in the quit-confirm prompt with a failing save stays dirty and never quits" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [fsx.max_path_bytes]u8 = undefined;
+    const fpath = try testTmpFilePath(&tmp, &path_buf, "missing-dir/note.txt");
+    @memcpy(ed.filename[0..fpath.len], fpath);
+    ed.filename_len = fpath.len;
+
+    for ("hello") |c| _ = ed.handleKey(.{ .char = c });
+    _ = ed.handleKey(.{ .ctrl = 'q' });
+    try std.testing.expectEqual(Mode.confirm, ed.mode);
+
+    try std.testing.expectEqual(Action.redraw, ed.handleKey(.{ .ctrl = 's' }));
+    try std.testing.expectEqual(Mode.normal, ed.mode);
+    try std.testing.expect(ed.modified);
+    try std.testing.expect(std.mem.startsWith(u8, ed.getStatusMsg(), "Save failed: "));
+}
+
+test "Ctrl+S in search mode saves and returns to normal" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [fsx.max_path_bytes]u8 = undefined;
+    const fpath = try testTmpFilePath(&tmp, &path_buf, "s.txt");
+    @memcpy(ed.filename[0..fpath.len], fpath);
+    ed.filename_len = fpath.len;
+
+    for ("abc") |c| _ = ed.handleKey(.{ .char = c });
+    _ = ed.handleKey(.{ .ctrl = 'f' });
+    try std.testing.expectEqual(Mode.search, ed.mode);
+    _ = ed.handleKey(.{ .char = 'a' });
+
+    try std.testing.expectEqual(Action.redraw, ed.handleKey(.{ .ctrl = 's' }));
+    try std.testing.expectEqual(Mode.normal, ed.mode);
+    try std.testing.expect(!ed.modified);
+    const saved = try fsx.readFileAlloc(std.testing.allocator, fpath, 64);
+    defer std.testing.allocator.free(saved);
+    try std.testing.expectEqualStrings("abc", saved);
+}
+
+test "Ctrl+S in replace mode and in the help overlay saves" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [fsx.max_path_bytes]u8 = undefined;
+    const fpath = try testTmpFilePath(&tmp, &path_buf, "r.txt");
+    @memcpy(ed.filename[0..fpath.len], fpath);
+    ed.filename_len = fpath.len;
+
+    for ("xyz") |c| _ = ed.handleKey(.{ .char = c });
+    _ = ed.handleKey(.{ .ctrl = 'h' });
+    try std.testing.expectEqual(Mode.replace, ed.mode);
+    _ = ed.handleKey(.{ .ctrl = 's' });
+    try std.testing.expectEqual(Mode.normal, ed.mode);
+    try std.testing.expect(!ed.modified);
+
+    _ = ed.handleKey(.{ .char = '!' });
+    ed.mode = .help;
+    _ = ed.handleKey(.{ .ctrl = 's' });
+    try std.testing.expectEqual(Mode.normal, ed.mode);
+    try std.testing.expect(!ed.modified);
+    const saved = try fsx.readFileAlloc(std.testing.allocator, fpath, 64);
+    defer std.testing.allocator.free(saved);
+    try std.testing.expectEqualStrings("xyz!", saved);
+}
+
+test "empty Save-As prompt cancels with a message instead of silently no-opping" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    for ("data") |c| _ = ed.handleKey(.{ .char = c });
+    _ = ed.handleKey(.{ .ctrl = 's' }); // untitled -> Save-As prompt
+    try std.testing.expectEqual(Mode.command, ed.mode);
+
+    // Clear the cwd-seeded prompt, then submit empty.
+    var i: usize = 0;
+    while (i < 300) : (i += 1) _ = ed.handleKey(.backspace);
+    _ = ed.handleKey(.enter);
+
+    try std.testing.expectEqual(Mode.normal, ed.mode);
+    try std.testing.expect(ed.modified);
+    try std.testing.expectEqualStrings("Save cancelled: empty filename.", ed.getStatusMsg());
+}
+
+test "Ctrl+S submits the Save-As prompt and reports the path written" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [fsx.max_path_bytes]u8 = undefined;
+    const fpath = try testTmpFilePath(&tmp, &path_buf, "typed.txt");
+
+    for ("body") |c| _ = ed.handleKey(.{ .char = c });
+    _ = ed.handleKey(.{ .ctrl = 's' });
+    try std.testing.expectEqual(Mode.command, ed.mode);
+    var i: usize = 0;
+    while (i < 300) : (i += 1) _ = ed.handleKey(.backspace);
+    for (fpath) |c| _ = ed.handleKey(.{ .char = c });
+
+    _ = ed.handleKey(.{ .ctrl = 's' }); // second Ctrl+S submits
+    try std.testing.expectEqual(Mode.normal, ed.mode);
+    try std.testing.expect(!ed.modified);
+    try std.testing.expect(std.mem.startsWith(u8, ed.getStatusMsg(), "Saved "));
+    try std.testing.expect(std.mem.indexOf(u8, ed.getStatusMsg(), "typed.txt") != null);
+    const saved = try fsx.readFileAlloc(std.testing.allocator, fpath, 64);
+    defer std.testing.allocator.free(saved);
+    try std.testing.expectEqualStrings("body", saved);
+}
+
+test "failed Save-As preserves the current filename and does not clear modified" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [fsx.max_path_bytes]u8 = undefined;
+    const good = try testTmpFilePath(&tmp, &path_buf, "good.txt");
+    @memcpy(ed.filename[0..good.len], good);
+    ed.filename_len = good.len;
+    for ("text") |c| _ = ed.handleKey(.{ .char = c });
+
+    // Drive the Save-As submit path directly at a bad target.
+    var bad_buf: [fsx.max_path_bytes]u8 = undefined;
+    const bad = try testTmpFilePath(&tmp, &bad_buf, "nope/bad.txt");
+    ed.mode = .command;
+    ed.command_action = .save_as;
+    @memcpy(ed.prompt_buf[0..bad.len], bad);
+    ed.prompt_len = bad.len;
+    _ = ed.handleKey(.enter);
+
+    try std.testing.expectEqual(Mode.normal, ed.mode);
+    try std.testing.expect(ed.modified);
+    try std.testing.expect(std.mem.startsWith(u8, ed.getStatusMsg(), "Save failed: "));
+    try std.testing.expectEqualStrings(good, ed.getFilename());
+    try std.testing.expectError(error.FileNotFound, fsx.access(bad));
+}
+
+test "Escape at the Save-As prompt reports the cancelled save" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    for ("data") |c| _ = ed.handleKey(.{ .char = c });
+    _ = ed.handleKey(.{ .ctrl = 's' });
+    try std.testing.expectEqual(Mode.command, ed.mode);
+    _ = ed.handleKey(.escape);
+    try std.testing.expectEqual(Mode.normal, ed.mode);
+    try std.testing.expectEqualStrings("Save cancelled: unsaved changes remain.", ed.getStatusMsg());
+}
+
+test "file:line on a missing prefix opens a new file at the prefix name" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [fsx.max_path_bytes]u8 = undefined;
+    const with_line = try testTmpFilePath(&tmp, &path_buf, "fresh.md:7");
+    try ed.openFile(with_line);
+    try std.testing.expect(std.mem.endsWith(u8, ed.getFilename(), "fresh.md"));
+
+    // Saving lands at fresh.md, not at a literal "fresh.md:7".
+    _ = ed.handleKey(.{ .char = 'x' });
+    ed.save();
+    try std.testing.expect(!ed.modified);
+    try std.testing.expectError(error.FileNotFound, fsx.access(with_line));
+    try fsx.access(with_line[0 .. with_line.len - 2]);
+}
+
+test "a file literally named with a colon-digit suffix still opens literally" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [fsx.max_path_bytes]u8 = undefined;
+    const weird = try testTmpFilePath(&tmp, &path_buf, "weird:3");
+    {
+        const f = try fsx.createFile(weird, .{});
+        defer f.close();
+        try f.writeAll("odd");
+    }
+    try ed.openFile(weird);
+    try std.testing.expect(std.mem.endsWith(u8, ed.getFilename(), "weird:3"));
+    try std.testing.expectEqual(@as(usize, 3), ed.buf.logicalLen());
+}
+
+test "openFile rejects an over-long path before mutating state" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    for ("keep") |c| _ = ed.handleKey(.{ .char = c });
+    const long_path = [_]u8{'a'} ** (fsx.max_path_bytes + 100);
+    try std.testing.expectError(error.NameTooLong, ed.openFile(&long_path));
+    // Nothing changed: still untitled, content intact.
+    try std.testing.expectEqual(@as(usize, 0), ed.filename_len);
+    try std.testing.expectEqual(@as(usize, 4), ed.buf.logicalLen());
+}
+
+test "undo after a paste removes exactly the pasted blob" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    for ("ab") |c| _ = ed.handleKey(.{ .char = c });
+    _ = ed.handleKey(.{ .paste = "one\ntwo\nthree" });
+    const after = try ed.buf.contents(std.testing.allocator);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualStrings("abone\ntwo\nthree", after);
+
+    ed.undo();
+    const back = try ed.buf.contents(std.testing.allocator);
+    defer std.testing.allocator.free(back);
+    try std.testing.expectEqualStrings("ab", back);
+}
+
+test "paste applies at every cursor" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    for ("aa aa") |c| _ = ed.handleKey(.{ .char = c });
+    ed.cursor.line = 0;
+    ed.cursor.col = 0;
+    _ = ed.handleKey(.{ .ctrl = 'd' });
+    try std.testing.expectEqual(@as(usize, 1), ed.cursors.items.len);
+
+    // Paste is never the rename keystroke: it disarms and inserts at
+    // every cursor.
+    _ = ed.handleKey(.{ .paste = "<P>" });
+    var tmp: [32]u8 = undefined;
+    var got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
+    try std.testing.expectEqualStrings("<P>aa <P>aa", got);
+
+    // One undo reverts the whole paste tick.
+    ed.undo();
+    got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
+    try std.testing.expectEqualStrings("aa aa", got);
+}
+
+test "arrow keys disarm a pending multi-cursor rename" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    for ("aa aa") |c| _ = ed.handleKey(.{ .char = c });
+    ed.cursor.line = 0;
+    ed.cursor.col = 0;
+    _ = ed.handleKey(.{ .ctrl = 'd' });
+    try std.testing.expect(ed.mc_word_len > 0);
+
+    _ = ed.handleKey(.right);
+    try std.testing.expectEqual(@as(usize, 0), ed.mc_word_len);
+
+    // Typing now inserts (no replacement) at both cursors — the primary
+    // moved right one cell, the secondary stayed at its word start.
+    _ = ed.handleKey(.{ .char = 'X' });
+    var tmp: [32]u8 = undefined;
+    const got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
+    try std.testing.expectEqualStrings("aXa Xaa", got);
+}
+
+test "clean quit never deletes a foreign crash-recovery swap" {
+    var cfg = config_mod.Config.init();
+    cfg.swap_files = true;
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [fsx.max_path_bytes]u8 = undefined;
+    const fpath = try testTmpFilePath(&tmp, &path_buf, "note.txt");
+    {
+        const f = try fsx.createFile(fpath, .{});
+        defer f.close();
+        try f.writeAll("hello");
+    }
+    var swap_buf: [fsx.max_path_bytes]u8 = undefined;
+    const swap = try testTmpFilePath(&tmp, &swap_buf, ".note.txt.swp");
+    {
+        const f = try fsx.createFile(swap, .{});
+        defer f.close();
+        try f.writeAll("recovered");
+    }
+
+    try ed.openFile(fpath);
+    try std.testing.expect(std.mem.startsWith(u8, ed.getStatusMsg(), "Recovered edits may exist"));
+
+    // What main.zig does on a clean quit / SIGHUP: the foreign swap must
+    // survive — this session never wrote it.
+    ed.removeSwap();
+    try fsx.access(swap);
+    const kept = try fsx.readFileAlloc(std.testing.allocator, swap, 64);
+    defer std.testing.allocator.free(kept);
+    try std.testing.expectEqualStrings("recovered", kept);
+
+    // Once this session writes the swap it owns it, and removal works.
+    _ = ed.handleKey(.{ .char = 'x' });
+    ed.last_swap_ms = 0;
+    ed.maybeAutosaveSwap();
+    try std.testing.expect(ed.swap_written);
+    ed.removeSwap();
+    try std.testing.expectError(error.FileNotFound, fsx.access(swap));
 }
