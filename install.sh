@@ -202,6 +202,13 @@ install_prebuilt() {
         || die "install failed (check permissions on $PREFIX)"
 
     INSTALLED_SHA="$($SHA256 "$PREFIX/issy" | awk '{print $1}')"
+
+    # The release publishes the commit it was cut from; reuse it rather
+    # than guessing. Format is "<sha>[ <epoch>]".
+    if fetch "$(release_url "commit.txt")" "$TMPDIR_/commit.txt" 2>/dev/null; then
+        _rel="$(tr -d '\r' < "$TMPDIR_/commit.txt" | head -1)"
+        seed_update_cache "${_rel%% *}" "$(printf '%s' "$_rel" | cut -s -d' ' -f2)"
+    fi
 }
 
 install_from_source() {
@@ -258,6 +265,43 @@ EOF
         || die "install failed (check permissions on $PREFIX)"
 
     INSTALLED_SHA="$($SHA256 "$PREFIX/issy" | awk '{print $1}')"
+
+    # %ct reads the commit object, so this works in the --depth 1 clone
+    # above. A tarball build has no .git and simply seeds nothing.
+    if [ -d "$src_dir/.git" ] && command -v git >/dev/null 2>&1; then
+        seed_update_cache \
+            "$(git -C "$src_dir" rev-parse HEAD 2>/dev/null)" \
+            "$(git -C "$src_dir" show -s --format=%ct HEAD 2>/dev/null)"
+    fi
+}
+
+seed_update_cache() {
+    # Record the release we just installed in ~/.cache/issy/commit.txt.
+    #
+    # Without this the editor's first launch compares its own commit
+    # against whatever the cache last saw — the release you just upgraded
+    # AWAY from — and (before the strictly-newer check landed) advertised
+    # a downgrade. Seeding it makes a fresh install quiet immediately
+    # instead of waiting for the first background worker run.
+    #
+    # Only commit.txt. NEVER seed manifest_epoch.txt: that is the
+    # anti-rollback high-water mark, and a wrong value written here would
+    # silently refuse every future update for that user.
+    #
+    # Entirely best-effort — a failure here must never fail an install.
+    [ -n "${HOME:-}" ] || return 0
+    [ -d "$HOME" ] && [ -w "$HOME" ] || return 0
+
+    _sha="$1"
+    _epoch="$2"
+    [ -n "$_sha" ] || return 0
+    _cache="$HOME/.cache/issy"
+    mkdir -p "$_cache" 2>/dev/null || return 0
+    if [ -n "$_epoch" ]; then
+        printf '%s %s\n' "$_sha" "$_epoch" > "$_cache/commit.txt" 2>/dev/null || true
+    else
+        printf '%s\n' "$_sha" > "$_cache/commit.txt" 2>/dev/null || true
+    fi
 }
 
 seed_rc() {
