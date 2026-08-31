@@ -16,7 +16,7 @@ const unicode = @import("unicode.zig");
 const positions_mod = @import("positions.zig");
 
 pub const Mode = enum { normal, search, command, confirm, replace, help };
-pub const Action = enum { none, quit, force_quit, redraw, prompt, export_pdf };
+pub const Action = enum { none, quit, force_quit, redraw, export_pdf };
 
 pub const Cursor = struct {
     line: usize = 0,

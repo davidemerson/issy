@@ -282,6 +282,11 @@ seed_rc() {
 # auto_close_brackets = false
 # auto_detect_indent = true
 # scroll_margin = 5
+#
+# swap_files: while a buffer has unsaved changes, periodically write them
+# to a sibling .<name>.swp file (removed on save/clean exit); a leftover
+# swap from a crash is reported on open.
+# swap_files = true
 
 # ── Clipboard ──
 #
@@ -300,6 +305,7 @@ seed_rc() {
 # left_padding = 2
 # gutter_padding = 3
 # word_wrap = true
+# wrap_indent = false        # hang wrap continuations under the line's indent
 # right_margin = 100
 # cursor_line_bg = true
 # cursor_style = bar         # bar, block, or underline

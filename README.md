@@ -138,7 +138,7 @@ issy [options] [file[:line]]
 
 ```sh
 issy main.zig
-issy src/editor.zig:42    # open at line 42
+issy src/editor.zig:42    # open at line 42 (works for new files too: issy draft.md:5 creates draft.md)
 issy newdoc.md            # start a new file at that path
 issy                      # empty buffer
 ```
@@ -170,8 +170,8 @@ issy --font /path/to/font.ttf --print output.pdf source.c
 
 | Key | Action |
 |---|---|
-| Ctrl+S | Save |
-| Ctrl+Q | Quit (on unsaved changes, press Enter or Ctrl+Q again to discard; Escape cancels) |
+| Ctrl+S | Save — works from every mode: search/replace/help save and return to normal, the unsaved-changes prompt saves and stays, and the Save-As prompt submits |
+| Ctrl+Q | Quit (on unsaved changes: Enter or Ctrl+Q again discards, Ctrl+S saves and stays, Escape cancels) |
 | Ctrl+Z | Undo (typing runs coalesce within 500ms — one step per word) |
 | Ctrl+Y | Redo |
 | Ctrl+C | Copy selection (also pushes to OS clipboard via OSC 52) |

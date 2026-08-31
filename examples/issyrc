@@ -30,6 +30,16 @@
 # Minimum lines between cursor and screen edge before scrolling
 # scroll_margin = 5
 
+# ── Clipboard ──
+
+# When on (the default), Ctrl+V and middle-click read the system
+# clipboard / primary selection via OSC 52, so text copied in any other
+# application pastes in. Falls back to issy's internal clipboard if the
+# terminal has OSC 52 read disabled (common over SSH). Set false to keep
+# Ctrl+V bound to the internal clipboard only. The terminal's own paste
+# keys (Ctrl+Shift+V / Shift+Insert) work regardless.
+# system_clipboard = true
+
 # ── Display ──
 
 # Show line numbers in the gutter

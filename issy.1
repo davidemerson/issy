@@ -48,6 +48,16 @@ opens an empty buffer bound to that filename, so
 behaves like a \(lqcreate new file\(rq and
 .B Ctrl+S
 writes directly to that path without first prompting.
+A trailing
+.B :N
+line suffix works for new files too:
+.B issy
+.I draft.md:5
+creates
+.I draft.md
+(a file literally named
+.I draft.md:5
+is only opened as such when it already exists on disk).
 .SH OPTIONS
 .TP
 .BR \-\-version ", " \-v
@@ -112,12 +122,19 @@ Multi-byte input is handled as UTF-8.
 .TP
 .B Ctrl+S
 Save the current buffer.
+Works from every mode: inside search, replace, or the help overlay it
+saves and returns to normal mode, and at an unsaved-changes
+confirmation prompt it saves and stays in the editor.
 If the buffer has no filename yet, a save-as prompt opens, seeded with
 the current working directory; type a path (with
 .B Tab
 completion) and press
 .B Enter
-to save.
+(or
+.B Ctrl+S
+again) to save.
+Save failures are reported with the reason (for example
+.BR "Save failed: AccessDenied" ).
 .TP
 .B Ctrl+Q
 Quit.
@@ -126,7 +143,9 @@ confirmation; press
 .B Enter
 or
 .B Ctrl+Q
-again to discard changes and exit, or
+again to discard changes and exit,
+.B Ctrl+S
+to save and stay, or
 .B Escape
 to cancel.
 .TP
@@ -318,7 +337,9 @@ confirmation first; press
 .B Enter
 or
 .B Ctrl+Q
-to discard and continue, or
+to discard and continue,
+.B Ctrl+S
+to save and stay, or
 .B Escape
 to cancel.
 The open prompt is seeded with the current working directory.
@@ -336,7 +357,9 @@ confirmation first; press
 .B Enter
 or
 .B Ctrl+Q
-to discard and start the new buffer, or
+to discard and start the new buffer,
+.B Ctrl+S
+to save and stay, or
 .B Escape
 to cancel.
 .TP
