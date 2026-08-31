@@ -412,7 +412,7 @@ fn realMain() !void {
                 needs_redraw = true;
             }
             idle_ms += 100;
-            if (update_mod.canAutoApply(&update_state, &ed, &cfg, idle_ms, update_mod.min_idle_ms_default)) {
+            if (update_mod.canAutoApply(&update_state, &ed, &cfg, idle_ms, update_mod.min_idle_ms_default, update_mod.selfIsWritable())) {
                 // apply either succeeds (noreturn, process is replaced) or
                 // returns an error — in which case we keep running and
                 // show the error in the status bar.

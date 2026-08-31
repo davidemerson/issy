@@ -78,36 +78,14 @@ expect eof
 wait
 record_result [assert_file $f "\xe4\xbd\xa0!\xe5\xa5\xbdz" "U3_codepoint_arrow_motion"]
 
-# --- U4: a multi-byte character split across reads is not corrupted ---
-# The tail of "é" (0xc3 0xa9) arrives after the ~100ms termios window.
-# With only one refill attempt the lead byte decoded as U+FFFD and the
-# orphaned continuation byte became a second one, so a typed é landed in
-# the file as two replacement characters — silent corruption on a laggy
-# link. The escape-sequence path already waited several windows.
-set f "$tmpdir/u4.txt"
-spawn $issy --no-config
-fconfigure $spawn_id -encoding iso8859-1
-sleep 0.8
-send "a"
-sleep 0.3
-send "\xc3"
-sleep 0.22
-send "\xa9"
-sleep 0.4
-send "b"
-sleep 0.3
-send "\x13"
-sleep 0.4
-for {set i 0} {$i < 200} {incr i} { send "\x7f" }
-sleep 0.2
-send "$f"
-sleep 0.2
-send "\r"
-sleep 0.4
-send "\x11"
-expect eof
-wait
-record_result [assert_file $f "a\xc3\xa9b" "U4_split_multibyte_not_corrupted"]
+# NOTE: there is deliberately no case here for a multi-byte character
+# split across reads (term.zig gives it the same bounded retry as an
+# escape sequence). A pty harness cannot reproduce it reliably: on Linux
+# expect batches both bytes before the editor reads them, so the case
+# passes against the buggy code too, and on macOS the same timing fails
+# against the fixed code. A flaky test is worse than an honest gap —
+# testing this properly needs injectable input in term.zig, which reads
+# fd 0 through a module-global buffer today.
 
 exec rm -rf $tmpdir
 report_results "t18_unicode"

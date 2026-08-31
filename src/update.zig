@@ -317,9 +317,14 @@ fn setAlarm(seconds: u32) void {
 /// Keeping the file check preserves today's classification exactly;
 /// switching to the dirname is a separate, deliberate behavior change
 /// and is filed as a follow-up rather than smuggled in here.
-fn selfIsWritable() bool {
+pub fn selfIsWritable() bool {
     var buf: [fsx.max_path_bytes]u8 = undefined;
-    const path = fsx.selfExePath(&buf) catch return false;
+    // Fail OPEN when we cannot resolve our own path. OpenBSD has no
+    // /proc/self/exe and derives this from sysctl, so a failure here
+    // means "unknown", not "read-only" — and answering false would
+    // silently disable auto-update on that platform. We only decline
+    // when we positively know the target cannot be written.
+    const path = fsx.selfExePath(&buf) catch return true;
     fsx.accessWritable(path) catch return false;
     return true;
 }
@@ -654,12 +659,18 @@ const resume_max_age_ns: i128 = 5 * std.time.ns_per_min;
 ///   - auto-apply is on in config
 ///   - buffer is clean (no unsaved changes)
 ///   - the editor has been idle for at least `min_idle_ms`
+/// `self_writable` is passed in rather than probed here so this stays a
+/// pure predicate: probing made it depend on the running binary's own
+/// path, which broke its unit test anywhere the test runner's binary
+/// isn't writable (and OpenBSD, which has no /proc/self/exe). Callers
+/// pass selfIsWritable().
 pub fn canAutoApply(
     state: *const UpdateState,
     ed: *const editor_mod.Editor,
     cfg: *const config_mod.Config,
     idle_ms: u64,
     min_idle_ms: u64,
+    self_writable: bool,
 ) bool {
     if (state.status != .staged) return false;
     if (!cfg.autoupdate) return false;
@@ -669,7 +680,7 @@ pub fn canAutoApply(
     // install used to retry every 60s of idle for the whole session,
     // flashing "auto-update failed: NotWritable" each time, which the
     // seeded ~/.issyrc and the docs both promised was a silent no-op.
-    if (!selfIsWritable()) return false;
+    if (!self_writable) return false;
     return true;
 }
 
@@ -1233,24 +1244,24 @@ test "canAutoApply rejects when buffer is modified" {
     var state = UpdateState{ .status = .staged };
 
     // Clean + idle + staged + autoupdate on → should apply.
-    try std.testing.expect(canAutoApply(&state, &ed, &cfg, 60_000, 60_000));
+    try std.testing.expect(canAutoApply(&state, &ed, &cfg, 60_000, 60_000, true));
 
     // Modified → reject.
     ed.modified = true;
-    try std.testing.expect(!canAutoApply(&state, &ed, &cfg, 60_000, 60_000));
+    try std.testing.expect(!canAutoApply(&state, &ed, &cfg, 60_000, 60_000, true));
     ed.modified = false;
 
     // Not idle long enough → reject.
-    try std.testing.expect(!canAutoApply(&state, &ed, &cfg, 30_000, 60_000));
+    try std.testing.expect(!canAutoApply(&state, &ed, &cfg, 30_000, 60_000, true));
 
     // Autoupdate off → reject.
     cfg.autoupdate = false;
-    try std.testing.expect(!canAutoApply(&state, &ed, &cfg, 60_000, 60_000));
+    try std.testing.expect(!canAutoApply(&state, &ed, &cfg, 60_000, 60_000, true));
     cfg.autoupdate = true;
 
     // Not staged → reject.
     state.status = .available;
-    try std.testing.expect(!canAutoApply(&state, &ed, &cfg, 60_000, 60_000));
+    try std.testing.expect(!canAutoApply(&state, &ed, &cfg, 60_000, 60_000, true));
 }
 
 test "update_key is bootstrapped" {
@@ -1395,15 +1406,21 @@ test "canAutoApply refuses once demoted to error_state" {
     var state = UpdateState{ .status = .error_state };
     // A failed apply demotes to error_state so the 60s retry loop stops
     // for the rest of the session.
-    try std.testing.expect(!canAutoApply(&state, &ed, &cfg, 120_000, min_idle_ms_default));
+    try std.testing.expect(!canAutoApply(&state, &ed, &cfg, 120_000, min_idle_ms_default, true));
 
     // .staged still gates on everything else (writability is checked
     // against the real test-runner binary, so assert only the negative
     // cases here).
     state.status = .staged;
-    try std.testing.expect(!canAutoApply(&state, &ed, &cfg, 0, min_idle_ms_default)); // not idle yet
+    try std.testing.expect(!canAutoApply(&state, &ed, &cfg, 0, min_idle_ms_default, true)); // not idle yet
+
+    // A non-writable install must not even attempt an apply — that is
+    // what stopped the every-60s "auto-update failed: NotWritable" loop.
+    try std.testing.expect(canAutoApply(&state, &ed, &cfg, 120_000, min_idle_ms_default, true));
+    try std.testing.expect(!canAutoApply(&state, &ed, &cfg, 120_000, min_idle_ms_default, false));
+
     ed.modified = true;
-    try std.testing.expect(!canAutoApply(&state, &ed, &cfg, 120_000, min_idle_ms_default)); // dirty buffer
+    try std.testing.expect(!canAutoApply(&state, &ed, &cfg, 120_000, min_idle_ms_default, true)); // dirty buffer
 }
 
 test "applyOrderingOk refuses anything not strictly newer" {
