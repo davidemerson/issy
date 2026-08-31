@@ -145,21 +145,46 @@ proc fresh_cache {} {
 # Bounded in WALL CLOCK, not in output silence: an editor that redraws
 # steadily (a status message refreshing, say) would keep a silence-based
 # drain alive indefinitely.
+#
+# `until_file` lets a case stop as soon as the thing it is waiting for
+# exists, instead of always burning the full budget. That keeps the
+# suite quick locally while tolerating a slow CI runner, where a fixed
+# sleep is exactly the kind of thing that passes on a laptop and fails
+# in CI.
 proc run_editor {bin args} {
     global tmpdir
+    set until_file ""
+    set budget_ms 6000
+    if {[llength $args] >= 1} { set until_file [lindex $args 0] }
+    if {[llength $args] >= 2} { set budget_ms [lindex $args 1] }
+
     set f "$tmpdir/work.txt"
     if {![file exists $f]} { exec sh -c "printf 'alpha\\n' > $f" }
     spawn -noecho $bin $f
     set pid [exp_pid]
-    set done 0
-    after 4000 { set ::run_editor_done 1 }
     set ::run_editor_done 0
+    set tid [after $budget_ms { set ::run_editor_done 1 }]
     while {!$::run_editor_done} {
+        if {$until_file ne "" && [file exists $until_file]} {
+            # Give the writer a moment to finish (the staged binary is
+            # renamed into place, but the editor may still be settling).
+            after 400
+            break
+        }
         expect -timeout 1 -re {.+} {} timeout {}
     }
+    after cancel $tid
     catch { exec kill -9 $pid }
     catch { close }
     catch { wait }
+}
+
+# Dump enough state to diagnose a CI-only failure from the log alone.
+proc diagnose {label} {
+    global cache tmpdir
+    puts stderr "  --- $label diagnostics ---"
+    catch { puts stderr "  cache: [exec ls -la $cache]" }
+    catch { puts stderr "  server log tail: [exec tail -5 $tmpdir/server.log]" }
 }
 
 exec sh -c "printf 'autoupdate = true\\nnotify_updates = true\\n' > $home/.issyrc"
@@ -169,7 +194,7 @@ exec sh -c "printf 'autoupdate = true\\nnotify_updates = true\\n' > $home/.issyr
 # A1: a good release is fetched, verified and staged.
 serve good
 fresh_cache
-run_editor "$tmpdir/old/bin/issy"
+run_editor "$tmpdir/old/bin/issy" "$cache/issy.staged" 20000
 set ok 1
 if {![file exists "$cache/issy.staged"]} {
     puts stderr "  no issy.staged after a good release"
@@ -179,7 +204,7 @@ if {![file exists "$cache/issy.staged"]} {
     set ok 0
 }
 record_result [expr {$ok && [file exists "$cache/sha256sums.txt"] && [file exists "$cache/manifest_epoch.txt"]}]
-if {$ok} { puts stderr "PASS A1_good_release_stages" } else { puts stderr "FAIL A1_good_release_stages" }
+if {$ok} { puts stderr "PASS A1_good_release_stages" } else { puts stderr "FAIL A1_good_release_stages"; diagnose A1 }
 
 # A2-A5: each negative variant must stage NOTHING. Every one of these
 # carries a valid signature over its mutated content (except bad-sig),
@@ -198,7 +223,7 @@ foreach {name label} {
     if {$name eq "epoch-old"} {
         exec sh -c "printf '2000000000' > $cache/manifest_epoch.txt"
     }
-    run_editor "$tmpdir/old/bin/issy"
+    run_editor "$tmpdir/old/bin/issy" "" 6000
     if {[file exists "$cache/issy.staged"]} {
         puts stderr "FAIL $label (staged despite a bad $name fixture)"
         record_result 0
@@ -245,12 +270,13 @@ proc seed_staged {variant} {
 # B1: the whole apply path — swap, re-exec, and the --resume round trip.
 seed_staged good
 exec cp "$tmpdir/old/bin/issy" "$tmpdir/bin/issy"
-run_editor "$tmpdir/bin/issy"
+run_editor "$tmpdir/bin/issy" "$cache/issy.prev" 20000
 if {[file_sha "$tmpdir/bin/issy"] eq $new_sha256} {
     puts stderr "PASS B1_apply_swaps_binary"
     record_result 1
 } else {
     puts stderr "FAIL B1_apply_swaps_binary"
+    diagnose B1
     record_result 0
 }
 
