@@ -927,9 +927,12 @@ pub const Renderer = struct {
             const indent: usize = if (sub > 0) ed.continuationIndentCols(ed.cursor.line) else 0;
             // Saturating: a tab-heavy or enormous line can push the
             // visual column past u16, and an unchecked add here used to
-            // panic in safe builds.
+            // panic in safe builds. Row clamps to the last CONTENT row:
+            // a single line wrapping taller than the viewport can't be
+            // scrolled sub-line-wise (scroll_top is line-granular), and
+            // the old rows-1 clamp parked the cursor on the status bar.
             term.moveCursor(
-                @min(vis_row, self.rows -| 1),
+                @min(vis_row, self.rows -| 2),
                 screenColSat(code_start, indent + col_in_sub),
             );
         } else {

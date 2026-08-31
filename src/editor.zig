@@ -2372,7 +2372,14 @@ pub const Editor = struct {
             // before comparing — otherwise a tab- or multibyte-bearing
             // line scrolls too far and the cursor drifts off its glyph.
             const gw = self.gutterWidth();
-            const code_cols = if (self.visible_cols > gw) @as(usize, self.visible_cols - gw) else 1;
+            var code_cols = if (self.visible_cols > gw) @as(usize, self.visible_cols - gw) else 1;
+            // The renderer clips the code area at right_margin; the
+            // scroll window must match, or with a margin narrower than
+            // the terminal the cursor can sit (and type invisibly) in a
+            // clipped region the renderer never draws.
+            if (self.config.right_margin > 0) {
+                code_cols = @min(code_cols, @as(usize, self.config.right_margin));
+            }
             const cursor_visual = self.byteColToVisualCol(self.cursor.line, self.cursor.col);
             if (cursor_visual < self.scroll_left) {
                 self.scroll_left = cursor_visual;
@@ -6010,4 +6017,26 @@ test "cursor motion over a truncated multi-byte lead never overshoots the line" 
     var tmp: [16]u8 = undefined;
     const got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
     try std.testing.expectEqualStrings("a!\xe4", got);
+}
+
+test "horizontal scroll window respects right_margin" {
+    var cfg = config_mod.Config.init();
+    cfg.word_wrap = false;
+    cfg.right_margin = 40;
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+    ed.visible_cols = 100;
+    ed.visible_rows = 10;
+
+    const line = [_]u8{'x'} ** 80;
+    try ed.buf.insert(0, &line);
+    ed.cursor.col = 80;
+    ed.cursor.col_want = 80;
+    ed.ensureCursorVisible();
+    // The renderer draws only right_margin (40) columns; the cursor's
+    // on-screen offset must fit inside them, not the terminal's 100.
+    try std.testing.expect(80 - ed.scroll_left < 40);
 }
