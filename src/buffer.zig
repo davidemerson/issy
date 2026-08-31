@@ -155,17 +155,26 @@ pub const Buffer = struct {
         var tmp_file: fsx.File = undefined;
         var tmp_path: []const u8 = undefined;
         var attempt: u8 = 0;
+        // The decoration around the basename costs 19 bytes ("." + "." +
+        // 8 hex + ".issy-tmp"), and NAME_MAX is 255. Truncate the embedded
+        // stem so a legal long filename still saves: with the full stem, a
+        // 237-251 byte basename that saved fine before the unique-temp
+        // naming landed would fail NameTooLong forever. Uniqueness comes
+        // from the random suffix plus O_EXCL, never from the stem, so
+        // truncating it costs nothing.
+        const stem_full = std.fs.path.basename(target);
+        const stem = stem_full[0..@min(stem_full.len, 255 - 19)];
         while (true) : (attempt += 1) {
             var rand: [4]u8 = undefined;
             fsx.randomBytes(&rand);
             const hex = std.fmt.bytesToHex(rand, .lower);
             tmp_path = if (std.fs.path.dirname(target)) |dir|
                 std.fmt.bufPrint(&tmp_buf, "{s}/.{s}.{s}.issy-tmp", .{
-                    dir, std.fs.path.basename(target), &hex,
+                    dir, stem, &hex,
                 }) catch return error.PathTooLong
             else
                 std.fmt.bufPrint(&tmp_buf, ".{s}.{s}.issy-tmp", .{
-                    std.fs.path.basename(target), &hex,
+                    stem, &hex,
                 }) catch return error.PathTooLong;
             tmp_file = fsx.createFile(tmp_path, .{
                 .exclusive = true,
@@ -1154,4 +1163,34 @@ test "load reads past a lying stat.size (procfs)" {
     defer buf.deinit();
     try buf.load("/proc/version");
     try std.testing.expect(buf.logicalLen() > 0);
+}
+
+test "long filenames save at every length up to NAME_MAX" {
+    // Regression guard for the unique-temp naming introduced in be41f73:
+    // the temp name adds 19 bytes of decoration to the basename, so
+    // without truncation a 237-251 byte name (legal — NAME_MAX is 255)
+    // failed with NameTooLong and could never be saved.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [fsx.max_path_bytes]u8 = undefined;
+    const cwd = try fsx.getcwd(&path_buf);
+
+    for ([_]usize{ 8, 235, 236, 237, 251, 255 }) |name_len| {
+        var buf = try Buffer.init(std.testing.allocator);
+        defer buf.deinit();
+        try buf.insert(0, "content\n");
+
+        var name: [256]u8 = undefined;
+        @memset(name[0..name_len], 'n');
+
+        var full_buf: [fsx.max_path_bytes]u8 = undefined;
+        const full = try std.fmt.bufPrint(&full_buf, "{s}/.zig-cache/tmp/{s}/{s}", .{
+            cwd, &tmp_dir.sub_path, name[0..name_len],
+        });
+
+        try buf.save(full);
+        const back = try fsx.readFileAlloc(std.testing.allocator, full, 64);
+        defer std.testing.allocator.free(back);
+        try std.testing.expectEqualStrings("content\n", back);
+    }
 }
