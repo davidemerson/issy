@@ -41,7 +41,9 @@ pub const Status = enum { none, available, staged, error_state };
 pub const UpdateState = struct {
     status: Status = .none,
     latest_sha: [40]u8 = undefined,
-    has_latest: bool = false,
+    /// Commit timestamp of the advertised release, 0 if the cache
+    /// predates the two-field commit.txt format or is unparseable.
+    latest_epoch: u64 = 0,
     message: [128]u8 = undefined,
     message_len: usize = 0,
 
@@ -135,21 +137,56 @@ fn ensureCacheDir(allocator: std.mem.Allocator) ![]u8 {
     return path;
 }
 
+/// The cache records the latest release as "<40 hex sha>[ <epoch>]".
+/// The epoch is what lets us tell *newer* from merely *different*; a
+/// cache written before the two-field format (or a malformed one)
+/// yields 0 = unknown.
+const CachedRelease = struct { sha: [40]u8, epoch: u64 };
+
+fn parseCachedRelease(bytes: []const u8) ?CachedRelease {
+    const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
+    if (trimmed.len < 40) return null;
+    var out: CachedRelease = .{ .sha = undefined, .epoch = 0 };
+    @memcpy(out.sha[0..], trimmed[0..40]);
+    const rest = std.mem.trim(u8, trimmed[40..], " \t\r\n");
+    if (rest.len > 0) out.epoch = std.fmt.parseInt(u64, rest, 10) catch 0;
+    return out;
+}
+
+/// Should we tell the user an update is available?
+///
+/// When both timestamps are known, require the advertised release to be
+/// strictly newer. Comparing SHAs for mere inequality — what this used
+/// to do — advertises a DOWNGRADE after any manual upgrade (brew,
+/// install.sh, a hand-copied binary), because the cache still names the
+/// older release the last worker run saw.
+///
+/// Unknown epochs fail OPEN, falling back to inequality: a wrong status
+/// line is the worst case, and a no-git tarball build would otherwise
+/// never learn about updates at all. Installing is the decision that
+/// fails closed — see verifyStagedBinary. Note this epoch arrives in an
+/// UNSIGNED file, so it may gate a notification and must never gate an
+/// install.
+fn shouldNotify(our_sha: []const u8, our_epoch: u64, latest_sha: []const u8, latest_epoch: u64) bool {
+    if (std.mem.eql(u8, our_sha[0..40], latest_sha[0..40])) return false;
+    if (our_epoch != 0 and latest_epoch != 0) return latest_epoch > our_epoch;
+    return true;
+}
+
 fn readCachedState(state: *UpdateState, commit_path: []const u8) void {
     const file = fsx.openFile(commit_path) catch return;
     defer file.close();
     var buf: [128]u8 = undefined;
     const n = file.readAll(&buf) catch return;
-    const trimmed = std.mem.trim(u8, buf[0..n], " \t\r\n");
-    if (trimmed.len < 40) return;
+    const cached = parseCachedRelease(buf[0..n]) orelse return;
 
-    @memcpy(state.latest_sha[0..], trimmed[0..40]);
-    state.has_latest = true;
+    state.latest_sha = cached.sha;
+    state.latest_epoch = cached.epoch;
 
-    if (!std.mem.eql(u8, trimmed[0..40], build_info.commit_sha[0..40])) {
+    if (shouldNotify(build_info.commit_sha[0..], build_info.commit_epoch, cached.sha[0..], cached.epoch)) {
         state.status = .available;
         var msg_buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&msg_buf, "update available: {s}", .{trimmed[0..7]}) catch {
+        const msg = std.fmt.bufPrint(&msg_buf, "update available: {s}", .{cached.sha[0..7]}) catch {
             state.setMessage("update available");
             return;
         };
@@ -238,20 +275,23 @@ fn doWork(
     // 1. Fetch commit.txt → cache.
     const commit_body = httpGet(&client, allocator, commit_url, max_commit_size) orelse return;
     defer allocator.free(commit_body);
-    if (commit_body.len < 40) return;
+    const latest = parseCachedRelease(commit_body) orelse return;
 
-    writeAtomic(commit_path, commit_body[0..40]) catch return;
+    // Persist the whole "<sha> <epoch>" record, trimmed — readCachedState
+    // needs the epoch to tell newer from merely different.
+    const record = std.mem.trim(u8, commit_body, " \t\r\n");
+    writeAtomic(commit_path, record) catch return;
 
     // Phase 2 work: only if autoupdate is on AND we have a pubkey AND this
-    // platform has a binary AND the latest SHA is different from ours.
+    // platform has a binary AND the release is actually newer than ours.
     if (!autoupdate) return;
     if (!update_key.isConfigured()) return;
 
     const asset_name = currentAssetName() orelse return;
 
-    if (std.mem.eql(u8, commit_body[0..40], build_info.commit_sha[0..40])) return;
+    if (!shouldNotify(build_info.commit_sha[0..], build_info.commit_epoch, latest.sha[0..], latest.epoch)) return;
 
-    downloadAndStage(&client, allocator, cache_dir, asset_name, commit_body[0..40]) catch return;
+    downloadAndStage(&client, allocator, cache_dir, asset_name, latest.sha[0..]) catch return;
 }
 
 fn downloadAndStage(
@@ -968,4 +1008,47 @@ test "downloadAndStage rejects a manifest missing the commit/epoch headers" {
     const no_headers = "abc  issy-linux-amd64\n";
     try std.testing.expectEqual(@as(?[]const u8, null), manifestHeaderField(no_headers, commit_header));
     try std.testing.expectEqual(@as(?u64, null), manifestEpoch(no_headers));
+}
+
+test "parseCachedRelease handles both cache formats" {
+    // Two-field format written by current CI.
+    const two = parseCachedRelease("2222222222222222222222222222222222222222 1700000000\n").?;
+    try std.testing.expectEqualStrings("2222222222222222222222222222222222222222", &two.sha);
+    try std.testing.expectEqual(@as(u64, 1700000000), two.epoch);
+
+    // Legacy single-field cache (written by any pre-1.4.1 worker).
+    const one = parseCachedRelease("3333333333333333333333333333333333333333").?;
+    try std.testing.expectEqual(@as(u64, 0), one.epoch);
+
+    // Garbage epoch degrades to unknown rather than failing the parse.
+    const bad = parseCachedRelease("4444444444444444444444444444444444444444 notanumber").?;
+    try std.testing.expectEqual(@as(u64, 0), bad.epoch);
+
+    try std.testing.expect(parseCachedRelease("short") == null);
+    try std.testing.expect(parseCachedRelease("") == null);
+}
+
+test "shouldNotify requires the release to be strictly newer" {
+    const ours = "1111111111111111111111111111111111111111";
+    const other = "2222222222222222222222222222222222222222";
+
+    // Same release: never notify, whatever the epochs say.
+    try std.testing.expect(!shouldNotify(ours, 100, ours, 999));
+
+    // THE REGRESSION: a cached OLDER release must not be advertised.
+    // This is the state every user lands in right after upgrading via
+    // brew or install.sh, since the installer never refreshes the cache.
+    try std.testing.expect(!shouldNotify(ours, 200, other, 100));
+
+    // Genuinely newer: notify.
+    try std.testing.expect(shouldNotify(ours, 100, other, 200));
+
+    // Equal epochs, different sha: not newer, so no notice.
+    try std.testing.expect(!shouldNotify(ours, 100, other, 100));
+
+    // Unknown epochs fail open (inequality), so a tarball build still
+    // learns about updates.
+    try std.testing.expect(shouldNotify(ours, 0, other, 200));
+    try std.testing.expect(shouldNotify(ours, 100, other, 0));
+    try std.testing.expect(shouldNotify(ours, 0, other, 0));
 }

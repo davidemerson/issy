@@ -279,7 +279,11 @@ jobs:
           chmod +x dist/issy-openbsd-amd64
 
           # Full 40-char commit SHA — consumed by the in-editor update checker.
-          git rev-parse HEAD > dist/commit.txt
+          # "<sha> <epoch>": the epoch lets a client tell a newer release
+          # from a merely different one. Backward compatible in both
+          # directions — older clients trim and slice [0..40], and newer
+          # clients treat a missing second field as unknown.
+          echo "$(git rev-parse HEAD) $(git show -s --format=%ct HEAD)" > dist/commit.txt
 
           # Sha256 manifest over the prebuilt binaries. The auto-update
           # path fetches this, verifies its Ed25519 signature, and then
@@ -406,7 +410,11 @@ jobs:
         working-directory: build
         run: |
           chmod +x dist/issy-openbsd-amd64
-          git rev-parse HEAD > dist/commit.txt
+          # "<sha> <epoch>": the epoch lets a client tell a newer release
+          # from a merely different one. Backward compatible in both
+          # directions — older clients trim and slice [0..40], and newer
+          # clients treat a missing second field as unknown.
+          echo "$(git rev-parse HEAD) $(git show -s --format=%ct HEAD)" > dist/commit.txt
           # Signed-manifest headers: the commit binds the manifest to this
           # release; the epoch (commit timestamp) is a monotonic counter the
           # client uses to reject replayed older releases. Both live INSIDE
