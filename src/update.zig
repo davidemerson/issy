@@ -813,6 +813,10 @@ test "build_info has expected fields" {
     try std.testing.expect(build_info.commit_sha.len == 40);
     _ = build_info.version;
     _ = build_info.build_type;
+    // Either unknown (0, e.g. a no-git tarball build with no override)
+    // or a plausible commit timestamp — never a garbage value that would
+    // let a stale release look newer than us.
+    try std.testing.expect(build_info.commit_epoch == 0 or build_info.commit_epoch > 1_500_000_000);
 }
 
 test "currentAssetName returns a name for the host platform" {
