@@ -1,0 +1,57 @@
+#!/usr/bin/expect -f
+# t24_large_file.exp -- responsiveness smoke on a 100k-line file:
+# open, jump to the end, edit, and save inside the suite timeout.
+# The file is generated here, never committed.
+
+set timeout 20
+set issy [lindex $argv 0]
+set test_dir [lindex $argv 1]
+source "$test_dir/helpers.tcl"
+
+set tmpdir [exec mktemp -d]
+
+set f "$tmpdir/big.txt"
+set fd [open $f w]
+for {set i 0} {$i < 100000} {incr i} {
+    puts $fd "line $i with some content here"
+}
+close $fd
+
+spawn $issy --no-config $f
+sleep 1.5
+# Jump to the last line, mark it, save.
+send "\x0c"
+sleep 0.2
+send "100000"
+sleep 0.2
+send "\r"
+sleep 0.5
+send "!"
+sleep 0.3
+send "\x13"
+sleep 1.5
+send "\x11"
+expect eof
+wait
+
+set ok 1
+set fd [open $f r]
+fconfigure $fd -translation binary
+set content [read $fd]
+close $fd
+if {[string first "!line 99999 with some content here" $content] < 0} {
+    puts stderr "FAIL B1_large_file_edit (marker missing at last line)"
+    set ok 0
+} else {
+    puts stderr "PASS B1_large_file_edit"
+}
+if {[string length $content] < 3000000} {
+    puts stderr "FAIL B1_large_file_size (truncated: [string length $content] bytes)"
+    set ok 0
+} else {
+    puts stderr "PASS B1_large_file_size"
+}
+record_result $ok
+
+exec rm -rf $tmpdir
+report_results "t24_large_file"

@@ -1,0 +1,82 @@
+#!/usr/bin/expect -f
+# t18_unicode.exp -- multi-byte input end-to-end: typing, saving, and
+# codepoint-wise deletion of accented Latin, CJK, and emoji.
+
+set timeout 8
+set issy [lindex $argv 0]
+set test_dir [lindex $argv 1]
+source "$test_dir/helpers.tcl"
+
+set tmpdir [exec mktemp -d]
+
+# Write raw bytes (chars 0x00-0xFF pass through 1:1). `exec printf`
+# would re-encode multi-byte escapes through the system encoding.
+proc write_bytes {path content} {
+    set fd [open $path w]
+    fconfigure $fd -translation binary
+    puts -nonewline $fd $content
+    close $fd
+}
+
+# --- U1: typed multi-byte text saves as exact UTF-8 ---
+set f "$tmpdir/u1.txt"
+spawn $issy --no-config
+fconfigure $spawn_id -encoding iso8859-1
+sleep 0.8
+# "héllo wörld 你好 🚀" -- é=\xc3\xa9  ö=\xc3\xb6  你=\xe4\xbd\xa0
+# 好=\xe5\xa5\xbd  🚀=\xf0\x9f\x9a\x80
+send "h\xc3\xa9llo w\xc3\xb6rld \xe4\xbd\xa0\xe5\xa5\xbd \xf0\x9f\x9a\x80"
+sleep 0.4
+send "\x13"
+sleep 0.4
+for {set i 0} {$i < 200} {incr i} { send "\x7f" }
+sleep 0.2
+send "$f"
+sleep 0.2
+send "\r"
+sleep 0.4
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "h\xc3\xa9llo w\xc3\xb6rld \xe4\xbd\xa0\xe5\xa5\xbd \xf0\x9f\x9a\x80" "U1_multibyte_type_save"]
+
+# --- U2: backspace removes exactly one codepoint at a time ---
+# Buffer ends "...你好 🚀"; 3 backspaces remove 🚀, space, 好 (9 bytes).
+set f "$tmpdir/u2.txt"
+write_bytes $f "ab\xe4\xbd\xa0\xe5\xa5\xbd \xf0\x9f\x9a\x80"
+spawn $issy --no-config $f
+fconfigure $spawn_id -encoding iso8859-1
+sleep 0.8
+send "\x1b\[F"
+sleep 0.2
+send "\x7f\x7f\x7f"
+sleep 0.3
+send "\x13"
+sleep 0.4
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "ab\xe4\xbd\xa0" "U2_codepoint_backspace"]
+
+# --- U3: arrow motion is codepoint-wise (marker lands between codepoints) ---
+set f "$tmpdir/u3.txt"
+write_bytes $f "\xe4\xbd\xa0\xe5\xa5\xbdz"
+spawn $issy --no-config $f
+fconfigure $spawn_id -encoding iso8859-1
+sleep 0.8
+# Home, Right once (over 你), insert marker
+send "\x1b\[H"
+sleep 0.2
+send "\x1b\[C"
+sleep 0.2
+send "!"
+sleep 0.3
+send "\x13"
+sleep 0.4
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "\xe4\xbd\xa0!\xe5\xa5\xbdz" "U3_codepoint_arrow_motion"]
+
+exec rm -rf $tmpdir
+report_results "t18_unicode"

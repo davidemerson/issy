@@ -29,7 +29,9 @@ if {$font_file eq ""} {
     puts stderr "SKIP t14_pdf: no font file found"
     puts stderr ""
     puts stderr "=== t14_pdf: 0/0 skipped (no font) ==="
-    exit 0
+    # Automake skip convention; run_tests.sh counts this apart from
+    # PASS so a font-less machine can't masquerade as green.
+    exit 77
 }
 
 # --- P1: PDF export produces valid multi-page PDF ---

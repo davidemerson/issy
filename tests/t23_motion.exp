@@ -1,0 +1,88 @@
+#!/usr/bin/expect -f
+# t23_motion.exp -- goto-line, word motion, shift-selection, and
+# reload, asserted by marker insertion into the saved file.
+
+set timeout 8
+set issy [lindex $argv 0]
+set test_dir [lindex $argv 1]
+source "$test_dir/helpers.tcl"
+
+set tmpdir [exec mktemp -d]
+
+# --- N1: Ctrl+L goto line puts the cursor at column 0 of that line ---
+set f "$tmpdir/n1.txt"
+exec printf "one\ntwo\nthree\nfour\n" > $f
+spawn $issy --no-config $f
+sleep 0.8
+send "\x0c"
+sleep 0.2
+send "3"
+sleep 0.2
+send "\r"
+sleep 0.3
+send "!"
+sleep 0.3
+send "\x13"
+sleep 0.4
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "one\ntwo\n!three\nfour\n" "N1_goto_line"]
+
+# --- N2: Ctrl+Right jumps word-wise ---
+set f "$tmpdir/n2.txt"
+exec printf "alpha beta gamma\n" > $f
+spawn $issy --no-config $f
+sleep 0.8
+# Word-right lands at the END of each word: two jumps from col 0 land
+# after "beta"
+send "\x1b\[1;5C\x1b\[1;5C"
+sleep 0.3
+send "!"
+sleep 0.3
+send "\x13"
+sleep 0.4
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "alpha beta! gamma\n" "N2_word_motion"]
+
+# --- N3: Shift+End selects to EOL; typing replaces the selection ---
+set f "$tmpdir/n3.txt"
+exec printf "keepREPLACETHIS\nnext\n" > $f
+spawn $issy --no-config $f
+sleep 0.8
+# Right x4 to col 4, then Shift+End, then type
+send "\x1b\[C\x1b\[C\x1b\[C\x1b\[C"
+sleep 0.2
+send "\x1b\[1;2F"
+sleep 0.2
+send "X"
+sleep 0.3
+send "\x13"
+sleep 0.4
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "keepX\nnext\n" "N3_shift_end_selection"]
+
+# --- N4: Ctrl+R reloads external changes ---
+set f "$tmpdir/n4.txt"
+exec printf "old content\n" > $f
+spawn $issy --no-config $f
+sleep 0.8
+exec printf "new content\n" > $f
+sleep 0.3
+send "\x12"
+sleep 0.5
+send "!"
+sleep 0.3
+send "\x13"
+sleep 0.4
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "!new content\n" "N4_reload_external_change"]
+
+exec rm -rf $tmpdir
+report_results "t23_motion"

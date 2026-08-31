@@ -1,0 +1,71 @@
+#!/usr/bin/expect -f
+# t19_multicursor.exp -- Ctrl+D multi-cursor rename: the headline
+# feature, previously untested end-to-end.
+
+set timeout 8
+set issy [lindex $argv 0]
+set test_dir [lindex $argv 1]
+source "$test_dir/helpers.tcl"
+
+set tmpdir [exec mktemp -d]
+
+# --- M1: Ctrl+D x2 then typing renames all three occurrences ---
+set f "$tmpdir/m1.txt"
+exec printf "count = 1\ncount += 2\nprint(count)\n" > $f
+spawn $issy --no-config $f
+sleep 0.8
+send "\x04"
+sleep 0.2
+send "\x04"
+sleep 0.2
+send "\x04"
+sleep 0.3
+send "total"
+sleep 0.4
+send "\x13"
+sleep 0.4
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "total = 1\ntotal += 2\nprint(total)\n" "M1_ctrl_d_rename"]
+
+# --- M2: single Ctrl+Z after a one-char rename restores every site ---
+set f "$tmpdir/m2.txt"
+exec printf "aa aa aa\n" > $f
+spawn $issy --no-config $f
+sleep 0.8
+send "\x04"
+sleep 0.2
+send "\x04"
+sleep 0.3
+send "X"
+sleep 0.3
+send "\x1a"
+sleep 0.3
+send "\x13"
+sleep 0.4
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "aa aa aa\n" "M2_rename_single_undo"]
+
+# --- M3: Escape clears extra cursors; typing then edits only one site ---
+set f "$tmpdir/m3.txt"
+exec printf "bb bb\n" > $f
+spawn $issy --no-config $f
+sleep 0.8
+send "\x04"
+sleep 0.2
+send "\x1b"
+sleep 0.3
+send "Y"
+sleep 0.3
+send "\x13"
+sleep 0.4
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "Ybb bb\n" "M3_escape_collapses_cursors"]
+
+exec rm -rf $tmpdir
+report_results "t19_multicursor"

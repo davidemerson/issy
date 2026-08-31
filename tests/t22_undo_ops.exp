@@ -1,0 +1,94 @@
+#!/usr/bin/expect -f
+# t22_undo_ops.exp -- undo across compound operations: paste,
+# replace-all, and the cut/paste round-trip.
+
+set timeout 8
+set issy [lindex $argv 0]
+set test_dir [lindex $argv 1]
+source "$test_dir/helpers.tcl"
+
+set tmpdir [exec mktemp -d]
+
+# --- V1: undo after a bracketed paste removes the whole blob ---
+set f "$tmpdir/v1.txt"
+exec printf "start\n" > $f
+spawn $issy --no-config $f
+sleep 0.8
+send "\x1b\[200~one\ntwo\nthree\x1b\[201~"
+sleep 0.4
+send "\x1a"
+sleep 0.3
+send "\x13"
+sleep 0.4
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "start\n" "V1_undo_whole_paste"]
+
+# --- V2: redo restores the paste ---
+set f "$tmpdir/v2.txt"
+exec printf "s\n" > $f
+spawn $issy --no-config $f
+sleep 0.8
+send "\x1b\[200~PASTED\x1b\[201~"
+sleep 0.4
+send "\x1a"
+sleep 0.3
+send "\x19"
+sleep 0.3
+send "\x13"
+sleep 0.4
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "PASTEDs\n" "V2_redo_paste"]
+
+# --- V3: replace-all is one undo step ---
+set f "$tmpdir/v3.txt"
+exec printf "dog cat dog bird dog\n" > $f
+spawn $issy --no-config $f
+sleep 0.8
+send "\x08"
+sleep 0.3
+send "dog"
+sleep 0.2
+send "\t"
+sleep 0.2
+send "fox"
+sleep 0.2
+send "\x01"
+sleep 0.4
+send "\x13"
+sleep 0.4
+# Verify the replacement wrote through, then undo restores in ONE step
+send "\x1a"
+sleep 0.3
+send "\x13"
+sleep 0.4
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "dog cat dog bird dog\n" "V3_replace_all_single_undo"]
+
+# --- V4: select-all cut then paste twice doubles the content ---
+set f "$tmpdir/v4.txt"
+exec printf "dup\n" > $f
+spawn $issy --no-config $f
+sleep 0.8
+send "\x01"
+sleep 0.2
+send "\x18"
+sleep 0.3
+send "\x16"
+sleep 0.3
+send "\x16"
+sleep 0.3
+send "\x13"
+sleep 0.4
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "dup\ndup\n" "V4_cut_paste_round_trip"]
+
+exec rm -rf $tmpdir
+report_results "t22_undo_ops"

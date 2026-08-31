@@ -13,34 +13,16 @@ proc arrow {dir} {
     }
 }
 
-proc key_home {} { send "\x1b\[H" }
-proc key_end {}  { send "\x1b\[F" }
-proc key_delete {} { send "\x1b\[3~" }
-proc key_pageup {} { send "\x1b\[5~" }
-proc key_pagedown {} { send "\x1b\[6~" }
-proc key_escape {} { send "\x1b"; sleep 0.15 }
 proc key_enter {} { send "\r" }
-proc key_tab {} { send "\t" }
-proc key_backspace {} { send "\x7f" }
 
-# Launch issy with --no-config to prevent user config interference
-proc launch {issy args} {
-    if {[llength $args] == 0} {
-        spawn $issy --no-config
-    } else {
-        eval spawn $issy --no-config $args
-    }
-    sleep 1
-}
-
-# Save (Ctrl+S) and quit (Ctrl+Q) for a file that already has a name
-proc save_quit {} {
-    ctrl s
-    sleep 0.3
-    ctrl q
-    sleep 0.3
-    expect eof
-    wait
+# Wait while continuously draining the editor's pty output. A plain
+# `sleep` leaves the pty master unread; once the small kernel buffer
+# fills, the editor blocks in write() and its main loop stops running,
+# so anything time-based (swap autosave, external-mtime polling, status
+# expiry) never fires. Times out `seconds` after the last output burst.
+proc drain {seconds} {
+    set t [expr {int(ceil($seconds))}]
+    expect -timeout $t -re {.+} { exp_continue } timeout { }
 }
 
 # Save-as: Ctrl+S opens prompt, clear CWD, type path, Enter, then quit
@@ -57,16 +39,6 @@ proc save_as_quit {path} {
     sleep 0.2
     key_enter
     sleep 0.5
-    ctrl q
-    sleep 0.3
-    expect eof
-    wait
-}
-
-# Force quit (Ctrl+Q twice) without saving
-proc force_quit {} {
-    ctrl q
-    sleep 0.2
     ctrl q
     sleep 0.3
     expect eof

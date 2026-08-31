@@ -1,0 +1,85 @@
+#!/usr/bin/expect -f
+# t21_mouse.exp -- SGR mouse input: click positions the caret,
+# double-click selects the word, triple-click selects the line, and
+# drag selects a range. Selection is proven by typing over it and
+# checking the saved bytes.
+
+set timeout 8
+set issy [lindex $argv 0]
+set test_dir [lindex $argv 1]
+source "$test_dir/helpers.tcl"
+
+set tmpdir [exec mktemp -d]
+
+# Layout note: --no-config gutter is "  N   " = 6 columns, so buffer
+# column C (0-based) is screen column C+7 in 1-based SGR coordinates.
+
+# --- X1: click positions the caret (marker lands at clicked byte) ---
+set f "$tmpdir/x1.txt"
+exec printf "alpha beta gamma\nsecond line here\n" > $f
+spawn $issy --no-config $f
+sleep 0.8
+# Click line 2, buffer col 7 (the "l" of "line"): x = 7+7 = 14, y = 2
+send "\x1b\[<0;14;2M\x1b\[<0;14;2m"
+sleep 0.3
+send "!"
+sleep 0.3
+send "\x13"
+sleep 0.4
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "alpha beta gamma\nsecond !line here\n" "X1_click_positions_caret"]
+
+# --- X2: double-click selects the word; typing replaces it ---
+set f "$tmpdir/x2.txt"
+exec printf "alpha beta gamma\n" > $f
+spawn $issy --no-config $f
+sleep 0.8
+# Double-click on "beta" (buffer col 7 -> x=14, y=1), two quick clicks
+send "\x1b\[<0;14;1M\x1b\[<0;14;1m\x1b\[<0;14;1M\x1b\[<0;14;1m"
+sleep 0.3
+send "X"
+sleep 0.3
+send "\x13"
+sleep 0.4
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "alpha X gamma\n" "X2_double_click_selects_word"]
+
+# --- X3: triple-click selects the line; typing replaces it ---
+set f "$tmpdir/x3.txt"
+exec printf "first line\nsecond line\n" > $f
+spawn $issy --no-config $f
+sleep 0.8
+send "\x1b\[<0;10;1M\x1b\[<0;10;1m\x1b\[<0;10;1M\x1b\[<0;10;1m\x1b\[<0;10;1M\x1b\[<0;10;1m"
+sleep 0.3
+send "Y"
+sleep 0.3
+send "\x13"
+sleep 0.4
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "Y\nsecond line\n" "X3_triple_click_selects_line"]
+
+# --- X4: press-drag-release selects a range; typing replaces it ---
+set f "$tmpdir/x4.txt"
+exec printf "abcdefghij\n" > $f
+spawn $issy --no-config $f
+sleep 0.8
+# Press at buffer col 2 (x=9), drag (button+32) to col 7 (x=14), release
+send "\x1b\[<0;9;1M\x1b\[<32;14;1M\x1b\[<0;14;1m"
+sleep 0.3
+send "Z"
+sleep 0.3
+send "\x13"
+sleep 0.4
+send "\x11"
+expect eof
+wait
+record_result [assert_file $f "abZhij\n" "X4_drag_selects_range"]
+
+exec rm -rf $tmpdir
+report_results "t21_mouse"
