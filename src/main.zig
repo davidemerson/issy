@@ -46,6 +46,21 @@ fn handleFatalSignal(_: SigArg) callconv(.c) void {
     shutdown_requested.store(true, .release);
 }
 
+/// Restore the terminal, then die with the signal's default behavior.
+///
+/// Installed with SA_RESETHAND, so the handler is disarmed the moment it
+/// runs: re-raising then takes the default action, preserving the exit
+/// status and any core dump, and a fault *inside* the handler still
+/// kills the process instead of looping.
+fn handleCrashSignal(sig: SigArg) callconv(.c) void {
+    term.emergencyRestore();
+    // 0.15 takes a c_int here, 0.16 takes the SIG enum — and SigArg is
+    // already whichever one this toolchain uses, so pass it straight
+    // through. With SA_RESETHAND the disposition is already SIG_DFL, so
+    // this terminates with the right status and core dump.
+    _ = std.c.raise(sig);
+}
+
 fn installSignalHandlers() void {
     const action = std.posix.Sigaction{
         .handler = .{ .handler = handleFatalSignal },
@@ -54,6 +69,24 @@ fn installSignalHandlers() void {
     };
     std.posix.sigaction(std.posix.SIG.TERM, &action, null);
     std.posix.sigaction(std.posix.SIG.HUP, &action, null);
+
+    // Hardware faults. Zig's panic handler already covers in-language
+    // panics (and ReleaseSafe turns most UB into one), but a genuine
+    // SIGSEGV/SIGBUS/SIGILL/SIGFPE bypasses it and would leave the
+    // terminal in raw mode on the alternate screen with mouse reporting
+    // on — the crash message invisible and the shell unusable until
+    // `reset`. Only restore and re-raise; do NOT try to save or clean
+    // up, since the process state is already untrustworthy (the swap
+    // file autosave covers unsaved work).
+    const crash_action = std.posix.Sigaction{
+        .handler = .{ .handler = handleCrashSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = std.posix.SA.RESETHAND,
+    };
+    std.posix.sigaction(std.posix.SIG.SEGV, &crash_action, null);
+    std.posix.sigaction(std.posix.SIG.BUS, &crash_action, null);
+    std.posix.sigaction(std.posix.SIG.ILL, &crash_action, null);
+    std.posix.sigaction(std.posix.SIG.FPE, &crash_action, null);
 }
 
 const Args = struct {

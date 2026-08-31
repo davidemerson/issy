@@ -972,28 +972,33 @@ fn snapshotPrev(allocator: std.mem.Allocator, src: []const u8, dst: []const u8) 
 /// layouts. The fallback copies into the TARGET's directory first, then
 /// renames within it, so the swap itself stays atomic.
 fn swapIntoPlace(allocator: std.mem.Allocator, staged_path: []const u8, argv0: []const u8) !void {
-    fsx.rename(staged_path, argv0) catch |e| switch (e) {
-        error.RenameAcrossMountPoints => {
+    // Fall back on ANY rename failure rather than matching a specific
+    // error: the cross-device error is spelled differently between the
+    // Zig 0.15 std.fs and 0.16 std.Io.Dir error sets, and a copy into
+    // the target directory is a reasonable second attempt regardless of
+    // why the direct rename failed. The original error is returned if
+    // the fallback fails too.
+    fsx.rename(staged_path, argv0) catch |first_err| {
+        {
             const dir = std.fs.path.dirname(argv0) orelse ".";
             var rand: [4]u8 = undefined;
             fsx.randomBytes(&rand);
             const hex = std.fmt.bytesToHex(rand, .lower);
-            const tmp_path = try std.fmt.allocPrint(allocator, "{s}/.issy.new.{s}", .{ dir, &hex });
+            const tmp_path = std.fmt.allocPrint(allocator, "{s}/.issy.new.{s}", .{ dir, &hex }) catch return first_err;
             defer allocator.free(tmp_path);
             errdefer fsx.deleteFile(tmp_path) catch {};
 
-            const data = try fsx.readFileAlloc(allocator, staged_path, max_binary_size);
+            const data = fsx.readFileAlloc(allocator, staged_path, max_binary_size) catch return first_err;
             defer allocator.free(data);
             {
-                const out = try fsx.createFile(tmp_path, .{ .exclusive = true, .mode = 0o755 });
+                const out = fsx.createFile(tmp_path, .{ .exclusive = true, .mode = 0o755 }) catch return first_err;
                 defer out.close();
-                try out.writeAll(data);
-                try out.sync();
+                out.writeAll(data) catch return first_err;
+                out.sync() catch return first_err;
             }
-            try fsx.rename(tmp_path, argv0);
+            fsx.rename(tmp_path, argv0) catch return first_err;
             fsx.deleteFile(staged_path) catch {};
-        },
-        else => return e,
+        }
     };
 }
 
