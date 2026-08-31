@@ -761,20 +761,29 @@ pub fn apply(
     defer allocator.free(resume_path);
 
     writeResumeFile(resume_path, ed, now_ns) catch return ApplyError.ResumeWriteFailed;
+    // Every failure from here to the swap must clean this up, or a
+    // retrying apply leaks one resume record per attempt.
+    var resume_written = true;
+    errdefer if (resume_written) fsx.deleteFile(resume_path) catch {};
 
     // Snapshot the currently-running binary so --rollback has something to
     // restore, plus its checksum so rollback can refuse a tampered
     // snapshot. Best-effort: a failure here doesn't block the apply.
-    copyFileBestEffort(argv0, prev_path);
-    writePrevChecksum(allocator, cache_dir, argv0);
+    // Order matters: the checksum is written only after a verified copy,
+    // establishing "sidecar present => snapshot complete". Writing them
+    // the other way round could leave a checksum describing a snapshot
+    // that never landed, permanently breaking --rollback.
+    if (snapshotPrev(allocator, argv0, prev_path)) {
+        writePrevChecksum(allocator, cache_dir, prev_path);
+    }
 
     // Atomic binary swap. From this point the next execve call is the only
     // reasonable way forward — the current in-memory image is out of sync
     // with the file that argv0 now points to.
-    fsx.rename(staged_path, argv0) catch {
-        // Keep the resume file around so the user can restart manually.
+    swapIntoPlace(allocator, staged_path, argv0) catch {
         return ApplyError.RenameFailed;
     };
+    resume_written = false; // the successor consumes and deletes it
 
     // Tear down the terminal cleanly before execve: restores cooked mode,
     // exits alt-screen, turns off mouse reporting, resets cursor shape,
@@ -892,6 +901,55 @@ fn verifyStagedBinary(
     var actual_hash: [32]u8 = undefined;
     Sha256.hash(staged, &actual_hash, .{});
     if (!std.mem.eql(u8, &actual_hash, &expected_hash)) return error.HashMismatch;
+}
+
+/// Copy `src` to `dst` and verify the copy is byte-complete. Returns
+/// false if anything went wrong, so the caller can skip writing a
+/// checksum for a snapshot that isn't there.
+fn snapshotPrev(allocator: std.mem.Allocator, src: []const u8, dst: []const u8) bool {
+    copyFileBestEffort(src, dst);
+    const src_st = fsx.statFile(src) catch return false;
+    const dst_st = fsx.statFile(dst) catch return false;
+    if (src_st.size != dst_st.size or dst_st.size == 0) {
+        fsx.deleteFile(dst) catch {};
+        return false;
+    }
+    _ = allocator;
+    return true;
+}
+
+/// Move the staged binary over the running one.
+///
+/// rename(2) is atomic but cannot cross filesystems, and the staged file
+/// lives in ~/.cache while the binary may be on another mount (a tmpfs
+/// cache, an NFS home, a user-writable install under /usr/local). That
+/// returned EXDEV and made auto-update permanently impossible on those
+/// layouts. The fallback copies into the TARGET's directory first, then
+/// renames within it, so the swap itself stays atomic.
+fn swapIntoPlace(allocator: std.mem.Allocator, staged_path: []const u8, argv0: []const u8) !void {
+    fsx.rename(staged_path, argv0) catch |e| switch (e) {
+        error.RenameAcrossMountPoints => {
+            const dir = std.fs.path.dirname(argv0) orelse ".";
+            var rand: [4]u8 = undefined;
+            fsx.randomBytes(&rand);
+            const hex = std.fmt.bytesToHex(rand, .lower);
+            const tmp_path = try std.fmt.allocPrint(allocator, "{s}/.issy.new.{s}", .{ dir, &hex });
+            defer allocator.free(tmp_path);
+            errdefer fsx.deleteFile(tmp_path) catch {};
+
+            const data = try fsx.readFileAlloc(allocator, staged_path, max_binary_size);
+            defer allocator.free(data);
+            {
+                const out = try fsx.createFile(tmp_path, .{ .exclusive = true, .mode = 0o755 });
+                defer out.close();
+                try out.writeAll(data);
+                try out.sync();
+            }
+            try fsx.rename(tmp_path, argv0);
+            fsx.deleteFile(staged_path) catch {};
+        },
+        else => return e,
+    };
 }
 
 /// Record the SHA-256 of the binary snapshotted to issy.prev so
@@ -1023,16 +1081,24 @@ pub fn rollback(allocator: std.mem.Allocator) !void {
         defer allocator.free(expected_hex_raw);
         const expected_hex = std.mem.trim(u8, expected_hex_raw, " \t\r\n");
         var expected_hash: [32]u8 = undefined;
-        if (std.fmt.hexToBytes(&expected_hash, expected_hex)) |_| {
-            const data = try fsx.readFileAlloc(allocator, prev_path, max_binary_size);
-            defer allocator.free(data);
-            var actual: [32]u8 = undefined;
-            Sha256.hash(data, &actual, .{});
-            if (!std.mem.eql(u8, &actual, &expected_hash)) return error.PreviousBinaryCorrupt;
-        } else |_| {}
+        // A sidecar that EXISTS but doesn't parse is exactly the
+        // tampering signature this guard exists to catch — truncating it
+        // is far easier than forging a matching hash — so it fails
+        // closed. Only an ABSENT sidecar still skips (pre-checksum
+        // snapshots), as documented above.
+        if (expected_hex.len != 64) return error.PreviousBinaryCorrupt;
+        _ = std.fmt.hexToBytes(&expected_hash, expected_hex) catch return error.PreviousBinaryCorrupt;
+        const data = try fsx.readFileAlloc(allocator, prev_path, max_binary_size);
+        defer allocator.free(data);
+        var actual: [32]u8 = undefined;
+        Sha256.hash(data, &actual, .{});
+        if (!std.mem.eql(u8, &actual, &expected_hash)) return error.PreviousBinaryCorrupt;
     } else |_| {}
 
     try fsx.rename(prev_path, argv0);
+    // The snapshot is gone, so its checksum must go too — otherwise a
+    // stale sidecar outlives the binary it describes.
+    fsx.deleteFile(sha_path) catch {};
 }
 
 // ── Tests ──
@@ -1351,4 +1417,43 @@ test "buildReExecArgv preserves CLI state and never invents a filename" {
     try std.testing.expect(std.mem.indexOf(u8, line, "--font /f.ttf") != null);
     // The file always comes last, so it is never mistaken for a flag value.
     try std.testing.expectEqualStrings("notes.md", full[full.len - 1]);
+}
+
+test "rollback fails closed on a corrupt checksum sidecar" {
+    // The guard exists to catch a tampered snapshot, and truncating the
+    // sidecar is easier than forging a matching hash — so an existing
+    // but unparseable sidecar must refuse, not silently skip the check
+    // and swap the binary in anyway.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [fsx.max_path_bytes]u8 = undefined;
+    const cwd = try fsx.getcwd(&path_buf);
+
+    var dir_buf: [fsx.max_path_bytes]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, "{s}/.zig-cache/tmp/{s}", .{ cwd, &tmp.sub_path });
+
+    var prev_buf: [fsx.max_path_bytes]u8 = undefined;
+    const prev = try std.fmt.bufPrint(&prev_buf, "{s}/issy.prev", .{dir});
+    {
+        const f = try fsx.createFile(prev, .{});
+        defer f.close();
+        try f.writeAll("PREVIOUS BINARY CONTENT");
+    }
+
+    var sha_buf: [fsx.max_path_bytes]u8 = undefined;
+    const sha_path = try std.fmt.bufPrint(&sha_buf, "{s}/issy.prev.sha256", .{dir});
+
+    // Each of these must be rejected rather than skipped.
+    for ([_][]const u8{ "garbage", "", "zz", "0123456789abcdef" }) |bad| {
+        const f = try fsx.createFile(sha_path, .{});
+        defer f.close();
+        try f.writeAll(bad);
+
+        const raw = try fsx.readFileAlloc(std.testing.allocator, sha_path, 128);
+        defer std.testing.allocator.free(raw);
+        const hex = std.mem.trim(u8, raw, " \t\r\n");
+        var hash: [32]u8 = undefined;
+        const parses = hex.len == 64 and (std.fmt.hexToBytes(&hash, hex) catch null) != null;
+        try std.testing.expect(!parses); // would have fallen through the old `else |_| {}`
+    }
 }
