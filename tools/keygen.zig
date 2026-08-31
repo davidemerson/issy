@@ -11,10 +11,20 @@
 //! and delete /tmp/keys.txt after you have saved both halves.
 
 const std = @import("std");
+const fsx = @import("fsx");
 const Ed25519 = std.crypto.sign.Ed25519;
 
 pub fn main() !void {
-    const kp = Ed25519.KeyPair.generate();
+    // 0.16 moved keypair generation onto the Io interface and reworked
+    // the stdout writer, so both go through the fsx shim like the rest
+    // of the tree. Without this, `zig build keygen` failed to compile on
+    // 0.16 — and CI never noticed, because keygen is built by no test
+    // step and run by no job (it prints a private key to stdout, so it
+    // must be compiled but never executed in CI).
+    const kp = if (comptime fsx.is_zig_016)
+        Ed25519.KeyPair.generate(fsx.io())
+    else
+        Ed25519.KeyPair.generate();
 
     // Extract the raw 32-byte seed from the secret key. Ed25519 secret_key
     // is seed || public_key (64 bytes total); the first 32 are the seed.
@@ -41,9 +51,12 @@ pub fn main() !void {
     var pem_body: [64]u8 = undefined;
     _ = std.base64.standard.Encoder.encode(&pem_body, &der);
 
-    var stdout_buf: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
-    const w = &stdout_writer.interface;
+    // Buffer the whole document, then hand it to fsx's stdout in one
+    // write: std.fs.File's writer API differs between 0.15 and 0.16,
+    // while std.Io.Writer.fixed is identical on both.
+    var out_buf: [4096]u8 = undefined;
+    var out = std.Io.Writer.fixed(&out_buf);
+    const w = &out;
 
     try w.writeAll(
         \\issy auto-update signing keypair
@@ -90,5 +103,5 @@ pub fn main() !void {
         \\forget it. To rotate, re-run `zig build keygen`, replace both.
         \\
     );
-    try w.flush();
+    try fsx.File.stdout().writeAll(w.buffered());
 }

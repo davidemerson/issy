@@ -91,13 +91,27 @@ pub fn build(b: *std.Build) void {
     // to bootstrap the auto-update signing key. Prints a PEM private key
     // and a Zig public-key array literal to stdout; the private key is
     // never persisted to disk by the tool.
+    const keygen_mod = b.createModule(.{
+        .root_source_file = b.path("tools/keygen.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // keygen goes through the same 0.15/0.16 shim as src/, so it needs
+    // fsx as a named import (a relative ../src path would sit outside
+    // the module root).
+    const keygen_fsx = b.createModule(.{
+        .root_source_file = b.path("src/fsx.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (os_tag == .linux or os_tag == .macos or os_tag == .openbsd) {
+        keygen_mod.link_libc = true;
+        keygen_fsx.link_libc = true;
+    }
+    keygen_mod.addImport("fsx", keygen_fsx);
     const keygen_exe = b.addExecutable(.{
         .name = "issy-keygen",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/keygen.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+        .root_module = keygen_mod,
     });
     const run_keygen = b.addRunArtifact(keygen_exe);
     const keygen_step = b.step("keygen", "Generate Ed25519 signing keypair for auto-update");
@@ -106,6 +120,7 @@ pub fn build(b: *std.Build) void {
     // Test step — run all tests across all source files.
     const source_files: []const []const u8 = &.{
         "src/unicode.zig",
+        "src/fsx.zig",
         "src/buffer.zig",
         "src/term.zig",
         "src/config.zig",
@@ -138,6 +153,12 @@ pub fn build(b: *std.Build) void {
         const run_unit_tests = b.addRunArtifact(unit_tests);
         test_step.dependOn(&run_unit_tests.step);
     }
+    // Compile keygen under `zig build test` so a toolchain change can't
+    // break it unnoticed (it lives outside source_files because it has
+    // no tests of its own). COMPILE ONLY — never addRunArtifact here:
+    // keygen prints a PKCS#8 private key to stdout, which in CI would
+    // land in a public Actions log.
+    test_step.dependOn(&keygen_exe.step);
 }
 
 // Writes src/build_info.zig with version, commit SHA, and build type.
