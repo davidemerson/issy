@@ -291,7 +291,7 @@ fn realMain() !void {
     // for next run. Never blocks on the network.
     var update_state = update_mod.UpdateState{};
     update_mod.startupCheck(&update_state, allocator, &cfg);
-    if (update_state.status == .available and cfg.notify_updates) {
+    if ((update_state.status == .available or update_state.status == .staged) and cfg.notify_updates) {
         ed.setStatusMessage(update_state.getMessage());
     }
 
@@ -388,7 +388,11 @@ fn realMain() !void {
                     const msg = std.fmt.bufPrint(&buf, "auto-update failed: {s}", .{@errorName(e)}) catch "auto-update failed";
                     ed.setStatusMessage(msg);
                     needs_redraw = true;
-                    // Back off: don't retry until more idle time accrues.
+                    // Demote so this doesn't retry every 60s of idle for
+                    // the rest of the session, re-reporting the same
+                    // failure. The worker re-stages on the next launch if
+                    // the cause was transient.
+                    update_state.status = .error_state;
                     idle_ms = 0;
                 };
             }

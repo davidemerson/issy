@@ -260,6 +260,70 @@ fn setAlarm(seconds: u32) void {
     }
 }
 
+/// True when the running binary's own path is writable — a necessary
+/// condition for the rename(2) swap that applies an update.
+///
+/// NOTE: this asks whether the FILE is writable, while rename(2)
+/// actually needs the containing DIRECTORY to be writable. The two
+/// disagree in both directions (a root-owned file in a user-owned dir
+/// can be replaced; a user-owned file in a root-owned dir cannot).
+/// Keeping the file check preserves today's classification exactly;
+/// switching to the dirname is a separate, deliberate behavior change
+/// and is filed as a follow-up rather than smuggled in here.
+fn selfIsWritable() bool {
+    var buf: [fsx.max_path_bytes]u8 = undefined;
+    const path = fsx.selfExePath(&buf) catch return false;
+    fsx.accessWritable(path) catch return false;
+    return true;
+}
+
+/// Is there any point downloading a release?
+///
+/// Pure so the whole decision tree is testable; `staged_matches_latest`
+/// is threaded in because computing it needs the cache.
+fn shouldStage(
+    autoupdate: bool,
+    key_configured: bool,
+    has_asset: bool,
+    writable: bool,
+    is_newer: bool,
+    staged_matches_latest: bool,
+) bool {
+    if (!autoupdate) return false;
+    if (!key_configured) return false;
+    if (!has_asset) return false;
+    // Nothing we download here could ever be installed, so downloading
+    // it is pure waste — this is the documented "notify-only" behavior
+    // for root-owned installs, which previously re-fetched the whole
+    // binary on every single launch.
+    if (!writable) return false;
+    if (!is_newer) return false;
+    // Already staged and still current: don't re-download megabytes.
+    // Bound to the COMMIT, not mere file existence, or a stale staged
+    // binary would pin the user forever.
+    if (staged_matches_latest) return false;
+    return true;
+}
+
+/// Does a staged binary already correspond to `latest_sha`? Answered
+/// from the cached signed manifest, which records the release it
+/// describes in its commit header.
+fn stagedMatchesLatest(allocator: std.mem.Allocator, cache_dir: []const u8, latest_sha: []const u8) bool {
+    const staged_path = std.fmt.allocPrint(allocator, "{s}/issy.staged", .{cache_dir}) catch return false;
+    defer allocator.free(staged_path);
+    const st = fsx.statFile(staged_path) catch return false;
+    if (st.kind != .file or st.size < 1024) return false;
+
+    const manifest_path = std.fmt.allocPrint(allocator, "{s}/sha256sums.txt", .{cache_dir}) catch return false;
+    defer allocator.free(manifest_path);
+    const manifest = fsx.readFileAlloc(allocator, manifest_path, max_manifest_size) catch return false;
+    defer allocator.free(manifest);
+
+    const mc = manifestHeaderField(manifest, commit_header) orelse return false;
+    if (mc.len < 40) return false;
+    return std.mem.eql(u8, mc[0..40], latest_sha[0..40]);
+}
+
 fn doWork(
     allocator: std.mem.Allocator,
     cache_dir: []const u8,
@@ -282,16 +346,20 @@ fn doWork(
     const record = std.mem.trim(u8, commit_body, " \t\r\n");
     writeAtomic(commit_path, record) catch return;
 
-    // Phase 2 work: only if autoupdate is on AND we have a pubkey AND this
-    // platform has a binary AND the release is actually newer than ours.
-    if (!autoupdate) return;
-    if (!update_key.isConfigured()) return;
+    // Phase 2 work. Every condition is in shouldStage() so the whole
+    // decision is testable without a network or a fork.
+    const asset_name = currentAssetName();
+    const is_newer = shouldNotify(build_info.commit_sha[0..], build_info.commit_epoch, latest.sha[0..], latest.epoch);
+    if (!shouldStage(
+        autoupdate,
+        update_key.isConfigured(),
+        asset_name != null,
+        selfIsWritable(),
+        is_newer,
+        stagedMatchesLatest(allocator, cache_dir, latest.sha[0..]),
+    )) return;
 
-    const asset_name = currentAssetName() orelse return;
-
-    if (!shouldNotify(build_info.commit_sha[0..], build_info.commit_epoch, latest.sha[0..], latest.epoch)) return;
-
-    downloadAndStage(&client, allocator, cache_dir, asset_name, latest.sha[0..]) catch return;
+    downloadAndStage(&client, allocator, cache_dir, asset_name.?, latest.sha[0..]) catch return;
 }
 
 fn downloadAndStage(
@@ -539,6 +607,11 @@ pub fn canAutoApply(
     if (!cfg.autoupdate) return false;
     if (ed.modified) return false;
     if (idle_ms < min_idle_ms) return false;
+    // Don't even attempt an apply we know will fail: a root-owned
+    // install used to retry every 60s of idle for the whole session,
+    // flashing "auto-update failed: NotWritable" each time, which the
+    // seeded ~/.issyrc and the docs both promised was a silent no-op.
+    if (!selfIsWritable()) return false;
     return true;
 }
 
@@ -1051,4 +1124,44 @@ test "shouldNotify requires the release to be strictly newer" {
     try std.testing.expect(shouldNotify(ours, 0, other, 200));
     try std.testing.expect(shouldNotify(ours, 100, other, 0));
     try std.testing.expect(shouldNotify(ours, 0, other, 0));
+}
+
+test "shouldStage: a non-writable install downloads nothing" {
+    // The documented contract for root-owned installs (install.sh's
+    // seeded ~/.issyrc, CONFIGURATION.md, issy.1) is a silent no-op.
+    // Before this gate the worker re-fetched the whole binary — up to
+    // 32 MiB — on every single launch, forever.
+    try std.testing.expect(!shouldStage(true, true, true, false, true, false));
+
+    // Everything satisfied: stage.
+    try std.testing.expect(shouldStage(true, true, true, true, true, false));
+
+    // Each individual gate closes it.
+    try std.testing.expect(!shouldStage(false, true, true, true, true, false)); // autoupdate off
+    try std.testing.expect(!shouldStage(true, false, true, true, true, false)); // no pubkey
+    try std.testing.expect(!shouldStage(true, true, false, true, true, false)); // no platform asset
+    try std.testing.expect(!shouldStage(true, true, true, true, false, false)); // not newer
+
+    // Already staged for this release: don't re-download.
+    try std.testing.expect(!shouldStage(true, true, true, true, true, true));
+}
+
+test "canAutoApply refuses once demoted to error_state" {
+    var cfg = config_mod.Config.init();
+    cfg.autoupdate = true;
+    var ed = try editor_mod.Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    var state = UpdateState{ .status = .error_state };
+    // A failed apply demotes to error_state so the 60s retry loop stops
+    // for the rest of the session.
+    try std.testing.expect(!canAutoApply(&state, &ed, &cfg, 120_000, min_idle_ms_default));
+
+    // .staged still gates on everything else (writability is checked
+    // against the real test-runner binary, so assert only the negative
+    // cases here).
+    state.status = .staged;
+    try std.testing.expect(!canAutoApply(&state, &ed, &cfg, 0, min_idle_ms_default)); // not idle yet
+    ed.modified = true;
+    try std.testing.expect(!canAutoApply(&state, &ed, &cfg, 120_000, min_idle_ms_default)); // dirty buffer
 }
