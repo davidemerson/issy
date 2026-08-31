@@ -42,7 +42,9 @@ echo ""
 # The build above deliberately ran with the real HOME so zig's global
 # cache is reused; suites that need it back read ISSY_TESTS_REAL_HOME.
 export ISSY_TESTS_REAL_HOME="$HOME"
-REAL_CACHE_FINGERPRINT="$(find "$HOME/.cache/issy" -type f -printf '%p %s %T@\n' 2>/dev/null | sort)"
+# `find -printf` is GNU-only; ls -l is portable enough to notice any
+# change to the real cache.
+REAL_CACHE_FINGERPRINT="$(ls -l "$HOME/.cache/issy" 2>/dev/null | sort)"
 export HOME="$TMPDIR/home"
 mkdir -p "$HOME"
 # Belt and braces: current suites all pass --no-config, so this is only
@@ -87,7 +89,7 @@ done
 # Isolation check: no suite may touch the developer's real update cache.
 # A suite that regresses on this would otherwise fail silently and start
 # depending on network state again.
-NOW_FINGERPRINT="$(find "$ISSY_TESTS_REAL_HOME/.cache/issy" -type f -printf '%p %s %T@\n' 2>/dev/null | sort)"
+NOW_FINGERPRINT="$(ls -l "$ISSY_TESTS_REAL_HOME/.cache/issy" 2>/dev/null | sort)"
 if [ "$NOW_FINGERPRINT" != "$REAL_CACHE_FINGERPRINT" ]; then
     echo "ISOLATION FAILURE: the suite modified $ISSY_TESTS_REAL_HOME/.cache/issy"
     FAIL=$((FAIL + 1))

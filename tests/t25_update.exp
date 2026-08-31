@@ -29,6 +29,31 @@ if {[catch {exec sh -c "command -v openssl"}]} {
     puts stderr "SKIP t25_update: openssl not available"
     exit 77
 }
+# The fixtures name a Linux amd64 asset, and currentAssetName() must
+# agree or nothing can ever stage. macOS ships no prebuilt binary at all
+# (auto-apply is a documented no-op there), and OpenBSD uses a different
+# asset name. Rather than fake a match, run this suite where the real
+# thing runs and skip elsewhere.
+set host_os [exec uname -s]
+set host_arch [exec uname -m]
+if {$host_os ne "Linux" || ($host_arch ne "x86_64" && $host_arch ne "amd64")} {
+    puts stderr "SKIP t25_update: update assets are Linux amd64 (host is $host_os/$host_arch)"
+    exit 77
+}
+
+# GNU sha256sum is not everywhere; prefer it, fall back to shasum.
+if {![catch {exec sh -c "command -v sha256sum"}]} {
+    set SHACMD "sha256sum"
+} elseif {![catch {exec sh -c "command -v shasum"}]} {
+    set SHACMD "shasum -a 256"
+} else {
+    puts stderr "SKIP t25_update: no sha256 utility"
+    exit 77
+}
+proc file_sha {path} {
+    global SHACMD
+    return [string trim [lindex [exec sh -c "$SHACMD $path"] 0]]
+}
 
 set tmpdir [exec mktemp -d]
 set home "$tmpdir/home"
@@ -89,7 +114,7 @@ build_issy "$tmpdir/new" $NEW_SHA $NEW_EPOCH
 # Restore the generated config so a later plain build isn't surprised.
 catch { exec env HOME=$real_home zig build --prefix "$tmpdir/heal" --build-file "$repo/build.zig" 2>> "$tmpdir/build.log" }
 
-set new_sha256 [string trim [lindex [exec sha256sum "$tmpdir/new/bin/issy"] 0]]
+set new_sha256 [file_sha "$tmpdir/new/bin/issy"]
 
 # Regenerate fixtures against the REAL "new" binary so the manifest hash
 # matches what would actually be downloaded.
@@ -149,7 +174,7 @@ set ok 1
 if {![file exists "$cache/issy.staged"]} {
     puts stderr "  no issy.staged after a good release"
     set ok 0
-} elseif {[string trim [lindex [exec sha256sum "$cache/issy.staged"] 0]] ne $new_sha256} {
+} elseif {[file_sha "$cache/issy.staged"] ne $new_sha256} {
     puts stderr "  staged binary does not match the served asset"
     set ok 0
 }
@@ -221,7 +246,7 @@ proc seed_staged {variant} {
 seed_staged good
 exec cp "$tmpdir/old/bin/issy" "$tmpdir/bin/issy"
 run_editor "$tmpdir/bin/issy"
-if {[string trim [lindex [exec sha256sum "$tmpdir/bin/issy"] 0]] eq $new_sha256} {
+if {[file_sha "$tmpdir/bin/issy"] eq $new_sha256} {
     puts stderr "PASS B1_apply_swaps_binary"
     record_result 1
 } else {
@@ -235,7 +260,7 @@ if {[string trim [lindex [exec sha256sum "$tmpdir/bin/issy"] 0]] eq $new_sha256}
 seed_staged good
 exec cp "$tmpdir/new/bin/issy" "$tmpdir/bin/issy2"
 run_editor "$tmpdir/bin/issy2"
-if {[string trim [lindex [exec sha256sum "$tmpdir/bin/issy2"] 0]] eq $new_sha256} {
+if {[file_sha "$tmpdir/bin/issy2"] eq $new_sha256} {
     puts stderr "PASS B2_not_newer_refused"
     record_result 1
 } else {
@@ -247,10 +272,10 @@ if {[string trim [lindex [exec sha256sum "$tmpdir/bin/issy2"] 0]] eq $new_sha256
 fresh_cache
 exec cp "$tmpdir/new/bin/issy" "$tmpdir/bin/rb"
 exec cp "$tmpdir/old/bin/issy" "$cache/issy.prev"
-exec sh -c "sha256sum $cache/issy.prev | cut -d' ' -f1 > $cache/issy.prev.sha256"
-set old_sha256 [string trim [lindex [exec sha256sum "$tmpdir/old/bin/issy"] 0]]
+exec sh -c "$SHACMD $cache/issy.prev | cut -d' ' -f1 > $cache/issy.prev.sha256"
+set old_sha256 [file_sha "$tmpdir/old/bin/issy"]
 catch { exec "$tmpdir/bin/rb" --rollback } rbout
-if {[string trim [lindex [exec sha256sum "$tmpdir/bin/rb"] 0]] eq $old_sha256
+if {[file_sha "$tmpdir/bin/rb"] eq $old_sha256
     && ![file exists "$cache/issy.prev.sha256"]} {
     puts stderr "PASS B3_rollback_restores"
     record_result 1
@@ -266,9 +291,9 @@ fresh_cache
 exec cp "$tmpdir/new/bin/issy" "$tmpdir/bin/rb2"
 exec cp "$tmpdir/old/bin/issy" "$cache/issy.prev"
 exec sh -c "echo garbage > $cache/issy.prev.sha256"
-set before [string trim [lindex [exec sha256sum "$tmpdir/bin/rb2"] 0]]
+set before [file_sha "$tmpdir/bin/rb2"]
 catch { exec "$tmpdir/bin/rb2" --rollback } rbout2
-if {[string trim [lindex [exec sha256sum "$tmpdir/bin/rb2"] 0]] eq $before
+if {[file_sha "$tmpdir/bin/rb2"] eq $before
     && [string match "*PreviousBinaryCorrupt*" $rbout2]} {
     puts stderr "PASS B4_rollback_fails_closed"
     record_result 1
