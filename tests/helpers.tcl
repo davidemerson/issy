@@ -92,6 +92,14 @@ proc repr {s} {
 # Track pass/fail counts
 set ::pass_count 0
 set ::fail_count 0
+set ::skip_count 0
+
+# A case that cannot run here (missing dependency, running as root).
+# Counted apart from PASS so an environment gap never reads as green.
+proc record_skip {name why} {
+    puts stderr "SKIP $name ($why)"
+    incr ::skip_count
+}
 
 proc record_result {ok} {
     if {$ok} {
@@ -104,8 +112,16 @@ proc record_result {ok} {
 proc report_results {suite_name} {
     set total [expr {$::pass_count + $::fail_count}]
     puts stderr ""
-    puts stderr "=== $suite_name: $::pass_count/$total passed ==="
+    if {$::skip_count > 0} {
+        puts stderr "=== $suite_name: $::pass_count/$total passed, $::skip_count skipped ==="
+    } else {
+        puts stderr "=== $suite_name: $::pass_count/$total passed ==="
+    }
     if {$::fail_count > 0} {
         exit 1
+    }
+    # Every case skipped: report the suite as skipped, not passed.
+    if {$total == 0 && $::skip_count > 0} {
+        exit 77
     }
 }

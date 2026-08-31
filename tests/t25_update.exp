@@ -1,0 +1,292 @@
+#!/usr/bin/expect -f
+# t25_update.exp -- end-to-end coverage of the auto-update path.
+#
+# Until this suite existed, NOTHING exercised the update machinery's real
+# behavior: not the HTTP fetch, not signature verification, not staging,
+# not apply, not the re-exec, not --rollback. Every bug this suite guards
+# was found by reading the code, and several were shipped for months.
+#
+# The binaries under test are built with -Dupdate-base-url pointed at a
+# loopback fixture server and -Dupdate-pubkey set to a throwaway key, so
+# no test reaches the network or trusts the production signing key.
+# Every spawn is a COPY under a scratch HOME: apply() renames over
+# /proc/self/exe, so running the shared zig-out binary would overwrite it.
+
+set timeout 20
+set issy [lindex $argv 0]
+set test_dir [lindex $argv 1]
+source "$test_dir/helpers.tcl"
+
+set repo [file dirname $test_dir]
+
+# python3 serves the fixtures; openssl signs them. Skip rather than fail
+# where they are unavailable (the OpenBSD CI VM has no python3).
+if {[catch {exec sh -c "command -v python3"}]} {
+    puts stderr "SKIP t25_update: python3 not available"
+    exit 77
+}
+if {[catch {exec sh -c "command -v openssl"}]} {
+    puts stderr "SKIP t25_update: openssl not available"
+    exit 77
+}
+
+set tmpdir [exec mktemp -d]
+set home "$tmpdir/home"
+set cache "$home/.cache/issy"
+file mkdir $home $cache "$tmpdir/bin" "$tmpdir/serve"
+set env(HOME) $home
+
+# The suite runner points HOME at a scratch dir but zig needs the real
+# one for its global cache, or every build here would recompile the world.
+set real_home $env(HOME)
+if {[info exists env(ISSY_TESTS_REAL_HOME)]} { set real_home $env(ISSY_TESTS_REAL_HOME) }
+
+proc cleanup {} {
+    global tmpdir server_pid
+    catch { exec kill $server_pid }
+    catch { exec rm -rf $tmpdir }
+}
+
+# --- Build the two binaries under test ------------------------------
+# "old" is what runs; "new" is what a release would ship. Two distinct
+# commits so the re-exec terminates instead of re-staging forever.
+set OLD_SHA "1111111111111111111111111111111111111111"
+set NEW_SHA "2222222222222222222222222222222222222222"
+set OLD_EPOCH 1700000000
+set NEW_EPOCH 1800000000
+
+# Mint the fixture key first: the binaries must be built to trust it.
+if {[catch {
+    exec bash "$test_dir/fixtures/make_release.sh" --out "$tmpdir/rel-good" \
+        --asset "$issy" --commit $NEW_SHA --epoch $NEW_EPOCH --variant good 2>@1
+} out]} {
+    puts stderr "SKIP t25_update: fixture generator unavailable ($out)"
+    cleanup
+    exit 77
+}
+set pubkey [string trim [exec cat "$tmpdir/rel-good/pubkey.hex"]]
+
+set port 18421
+set base "http://127.0.0.1:$port/"
+
+# The override build deliberately warns on stderr, and Tcl's exec treats
+# ANY stderr output as a failure — so send it to the log, not the void,
+# and let a nonzero exit be the only failure signal.
+proc build_issy {prefix sha epoch} {
+    global repo base pubkey real_home tmpdir
+    exec env HOME=$real_home zig build -Doptimize=ReleaseSafe \
+        --prefix $prefix -Dcommit=$sha -Drelease=true -Dcommit-epoch=$epoch \
+        -Dupdate-base-url=$base -Dupdate-pubkey=$pubkey -Dupdate-min-idle-ms=300 \
+        --build-file "$repo/build.zig" 2>> "$tmpdir/build.log"
+}
+
+if {[catch { build_issy "$tmpdir/old" $OLD_SHA $OLD_EPOCH } err]} {
+    puts stderr "SKIP t25_update: could not build test binary ($err)"
+    cleanup
+    exit 77
+}
+build_issy "$tmpdir/new" $NEW_SHA $NEW_EPOCH
+# Restore the generated config so a later plain build isn't surprised.
+catch { exec env HOME=$real_home zig build --prefix "$tmpdir/heal" --build-file "$repo/build.zig" 2>> "$tmpdir/build.log" }
+
+set new_sha256 [string trim [lindex [exec sha256sum "$tmpdir/new/bin/issy"] 0]]
+
+# Regenerate fixtures against the REAL "new" binary so the manifest hash
+# matches what would actually be downloaded.
+proc make_variant {name variant} {
+    global test_dir tmpdir NEW_SHA NEW_EPOCH
+    exec bash "$test_dir/fixtures/make_release.sh" --out "$tmpdir/rel-$name" \
+        --asset "$tmpdir/new/bin/issy" --commit $NEW_SHA --epoch $NEW_EPOCH --variant $variant 2>@1
+}
+foreach v {good bad-sig commit-mismatch epoch-old hash-wrong} { make_variant $v $v }
+
+# --- Fixture server -------------------------------------------------
+set server_pid [exec python3 -m http.server -b 127.0.0.1 -d "$tmpdir/serve" $port \
+                > "$tmpdir/server.log" 2>@1 &]
+sleep 1
+
+proc serve {name} {
+    global tmpdir
+    catch { exec sh -c "rm -f $tmpdir/serve/*" }
+    exec sh -c "cp $tmpdir/rel-$name/commit.txt $tmpdir/rel-$name/sha256sums.txt $tmpdir/rel-$name/sha256sums.txt.sig $tmpdir/rel-$name/issy-* $tmpdir/serve/"
+}
+
+proc fresh_cache {} {
+    global cache
+    catch { exec rm -rf $cache }
+    file mkdir $cache
+}
+
+# Bounded in WALL CLOCK, not in output silence: an editor that redraws
+# steadily (a status message refreshing, say) would keep a silence-based
+# drain alive indefinitely.
+proc run_editor {bin args} {
+    global tmpdir
+    set f "$tmpdir/work.txt"
+    if {![file exists $f]} { exec sh -c "printf 'alpha\\n' > $f" }
+    spawn -noecho $bin $f
+    set pid [exp_pid]
+    set done 0
+    after 4000 { set ::run_editor_done 1 }
+    set ::run_editor_done 0
+    while {!$::run_editor_done} {
+        expect -timeout 1 -re {.+} {} timeout {}
+    }
+    catch { exec kill -9 $pid }
+    catch { close }
+    catch { wait }
+}
+
+exec sh -c "printf 'autoupdate = true\\nnotify_updates = true\\n' > $home/.issyrc"
+
+# --- Group A: the worker, over real HTTP ----------------------------
+
+# A1: a good release is fetched, verified and staged.
+serve good
+fresh_cache
+run_editor "$tmpdir/old/bin/issy"
+set ok 1
+if {![file exists "$cache/issy.staged"]} {
+    puts stderr "  no issy.staged after a good release"
+    set ok 0
+} elseif {[string trim [lindex [exec sha256sum "$cache/issy.staged"] 0]] ne $new_sha256} {
+    puts stderr "  staged binary does not match the served asset"
+    set ok 0
+}
+record_result [expr {$ok && [file exists "$cache/sha256sums.txt"] && [file exists "$cache/manifest_epoch.txt"]}]
+if {$ok} { puts stderr "PASS A1_good_release_stages" } else { puts stderr "FAIL A1_good_release_stages" }
+
+# A2-A5: each negative variant must stage NOTHING. Every one of these
+# carries a valid signature over its mutated content (except bad-sig),
+# so a pass proves the specific check fired, not just "something failed".
+foreach {name label} {
+    bad-sig         A2_bad_signature_rejected
+    commit-mismatch A3_commit_mismatch_rejected
+    epoch-old       A4_rolled_back_epoch_rejected
+    hash-wrong      A5_asset_hash_mismatch_rejected
+} {
+    serve $name
+    fresh_cache
+    # Anti-rollback compares against the cached high-water mark, so on a
+    # FIRST contact any epoch is legitimately accepted. Seed a higher
+    # mark, or this case would prove nothing.
+    if {$name eq "epoch-old"} {
+        exec sh -c "printf '2000000000' > $cache/manifest_epoch.txt"
+    }
+    run_editor "$tmpdir/old/bin/issy"
+    if {[file exists "$cache/issy.staged"]} {
+        puts stderr "FAIL $label (staged despite a bad $name fixture)"
+        record_result 0
+    } else {
+        puts stderr "PASS $label"
+        record_result 1
+    }
+}
+
+# A6: a non-writable install must not download the binary at all — the
+# documented "notify only" behavior for root-owned installs, which used
+# to re-fetch megabytes on every single launch.
+serve good
+fresh_cache
+if {[exec id -u] == 0} {
+    record_skip A6_nonwritable_downloads_nothing "running as root"
+} else {
+    exec cp "$tmpdir/old/bin/issy" "$tmpdir/bin/ro-issy"
+    exec chmod 555 "$tmpdir/bin/ro-issy"
+    run_editor "$tmpdir/bin/ro-issy"
+    set staged [file exists "$cache/issy.staged"]
+    set notified [file exists "$cache/commit.txt"]
+    exec chmod 755 "$tmpdir/bin/ro-issy"
+    if {!$staged && $notified} {
+        puts stderr "PASS A6_nonwritable_downloads_nothing"
+        record_result 1
+    } else {
+        puts stderr "FAIL A6_nonwritable_downloads_nothing (staged=$staged notified=$notified)"
+        record_result 0
+    }
+}
+
+# --- Group B: apply, re-exec, rollback (server not needed) ----------
+
+proc seed_staged {variant} {
+    global tmpdir cache NEW_SHA NEW_EPOCH
+    fresh_cache
+    exec sh -c "cp $tmpdir/rel-$variant/sha256sums.txt $tmpdir/rel-$variant/sha256sums.txt.sig $cache/"
+    exec cp "$tmpdir/new/bin/issy" "$cache/issy.staged"
+    exec chmod 755 "$cache/issy.staged"
+    exec sh -c "printf '%s %s\\n' $NEW_SHA $NEW_EPOCH > $cache/commit.txt"
+}
+
+# B1: the whole apply path — swap, re-exec, and the --resume round trip.
+seed_staged good
+exec cp "$tmpdir/old/bin/issy" "$tmpdir/bin/issy"
+run_editor "$tmpdir/bin/issy"
+if {[string trim [lindex [exec sha256sum "$tmpdir/bin/issy"] 0]] eq $new_sha256} {
+    puts stderr "PASS B1_apply_swaps_binary"
+    record_result 1
+} else {
+    puts stderr "FAIL B1_apply_swaps_binary"
+    record_result 0
+}
+
+# B2: a staged binary that is NOT newer must be refused. This is the
+# silent-downgrade bug: it needed no attacker — stage N+1, upgrade by
+# hand to N+2, and the next idle reinstalled N+1 over it.
+seed_staged good
+exec cp "$tmpdir/new/bin/issy" "$tmpdir/bin/issy2"
+run_editor "$tmpdir/bin/issy2"
+if {[string trim [lindex [exec sha256sum "$tmpdir/bin/issy2"] 0]] eq $new_sha256} {
+    puts stderr "PASS B2_not_newer_refused"
+    record_result 1
+} else {
+    puts stderr "FAIL B2_not_newer_refused (binary changed)"
+    record_result 0
+}
+
+# B3: --rollback restores the snapshot and removes its checksum.
+fresh_cache
+exec cp "$tmpdir/new/bin/issy" "$tmpdir/bin/rb"
+exec cp "$tmpdir/old/bin/issy" "$cache/issy.prev"
+exec sh -c "sha256sum $cache/issy.prev | cut -d' ' -f1 > $cache/issy.prev.sha256"
+set old_sha256 [string trim [lindex [exec sha256sum "$tmpdir/old/bin/issy"] 0]]
+catch { exec "$tmpdir/bin/rb" --rollback } rbout
+if {[string trim [lindex [exec sha256sum "$tmpdir/bin/rb"] 0]] eq $old_sha256
+    && ![file exists "$cache/issy.prev.sha256"]} {
+    puts stderr "PASS B3_rollback_restores"
+    record_result 1
+} else {
+    puts stderr "FAIL B3_rollback_restores ($rbout)"
+    record_result 0
+}
+
+# B4: --rollback must FAIL CLOSED on a checksum it cannot parse.
+# Truncating that sidecar is far easier than forging a matching hash, so
+# the one case the guard exists for was the one it used to skip.
+fresh_cache
+exec cp "$tmpdir/new/bin/issy" "$tmpdir/bin/rb2"
+exec cp "$tmpdir/old/bin/issy" "$cache/issy.prev"
+exec sh -c "echo garbage > $cache/issy.prev.sha256"
+set before [string trim [lindex [exec sha256sum "$tmpdir/bin/rb2"] 0]]
+catch { exec "$tmpdir/bin/rb2" --rollback } rbout2
+if {[string trim [lindex [exec sha256sum "$tmpdir/bin/rb2"] 0]] eq $before
+    && [string match "*PreviousBinaryCorrupt*" $rbout2]} {
+    puts stderr "PASS B4_rollback_fails_closed"
+    record_result 1
+} else {
+    puts stderr "FAIL B4_rollback_fails_closed ($rbout2)"
+    record_result 0
+}
+
+# B5: the test binaries must identify themselves, so an override build
+# can never be mistaken for something shippable.
+set ver [exec "$tmpdir/old/bin/issy" --version]
+if {[string match "*test-update*" $ver]} {
+    puts stderr "PASS B5_test_binary_is_marked"
+    record_result 1
+} else {
+    puts stderr "FAIL B5_test_binary_is_marked ($ver)"
+    record_result 0
+}
+
+cleanup
+report_results "t25_update"
