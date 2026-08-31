@@ -350,8 +350,13 @@ pub const Font = struct {
 
         if (id_range_off + seg_count_x2 > data.len) return;
 
+        // Total writes are capped exactly as parseCmapFormat12 already
+        // caps them. Without it, a crafted table (every segment spanning
+        // 0..0xFFFE, up to 32767 segments) drove ~2.1 billion iterations
+        // from a ~260 KB file — seconds of pegged CPU on font load.
+        var writes: usize = 0;
         var seg: usize = 0;
-        while (seg < seg_count) : (seg += 1) {
+        while (seg < seg_count and writes < 65536) : (seg += 1) {
             const end_code = readU16(data, end_codes_off + seg * 2);
             const start_code = readU16(data, start_codes_off + seg * 2);
             const id_delta: i16 = readI16(data, id_delta_off + seg * 2);
@@ -360,7 +365,7 @@ pub const Font = struct {
             if (start_code == 0xFFFF) break;
 
             var c: u32 = start_code;
-            while (c <= end_code and c < 65536) : (c += 1) {
+            while (c <= end_code and c < 65536 and writes < 65536) : (c += 1) {
                 var glyph_id: u16 = undefined;
                 if (id_range_offset == 0) {
                     glyph_id = @bitCast(@as(i16, @bitCast(@as(u16, @intCast(c)))) +% id_delta);
@@ -377,6 +382,7 @@ pub const Font = struct {
                     }
                 }
                 self.cmap[@intCast(c)] = glyph_id;
+                writes += 1;
             }
         }
     }
@@ -427,7 +433,13 @@ pub const Font = struct {
     }
 
     pub fn lineHeight(self: *const Font, font_size_pt: f32) f32 {
-        return @as(f32, @floatFromInt(self.ascender - self.descender + self.line_gap)) * font_size_pt / @as(f32, @floatFromInt(self.units_per_em));
+        // Widen before the arithmetic: these are i16 values read
+        // straight out of the file, and Zig does not promote, so a font
+        // declaring ascender=32767, descender=-32768 overflowed on the
+        // subtraction and PANICKED — in ReleaseSafe, which is the mode
+        // CI ships, aborting --print/Ctrl+P on a crafted font.
+        const span: i32 = @as(i32, self.ascender) - @as(i32, self.descender) + @as(i32, self.line_gap);
+        return @as(f32, @floatFromInt(span)) * font_size_pt / @as(f32, @floatFromInt(self.units_per_em));
     }
 
     pub fn familyName(self: *const Font) []const u8 {
@@ -572,4 +584,58 @@ test "units_per_em of zero is clamped so metrics don't divide by zero" {
     var font = Font{ .allocator = allocator, .data = &.{}, .cmap = &.{} };
     try font.parseTables(data, 1);
     try std.testing.expectEqual(@as(u16, 1000), font.units_per_em);
+}
+
+test "lineHeight survives hostile vertical metrics" {
+    // ascender - descender + line_gap is i16 arithmetic on values read
+    // straight from the file; unwidened it panicked in ReleaseSafe (the
+    // mode CI ships), aborting --print on a crafted font.
+    var f = Font{
+        .allocator = std.testing.allocator,
+        .data = &.{},
+        .units_per_em = 1000,
+        .ascender = 32767,
+        .descender = -32768,
+        .line_gap = 32767,
+    };
+    const h = f.lineHeight(10.0);
+    try std.testing.expect(std.math.isFinite(h));
+    try std.testing.expect(h > 0);
+
+    // The ordinary case still computes the same value as before.
+    f.ascender = 800;
+    f.descender = -200;
+    f.line_gap = 0;
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), f.lineHeight(10.0), 0.001);
+}
+
+test "cmap format 4 caps total writes on a hostile table" {
+    // Every segment spanning the whole BMP, which without a cap drove
+    // ~2.1e9 iterations from a small file.
+    const seg_count: usize = 64;
+    const seg_x2 = seg_count * 2;
+    const size = 14 + seg_x2 * 4 + 2 + 64;
+    const buf = try std.testing.allocator.alloc(u8, size);
+    defer std.testing.allocator.free(buf);
+    @memset(buf, 0);
+
+    std.mem.writeInt(u16, buf[6..8], @intCast(seg_x2), .big); // segCountX2
+    const end_off = 14;
+    const start_off = end_off + seg_x2 + 2;
+    const delta_off = start_off + seg_x2;
+    var i: usize = 0;
+    while (i < seg_count) : (i += 1) {
+        std.mem.writeInt(u16, buf[end_off + i * 2 ..][0..2], 0xFFFE, .big); // endCode
+        std.mem.writeInt(u16, buf[start_off + i * 2 ..][0..2], 0, .big); // startCode
+        std.mem.writeInt(u16, buf[delta_off + i * 2 ..][0..2], 1, .big); // idDelta
+    }
+
+    const cmap = try std.testing.allocator.alloc(u16, 65536);
+    defer std.testing.allocator.free(cmap);
+    @memset(cmap, 0);
+
+    var f = Font{ .allocator = std.testing.allocator, .data = &.{}, .cmap = cmap };
+    // Must return promptly rather than grinding through billions of
+    // iterations; the assertion is simply that it terminates.
+    f.parseCmapFormat4(buf, 0);
 }
