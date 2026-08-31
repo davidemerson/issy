@@ -33,6 +33,9 @@ class Issy < Formula
     unless build.head?
       args << "-Dcommit=#{stable_commit}"
       args << "-Drelease=true"
+      # Without the commit timestamp the update path can't tell a newer
+      # release from a merely different one, so it declines to auto-apply.
+      args << "-Dcommit-epoch=#{stable_commit_epoch}" if respond_to?(:stable_commit_epoch)
     end
     system "zig", "build", *args
     bin.install "zig-out/bin/issy"

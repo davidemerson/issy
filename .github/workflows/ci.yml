@@ -165,6 +165,11 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Syntax-check the formula
+        # `brew install --HEAD` never evaluates the stable block, so a
+        # syntax error introduced by the tag-time formula bump would stay
+        # invisible until a real `brew install issy`. This catches it.
+        run: ruby -c Formula/issy.rb
       - name: Tap the checked-out repo as a local Homebrew tap
         # `brew install --HEAD` requires the formula to be available
         # through a tap.  Symlink the workspace into
@@ -474,7 +479,11 @@ jobs:
           # tag-object SHA, which never matches commit.txt and would pin
           # brew users to a permanent "update available".
           COMMIT="$(git -C "$GITHUB_WORKSPACE/build" rev-parse HEAD)"
-          python3 .github/scripts/bump_formula.py Formula/issy.rb "$VERSION" "$SHA256" "$COMMIT"
+          # Same commit's timestamp, so the brew stable build can order
+          # releases (see -Dcommit-epoch in build.zig). Read from the same
+          # checkout as COMMIT for exactly the same reason.
+          COMMIT_EPOCH="$(git -C "$GITHUB_WORKSPACE/build" show -s --format=%ct HEAD)"
+          python3 .github/scripts/bump_formula.py Formula/issy.rb "$VERSION" "$SHA256" "$COMMIT" "$COMMIT_EPOCH"
           if git diff --quiet Formula/issy.rb; then
             echo "Formula/issy.rb already at v$VERSION — nothing to commit."
             exit 0

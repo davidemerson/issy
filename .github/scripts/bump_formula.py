@@ -6,7 +6,10 @@
 # use — if you run this locally, the next tag-push CI run will overwrite your
 # edits.
 #
-# Usage: bump_formula.py <formula_path> <version> <sha256> <commit>
+# Usage: bump_formula.py <formula_path> <version> <sha256> <commit> [commit_epoch]
+#   commit_epoch is optional (default "0" = unknown) so this stays
+#   compatible with an older ci.yml invocation and vice versa — a
+#   required arg would hard-fail at tag time, the worst possible moment.
 #   version is the bare semver ("0.2.0"), not the tag ("v0.2.0").
 #   commit is the 40-char SHA the tag points at, recorded so the brew
 #   stable build can stamp build_info (the source tarball has no .git).
@@ -23,7 +26,7 @@ BLOCK_RE = re.compile(
 )
 
 
-def render_block(version: str, sha256: str, commit: str) -> str:
+def render_block(version: str, sha256: str, commit: str, commit_epoch: str) -> str:
     return (
         f"{BEGIN} — edited by .github/scripts/bump_formula.py on tag push. Do not edit by hand.\n"
         f'  url "https://github.com/davidemerson/issy/archive/refs/tags/v{version}.tar.gz"\n'
@@ -37,22 +40,30 @@ def render_block(version: str, sha256: str, commit: str) -> str:
         "  def stable_commit\n"
         f'    "{commit}"\n'
         "  end\n"
+        "  # Commit timestamp, passed as -Dcommit-epoch. Lets the update path\n"
+        "  # tell a newer release from a merely different one; 0 = unknown.\n"
+        "  def stable_commit_epoch\n"
+        f'    "{commit_epoch}"\n'
+        "  end\n"
         f"{END}\n"
     )
 
 
 def main() -> None:
-    if len(sys.argv) != 5:
-        sys.exit("usage: bump_formula.py <formula_path> <version> <sha256> <commit>")
+    if len(sys.argv) not in (5, 6):
+        sys.exit("usage: bump_formula.py <formula_path> <version> <sha256> <commit> [commit_epoch]")
     path = pathlib.Path(sys.argv[1])
     version = sys.argv[2]
     sha256 = sys.argv[3]
     commit = sys.argv[4]
+    commit_epoch = sys.argv[5] if len(sys.argv) == 6 else "0"
 
     if not re.fullmatch(r"[0-9a-f]{64}", sha256):
         sys.exit(f"refusing to write: sha256 {sha256!r} is not 64 hex chars")
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         sys.exit(f"refusing to write: commit {commit!r} is not 40 hex chars")
+    if not re.fullmatch(r"\d+", commit_epoch):
+        sys.exit(f"refusing to write: commit_epoch {commit_epoch!r} is not decimal")
 
     src = path.read_text()
     if not BLOCK_RE.search(src):
@@ -61,7 +72,7 @@ def main() -> None:
             "is the formula template still intact?"
         )
 
-    new = BLOCK_RE.sub(render_block(version, sha256, commit), src, count=1)
+    new = BLOCK_RE.sub(render_block(version, sha256, commit, commit_epoch), src, count=1)
     if new == src:
         print("formula already up to date")
         return
