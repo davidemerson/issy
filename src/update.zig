@@ -205,8 +205,12 @@ fn spawnWorker(
     const pid2 = std.c.fork();
     if (pid2 != 0) std.c._exit(0);
 
-    // Grandchild: detach from the tty and do the work.
+    // Grandchild: detach from the tty and do the work. The parent has
+    // already used fsx.io() (ensureCacheDir ran before us), so on 0.16
+    // we inherited a thread pool whose workers didn't survive the fork —
+    // replace it before any I/O. See fsx.resetIoAfterFork.
     _ = std.c.setsid();
+    fsx.resetIoAfterFork();
     setAlarm(fetch_timeout_seconds);
 
     doWork(allocator, cache_dir, commit_path, autoupdate);

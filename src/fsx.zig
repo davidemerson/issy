@@ -331,6 +331,29 @@ pub fn openSwapNoFollow(path: []const u8) !File {
     return .{ .handle = fd };
 }
 
+/// Re-create the process-wide Io instance in a freshly forked child
+/// (0.16 only; a no-op on 0.15, which has no Io).
+///
+/// `std.Io.Threaded` is a thread pool. Only the calling thread survives
+/// fork(2), so a child that inherited an initialized pool holds a
+/// structure describing workers that no longer exist. Today that is
+/// harmless — 0.16.0's `Threaded.init` spawns no threads up front, and
+/// the http/net/dir paths the update worker uses never enter the
+/// async vtable that would spawn any — but the invariant is invisible
+/// and one stdlib change away from breaking: a threaded resolver or a
+/// concurrent connect would leave the child enqueued on a run queue
+/// nobody drains, blocking until the worker's SIGALRM kills it. That
+/// failure mode is silent (auto-update simply stops working), so guard
+/// it rather than depend on stdlib internals.
+///
+/// Deliberately does NOT deinit the inherited instance: that would try
+/// to join worker threads the child does not have.
+pub fn resetIoAfterFork() void {
+    if (comptime !is_zig_016) return;
+    threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    threaded_state = .ready;
+}
+
 /// Fill `buf` with random bytes (used for temp-name uniqueness; O_EXCL
 /// provides the actual collision safety). 0.16 removed the ambient
 /// std.crypto.random in favor of the Io interface's csprng.
