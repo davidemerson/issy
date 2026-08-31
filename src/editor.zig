@@ -537,22 +537,36 @@ pub const Editor = struct {
             return .none;
         }
 
-        switch (self.mode) {
-            .normal => return self.handleNormalKey(key),
-            .search => return self.handleSearchKey(key),
-            .command => return self.handleCommandKey(key),
-            .confirm => return self.handleConfirmKey(key),
-            .replace => return self.handleReplaceKey(key),
-            .help => {
+        const action: Action = switch (self.mode) {
+            .normal => self.handleNormalKey(key),
+            .search => self.handleSearchKey(key),
+            .command => self.handleCommandKey(key),
+            .confirm => self.handleConfirmKey(key),
+            .replace => self.handleReplaceKey(key),
+            .help => blk: {
                 // Any key dismisses the help overlay — except Ctrl+S,
                 // which also performs the save the overlay advertises.
                 // No other key is routed onward: generalizing would make
                 // a dismissal keystroke edit the buffer.
                 self.mode = .normal;
                 if (key == .ctrl and key.ctrl == 's') self.save();
-                return .redraw;
+                break :blk .redraw;
             },
+        };
+
+        // Mouse events are only decoded in normal mode, so a keystroke
+        // that leaves normal mode with the button still held (Ctrl+F,
+        // Ctrl+H, F1 — or a release the terminal dropped on a tmux
+        // detach) used to strand is_dragging. The main loop then called
+        // dragAutoscrollTick every 100ms tick, scrolling and MOVING THE
+        // CURSOR until the next click. Checked AFTER dispatch so the
+        // transition itself is covered, not just later keys.
+        if (self.mode != .normal and self.is_dragging) {
+            self.is_dragging = false;
+            self.has_dragged = false;
         }
+
+        return action;
     }
 
     /// Insert pasted text (from a bracketed paste or an OSC 52 clipboard read)
@@ -1941,6 +1955,9 @@ pub const Editor = struct {
     /// Gated on `has_dragged` — a stationary click with no drag
     /// never autoscrolls even if it happened at row 0 / the last row.
     pub fn dragAutoscrollTick(self: *Editor) bool {
+        // Belt and braces with the mode-change clear in handleKey: an
+        // autoscroll must never run while a prompt or overlay is up.
+        if (self.mode != .normal) return false;
         if (!self.is_dragging or !self.has_dragged) return false;
 
         var scrolled = false;
@@ -2913,9 +2930,35 @@ pub const Editor = struct {
         if (self.undo_stack.items.len > MAX_UNDO_ENTRIES) {
             var drop: usize = MAX_UNDO_ENTRIES / 10;
             const items = self.undo_stack.items;
-            // Never split a multi-cursor group across the cut.
-            while (drop < items.len and items[drop].group_id != 0 and
-                items[drop].group_id == items[drop - 1].group_id) drop += 1;
+            // Never split a multi-cursor group across the cut. Walking
+            // FORWARD to the next boundary is only safe while a boundary
+            // exists ahead: when the group at the cut runs all the way to
+            // the top of the stack — a replace-all with more matches than
+            // the cap — "forward to the boundary" meant the end of the
+            // array, so the whole stack was freed, including entries
+            // pushed moments earlier for an operation still being built.
+            // That silently left the operation partly un-undoable.
+            //
+            // Try backward first (drop less, always a clean boundary),
+            // and if the entire retained range is one group, skip
+            // eviction this round and let the cap be exceeded until the
+            // group finishes.
+            const cut_group = items[drop].group_id;
+            if (cut_group != 0 and cut_group == items[items.len - 1].group_id) {
+                var back = drop;
+                while (back > 0 and items[back].group_id == cut_group) back -= 1;
+                if (back == 0) {
+                    // One group spans everything. Keep it intact unless it
+                    // has grown past a hard backstop, where bounding
+                    // memory has to win.
+                    if (items.len <= 2 * MAX_UNDO_ENTRIES) return;
+                } else {
+                    drop = back + 1;
+                }
+            } else {
+                while (drop < items.len and items[drop].group_id != 0 and
+                    items[drop].group_id == items[drop - 1].group_id) drop += 1;
+            }
             for (items[0..drop]) |entry| {
                 if (entry.deleted) |d| self.allocator.free(d);
             }
@@ -6267,4 +6310,45 @@ test "replace-and-next never re-matches inside its own replacement" {
     _ = ed.handleKey(.escape);
     got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
     try std.testing.expectEqualStrings("aa b aa", got);
+}
+
+test "undo cap never evicts an in-progress group" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+
+    // Simulate a replace-all bigger than the cap: one group id, pushed
+    // entry by entry. The old eviction walked forward to a group
+    // boundary, found none before the end of the array, and freed the
+    // whole stack — leaving the operation partly un-undoable.
+    const gid = ed.nextUndoGroupId();
+    var i: usize = 0;
+    while (i < Editor.MAX_UNDO_ENTRIES + 500) : (i += 1) {
+        ed.pushUndoGrouped(0, null, 1, gid);
+    }
+    try std.testing.expect(ed.undo_stack.items.len > 0);
+    // Every retained entry still belongs to the group being built.
+    for (ed.undo_stack.items) |e| try std.testing.expectEqual(gid, e.group_id);
+
+    // And the backstop still bounds memory.
+    try std.testing.expect(ed.undo_stack.items.len <= 2 * Editor.MAX_UNDO_ENTRIES);
+}
+
+test "a mode change mid-drag cannot strand the autoscroll" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+    for ("hello world") |c| _ = ed.handleKey(.{ .char = c });
+
+    // Press and drag, then open search while the button is still held —
+    // the release event never arrives in normal mode.
+    _ = ed.handleKey(.{ .mouse_click = .{ .row = 0, .col = 8 } });
+    _ = ed.handleKey(.{ .mouse_drag = .{ .row = 0, .col = 12 } });
+    try std.testing.expect(ed.is_dragging);
+
+    _ = ed.handleKey(.{ .ctrl = 'f' });
+    try std.testing.expectEqual(Mode.search, ed.mode);
+    try std.testing.expect(!ed.is_dragging);
+    // And the tick refuses regardless.
+    try std.testing.expect(!ed.dragAutoscrollTick());
 }

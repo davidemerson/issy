@@ -406,23 +406,35 @@ pub const Buffer = struct {
 
     fn ensureLineIndex(self: *Buffer) void {
         if (self.line_index_valid) return;
-        self.line_index.clearRetainingCapacity();
-        // On allocation failure we bail with whatever fit; the flag stays
-        // false so the next call retries.
-        self.line_index.append(self.allocator, 0) catch return;
 
         const pre = self.data[0..self.gap_start];
+        const post = self.data[self.gap_end..];
+
+        // Count first, reserve once, then fill infallibly. Appending as
+        // we scanned meant an allocation failure mid-rebuild published a
+        // TRUNCATED index with the flag still false: callers then saw a
+        // short line count and a final "line" swallowing the rest of the
+        // buffer. Counting is allocation-free, so the rebuild is now
+        // all-or-nothing — on failure the previous index is left as it
+        // was, still marked invalid, and the next call retries.
+        var count: usize = 1;
+        count += std.mem.count(u8, pre, "\n");
+        count += std.mem.count(u8, post, "\n");
+        self.line_index.ensureTotalCapacity(self.allocator, count) catch return;
+
+        self.line_index.clearRetainingCapacity();
+        self.line_index.appendAssumeCapacity(0);
+
         var i: usize = 0;
         while (std.mem.indexOfScalarPos(u8, pre, i, '\n')) |nl| {
-            self.line_index.append(self.allocator, nl + 1) catch return;
+            self.line_index.appendAssumeCapacity(nl + 1);
             i = nl + 1;
         }
 
-        const post = self.data[self.gap_end..];
         i = 0;
         while (std.mem.indexOfScalarPos(u8, post, i, '\n')) |nl| {
             // Physical gap_end + nl → logical gap_start + nl.
-            self.line_index.append(self.allocator, self.gap_start + nl + 1) catch return;
+            self.line_index.appendAssumeCapacity(self.gap_start + nl + 1);
             i = nl + 1;
         }
         self.line_index_valid = true;
@@ -1193,4 +1205,34 @@ test "long filenames save at every length up to NAME_MAX" {
         defer std.testing.allocator.free(back);
         try std.testing.expectEqualStrings("content\n", back);
     }
+}
+
+test "line index rebuild is all-or-nothing under allocation failure" {
+    // A partial rebuild used to be published with the flag still false:
+    // lineCount() then reported too few lines and the last entry
+    // swallowed the rest of the buffer. Now the reserve happens up front,
+    // so a failure leaves nothing half-built and the retry succeeds.
+    const backing = std.testing.allocator;
+    var buf = try Buffer.init(backing);
+    defer buf.deinit();
+    try buf.insert(0, "one\ntwo\nthree\nfour\nfive\n");
+    const expected = buf.lineCount();
+    try std.testing.expectEqual(@as(usize, 6), expected);
+
+    // Force a rebuild under an allocator that fails every request.
+    buf.line_index_valid = false;
+    // Release the capacity too, or the rebuild needs no allocation at
+    // all and the failing allocator is never consulted.
+    buf.line_index.deinit(backing);
+    buf.line_index = .empty;
+    var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = 0 });
+    const saved = buf.allocator;
+    buf.allocator = failing.allocator();
+    _ = buf.lineCount(); // must not crash, must not publish a partial index
+    try std.testing.expect(!buf.line_index_valid);
+
+    // Retry with a working allocator: the index comes back complete.
+    buf.allocator = saved;
+    try std.testing.expectEqual(expected, buf.lineCount());
+    try std.testing.expect(buf.line_index_valid);
 }

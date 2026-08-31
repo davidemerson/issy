@@ -419,13 +419,28 @@ fn readKeyOnce() !Key {
         return .{ .char = @intCast(b) };
     }
 
-    // Multi-byte UTF-8. If the sequence is split across reads, try one
-    // refill before decoding; unicode.decode validates continuation
-    // bytes and rejects overlong/surrogate encodings, yielding U+FFFD
-    // (len 1) for malformed input so we always make progress.
+    // Multi-byte UTF-8 split across reads. Wait for the rest with the
+    // same bounded patience the escape path uses (max_split_waits ~100ms
+    // windows), resetting the count whenever bytes actually arrive.
+    //
+    // A single refill was not enough: on a laggy link the tail of a
+    // two-byte character could miss that one window, and unicode.decode
+    // then consumed just the lead byte as U+FFFD while each orphaned
+    // continuation byte became another. A typed "é" landed in the
+    // document as two replacement characters — silent corruption at
+    // input time, not a display glitch. CSI sequences already got three
+    // windows and pastes twenty; there was no reason for text to get
+    // less patience than escape sequences.
     const expected: usize = unicode.utf8Len(b);
-    if (expected > readBufAvailable()) {
+    var utf8_waits: usize = 0;
+    while (expected > readBufAvailable() and utf8_waits < max_split_waits) {
+        const before = readBufAvailable();
         fillReadBuf();
+        if (readBufAvailable() == before) {
+            utf8_waits += 1;
+        } else {
+            utf8_waits = 0; // progress — keep waiting for the remainder
+        }
     }
     const take = @min(expected, readBufAvailable());
     const r = unicode.decode(readBufSlice(0, take));
