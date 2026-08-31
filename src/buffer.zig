@@ -157,7 +157,7 @@ pub const Buffer = struct {
         var attempt: u8 = 0;
         while (true) : (attempt += 1) {
             var rand: [4]u8 = undefined;
-            std.crypto.random.bytes(&rand);
+            fsx.randomBytes(&rand);
             const hex = std.fmt.bytesToHex(rand, .lower);
             tmp_path = if (std.fs.path.dirname(target)) |dir|
                 std.fmt.bufPrint(&tmp_buf, "{s}/.{s}.{s}.issy-tmp", .{

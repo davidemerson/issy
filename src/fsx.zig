@@ -331,6 +331,17 @@ pub fn openSwapNoFollow(path: []const u8) !File {
     return .{ .handle = fd };
 }
 
+/// Fill `buf` with random bytes (used for temp-name uniqueness; O_EXCL
+/// provides the actual collision safety). 0.16 removed the ambient
+/// std.crypto.random in favor of the Io interface's csprng.
+pub fn randomBytes(buf: []u8) void {
+    if (comptime !is_zig_016) {
+        std.crypto.random.bytes(buf);
+        return;
+    }
+    io().random(buf);
+}
+
 /// Best-effort fsync of the directory containing `path`, making a
 /// rename that just landed there durable. Failures are deliberately
 /// ignored: some filesystems refuse directory fsync (EINVAL), and once
