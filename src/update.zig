@@ -32,6 +32,7 @@ const Ed25519 = std.crypto.sign.Ed25519;
 const config_mod = @import("config.zig");
 const build_info = @import("build_info.zig");
 const update_key = @import("update_key.zig");
+const update_config = @import("update_config.zig");
 const editor_mod = @import("editor.zig");
 const term = @import("term.zig");
 
@@ -55,7 +56,11 @@ pub const UpdateState = struct {
     }
 };
 
-const base_url = "https://github.com/davidemerson/issy/releases/latest/download/";
+// The real origin. update_config.base_url_override is null in every
+// normally-built binary (build.zig rewrites that file on each configure),
+// so this folds at comptime and no override survives into a release.
+const default_base_url = "https://github.com/davidemerson/issy/releases/latest/download/";
+const base_url = update_config.base_url_override orelse default_base_url;
 const commit_url = base_url ++ "commit.txt";
 const sums_url = base_url ++ "sha256sums.txt";
 const sig_url = base_url ++ "sha256sums.txt.sig";
@@ -470,7 +475,7 @@ fn writeAtomic(path: []const u8, content: []const u8) !void {
 
 // ── Phase 3: in-session re-exec ──
 
-pub const min_idle_ms_default: u64 = 60_000;
+pub const min_idle_ms_default: u64 = update_config.min_idle_ms_override orelse 60_000;
 const resume_file_version: u32 = 1;
 const resume_max_age_ns: i128 = 5 * std.time.ns_per_min;
 

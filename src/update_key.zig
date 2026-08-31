@@ -18,12 +18,18 @@
 //! sha256sums.txt from the latest release, there is no backward
 //! compatibility window to manage.
 
-pub const public_key: [32]u8 = .{
+const update_config = @import("update_config.zig");
+
+/// The real, committed release key. Overridden only by a TEST build
+/// (see build.zig's writeUpdateConfig); null in every shipped binary.
+const release_public_key: [32]u8 = .{
     0xd3, 0xe0, 0x5f, 0x42, 0x90, 0x18, 0xa4, 0xbe,
     0x84, 0xf1, 0x8a, 0xa7, 0x9f, 0x83, 0x43, 0xeb,
     0x11, 0xae, 0xde, 0xa1, 0xc6, 0xe1, 0x46, 0x75,
     0x79, 0x66, 0x74, 0x4c, 0x24, 0xec, 0xb5, 0xb1,
 };
+
+pub const public_key: [32]u8 = update_config.public_key_override orelse release_public_key;
 
 pub fn isConfigured() bool {
     for (public_key) |b| {

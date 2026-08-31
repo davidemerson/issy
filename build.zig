@@ -32,10 +32,28 @@ pub fn build(b: *std.Build) void {
     const release_opt = b.option(bool, "release", "Mark build_info as a release build") orelse false;
     const commit_epoch_opt = b.option([]const u8, "commit-epoch", "Override the commit timestamp embedded in build_info (unix seconds); pairs with -Dcommit for builds with no .git");
 
+    // TEST-ONLY update seams. These exist so the integration suite can
+    // point a throwaway binary at a loopback fixture server signed with
+    // a throwaway key. A build with no -Dupdate-* flag rewrites
+    // src/update_config.zig back to all-null on EVERY configure, so an
+    // override can never survive into a release binary and an
+    // accidentally-overridden tree self-heals on the next plain build.
+    const update_base_url_opt = b.option([]const u8, "update-base-url", "TEST ONLY: base URL for update artifacts; must end in '/'");
+    const update_pubkey_opt = b.option([]const u8, "update-pubkey", "TEST ONLY: Ed25519 manifest-verification public key, 64 hex chars");
+    const update_min_idle_opt = b.option([]const u8, "update-min-idle-ms", "TEST ONLY: idle milliseconds before in-session auto-apply");
+
     // Generate src/build_info.zig with version + commit SHA + build type.
     // Runs at configure time so `@import("build_info.zig")` from main.zig works.
     writeBuildInfo(b, commit_opt, release_opt, commit_epoch_opt) catch |err| {
         std.debug.print("warning: failed to write build_info.zig ({s}); using dev fallback\n", .{@errorName(err)});
+    };
+
+    // Fatal on failure, unlike writeBuildInfo's warn-and-continue: if
+    // this write fails while a stale override file is on disk, we would
+    // ship a binary pointed at someone else's URL or key.
+    writeUpdateConfig(b, update_base_url_opt, update_pubkey_opt, update_min_idle_opt) catch |err| {
+        std.debug.print("error: failed to write src/update_config.zig ({s})\n", .{@errorName(err)});
+        std.process.exit(1);
     };
 
     const exe = b.addExecutable(.{
@@ -160,6 +178,124 @@ pub fn build(b: *std.Build) void {
     // keygen prints a PKCS#8 private key to stdout, which in CI would
     // land in a public Actions log.
     test_step.dependOn(&keygen_exe.step);
+}
+
+// Writes src/update_config.zig — the TEST-ONLY seams that let the
+// integration suite drive the update path against a local fixture
+// server without touching the network or the release signing key.
+//
+// Safety properties, which are the whole reason this is a generated
+// file rather than a runtime env var or config key:
+//   * A plain `zig build` (no -Dupdate-* flags) rewrites this file with
+//     all-null values on EVERY configure, so a tree that was once built
+//     with overrides heals itself and there is no persistent state to
+//     forget to reset.
+//   * With the values null, `orelse` folds at comptime: a release binary
+//     contains no override branch, string, or symbol at all.
+//   * A malformed value is a hard build failure, never a silent
+//     fall-back to the release defaults — so a binary that "looks"
+//     release-keyed but isn't cannot exist.
+//   * Any override build prints a warning and stamps `test-update` into
+//     `issy --version`, which the CLI test asserts is absent from a
+//     normally-built binary.
+fn writeUpdateConfig(b: *std.Build, url: ?[]const u8, pubkey_hex: ?[]const u8, min_idle: ?[]const u8) !void {
+    const allocator = b.allocator;
+
+    if (url) |u| {
+        if (!std.mem.startsWith(u8, u, "http://") and !std.mem.startsWith(u8, u, "https://")) {
+            std.debug.print("error: -Dupdate-base-url must start with http:// or https://\n", .{});
+            std.process.exit(1);
+        }
+        // The asset URL is built as base_url ++ asset_name.
+        if (!std.mem.endsWith(u8, u, "/")) {
+            std.debug.print("error: -Dupdate-base-url must end with '/'\n", .{});
+            std.process.exit(1);
+        }
+    }
+    if (pubkey_hex) |h| {
+        if (h.len != 64 or !isHexN(h)) {
+            std.debug.print("error: -Dupdate-pubkey must be exactly 64 hex characters\n", .{});
+            std.process.exit(1);
+        }
+    }
+    if (min_idle) |m| {
+        if (m.len == 0 or !isDecimal(m)) {
+            std.debug.print("error: -Dupdate-min-idle-ms must be decimal\n", .{});
+            std.process.exit(1);
+        }
+    }
+
+    var url_buf: [512]u8 = undefined;
+    const url_line = if (url) |u|
+        try std.fmt.bufPrint(&url_buf, "\"{s}\"", .{u})
+    else
+        "null";
+
+    var key_buf: [512]u8 = undefined;
+    const key_line = if (pubkey_hex) |h| blk: {
+        var raw: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&raw, h) catch {
+            std.debug.print("error: -Dupdate-pubkey is not valid hex\n", .{});
+            std.process.exit(1);
+        };
+        var w: usize = 0;
+        var out: [512]u8 = undefined;
+        w += (try std.fmt.bufPrint(out[w..], ".{{ ", .{})).len;
+        for (raw) |byte| {
+            w += (try std.fmt.bufPrint(out[w..], "0x{x:0>2}, ", .{byte})).len;
+        }
+        w += (try std.fmt.bufPrint(out[w..], "}}", .{})).len;
+        @memcpy(key_buf[0..w], out[0..w]);
+        break :blk key_buf[0..w];
+    } else "null";
+
+    const any = url != null or pubkey_hex != null or min_idle != null;
+
+    const content = try std.fmt.allocPrint(allocator,
+        \\// Generated by build.zig. Do not edit; do not commit.
+        \\//
+        \\// TEST-ONLY overrides for the auto-update path. A plain
+        \\// `zig build` rewrites this file with all-null values, so a
+        \\// release binary never contains an override.
+        \\pub const base_url_override: ?[]const u8 = {s};
+        \\pub const public_key_override: ?[32]u8 = {s};
+        \\pub const min_idle_ms_override: ?u64 = {s};
+        \\pub const any_override: bool = {s};
+        \\
+    , .{ url_line, key_line, min_idle orelse "null", if (any) "true" else "false" });
+    defer allocator.free(content);
+
+    if (any) {
+        std.debug.print("warning: building with TEST update overrides — do not ship this binary\n", .{});
+    }
+
+    const path = "src/update_config.zig";
+    const existing = if (zig_016)
+        std.Io.Dir.cwd().readFileAlloc(b.graph.io, path, allocator, .limited(4096)) catch null
+    else
+        std.fs.cwd().readFileAlloc(allocator, path, 4096) catch null;
+    if (existing) |buf| {
+        defer allocator.free(buf);
+        if (std.mem.eql(u8, buf, content)) return;
+    }
+
+    if (zig_016) {
+        const file = try std.Io.Dir.cwd().createFile(b.graph.io, path, .{});
+        defer file.close(b.graph.io);
+        try file.writeStreamingAll(b.graph.io, content);
+    } else {
+        const file = try std.fs.cwd().createFile(path, .{});
+        defer file.close();
+        try file.writeAll(content);
+    }
+}
+
+fn isHexN(s: []const u8) bool {
+    for (s) |c| {
+        const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+        if (!ok) return false;
+    }
+    return true;
 }
 
 // Writes src/build_info.zig with version, commit SHA, build type, and

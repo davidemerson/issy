@@ -4,24 +4,34 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(dirname "$SCRIPT_DIR")"
-ISSY="$REPO/zig-out/bin/issy"
 
 command -v expect >/dev/null || { echo "ERROR: expect is not installed"; exit 1; }
 
+# All suite mktemps land under one trap-cleaned directory, so a suite
+# that aborts mid-run (uncaught Tcl error) can't leak temp dirs. The
+# trap also restores src/update_config.zig, which the seam-enabled build
+# below rewrites (a plain `zig build` resets it to all-null).
+TMPDIR="$(mktemp -d)"
+export TMPDIR
+SUITE_PREFIX="$TMPDIR/prefix"
+trap 'cd "$REPO" && zig build --prefix "$TMPDIR/heal" >/dev/null 2>&1; rm -rf "$TMPDIR"' EXIT
+
 # Build. A failed build must fail the run — testing a stale binary
 # reports results for code that no longer exists.
+#
+# The suite binary is built with the update origin pointed at a closed
+# port and installed OUTSIDE zig-out. Two reasons: the update worker can
+# then never reach github.com from a test (it fails instantly on
+# connect), and a developer's zig-out/bin/issy is never replaced by a
+# binary carrying test-only overrides. Suites that need a real origin
+# build their own binary.
 echo "Building issy..."
-if ! (cd "$REPO" && zig build 2>&1); then
+if ! (cd "$REPO" && zig build --prefix "$SUITE_PREFIX" -Dupdate-base-url=http://127.0.0.1:9/ 2>&1); then
     echo "BUILD FAILED"
     exit 1
 fi
+ISSY="$SUITE_PREFIX/bin/issy"
 echo ""
-
-# All suite mktemps land under one trap-cleaned directory, so a suite
-# that aborts mid-run (uncaught Tcl error) can't leak temp dirs.
-TMPDIR="$(mktemp -d)"
-export TMPDIR
-trap 'rm -rf "$TMPDIR"' EXIT
 
 # Everything past this point runs against a scratch HOME. Two separate
 # leaks made that necessary: a clean tree stamps build_type=.release, so
@@ -80,6 +90,12 @@ done
 NOW_FINGERPRINT="$(find "$ISSY_TESTS_REAL_HOME/.cache/issy" -type f -printf '%p %s %T@\n' 2>/dev/null | sort)"
 if [ "$NOW_FINGERPRINT" != "$REAL_CACHE_FINGERPRINT" ]; then
     echo "ISOLATION FAILURE: the suite modified $ISSY_TESTS_REAL_HOME/.cache/issy"
+    FAIL=$((FAIL + 1))
+fi
+
+# A shipped binary must never carry the test-only update overrides.
+if [ -x "$REPO/zig-out/bin/issy" ] && "$REPO/zig-out/bin/issy" --version 2>/dev/null | grep -q "test-update"; then
+    echo "ISOLATION FAILURE: zig-out/bin/issy carries test update overrides"
     FAIL=$((FAIL + 1))
 fi
 

@@ -19,3 +19,4 @@ src/build_info.zig
 
 # Python bytecode (from .github/scripts/)
 __pycache__/
+src/update_config.zig

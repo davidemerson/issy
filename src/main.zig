@@ -13,6 +13,7 @@ const editor_mod = @import("editor.zig");
 const render_mod = @import("render.zig");
 const print_mod = @import("print.zig");
 const update_mod = @import("update.zig");
+const update_config = @import("update_config.zig");
 const build_info = @import("build_info.zig");
 
 comptime {
@@ -160,10 +161,14 @@ fn realMain() !void {
     if (args.show_version) {
         const stdout = fsx.File.stdout();
         var buf: [128]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, "issy {s} ({s} {s})\n", .{
+        // A binary built with TEST update overrides identifies itself, so
+        // one can never be mistaken for a shippable build (the CLI test
+        // asserts this marker is absent from a normally-built binary).
+        const line = std.fmt.bufPrint(&buf, "issy {s} ({s} {s}{s})\n", .{
             build_info.version,
             build_info.commit_sha[0..@min(7, build_info.commit_sha.len)],
             @tagName(build_info.build_type),
+            if (update_config.any_override) " test-update" else "",
         }) catch "issy\n";
         try stdout.writeAll(line);
         return;
