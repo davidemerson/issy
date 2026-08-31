@@ -924,10 +924,13 @@ pub const Renderer = struct {
             // Column within sub-line — must be in visual cols, not byte
             // cols, or the cursor drifts on tab-bearing lines.
             const col_in_sub = ed.cursorVisualColInSubLine();
-            const indent: u16 = if (sub > 0) @intCast(@min(ed.continuationIndentCols(ed.cursor.line), std.math.maxInt(u16))) else 0;
+            const indent: usize = if (sub > 0) ed.continuationIndentCols(ed.cursor.line) else 0;
+            // Saturating: a tab-heavy or enormous line can push the
+            // visual column past u16, and an unchecked add here used to
+            // panic in safe builds.
             term.moveCursor(
                 @min(vis_row, self.rows -| 1),
-                code_start + indent + @as(u16, @intCast(@min(col_in_sub, std.math.maxInt(u16)))),
+                screenColSat(code_start, indent + col_in_sub),
             );
         } else {
             const cursor_row: u16 = if (ed.cursor.line >= ed.scroll_top)
@@ -935,8 +938,7 @@ pub const Renderer = struct {
             else
                 0;
             const cursor_visual = ed.byteColToVisualCol(ed.cursor.line, ed.cursor.col);
-            const cursor_col = code_start + @as(u16, @intCast(@min(cursor_visual, std.math.maxInt(u16)))) -| @as(u16, @intCast(@min(ed.scroll_left, std.math.maxInt(u16))));
-            term.moveCursor(cursor_row, cursor_col);
+            term.moveCursor(cursor_row, screenColSat(code_start, cursor_visual -| ed.scroll_left));
         }
 
         term.setCursorShape(ed.config.cursor_style);

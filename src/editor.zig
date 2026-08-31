@@ -1706,7 +1706,10 @@ pub const Editor = struct {
         const slice_len = @min(@as(usize, 4), info.len - byte_col);
         const data = self.buf.contiguousSlice(info.start + byte_col, slice_len, &tmp);
         if (data.len == 0) return 1;
-        return @max(@as(usize, unicode.utf8Len(data[0])), 1);
+        // Clamp to the bytes actually on the line: a truncated multi-byte
+        // lead at line end claims more bytes than exist, and advancing by
+        // the claim used to push cursor.col past the line length.
+        return @min(@max(@as(usize, unicode.utf8Len(data[0])), 1), info.len - byte_col);
     }
 
     /// Length in bytes of the codepoint *ending* at `byte_col` on `line`.
@@ -5990,4 +5993,21 @@ test "visualColToByteCol snaps a click on either half of a wide glyph to the gly
     try std.testing.expectEqual(@as(usize, 1), ed.visualColToByteCol(0, 2));
     // visual 3 is b (byte offset 4)
     try std.testing.expectEqual(@as(usize, 4), ed.visualColToByteCol(0, 3));
+}
+
+test "cursor motion over a truncated multi-byte lead never overshoots the line" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+    // "a" + truncated 3-byte lead 0xE4 at line end (2 bytes total).
+    try ed.buf.insert(0, "a\xe4");
+    _ = ed.handleKey(.right);
+    _ = ed.handleKey(.right);
+    // Previously col jumped to 4 (past the 2-byte line); it must clamp.
+    try std.testing.expect(ed.cursor.col <= 2);
+    _ = ed.handleKey(.left);
+    _ = ed.handleKey(.{ .char = '!' });
+    var tmp: [16]u8 = undefined;
+    const got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
+    try std.testing.expectEqualStrings("a!\xe4", got);
 }

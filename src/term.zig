@@ -315,6 +315,16 @@ fn readBufSlice(start: usize, end: usize) []const u8 {
 }
 
 fn readKeyPosix() !Key {
+    // Loop instead of tail recursion: a hostile stream of stray ESC[201~
+    // markers used to recurse into readKeyPosix once per marker with no
+    // depth bound (stack overflow); this consumes them in constant stack.
+    while (true) {
+        const k = try readKeyOnce();
+        if (k != .paste_end) return k;
+    }
+}
+
+fn readKeyOnce() !Key {
     // Inside a bracketed paste body: keep handing the editor decoded text
     // chunks (never key events) until the ESC[201~ terminator is consumed.
     if (paste_active) return capturePasteBody();
@@ -376,8 +386,8 @@ fn readKeyPosix() !Key {
                         return capturePasteBody();
                     },
                     // A stray end marker outside a paste (e.g. after a
-                    // split-recovery) — skip it and read the next key.
-                    .paste_end => return readKeyPosix(),
+                    // split-recovery) — returned as-is; readKeyPosix's
+                    // loop skips it and reads the next key.
                     else => return r.key,
                 }
             }
