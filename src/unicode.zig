@@ -386,3 +386,74 @@ test "isContByte" {
     try std.testing.expect(!isContByte(0xC0));
     try std.testing.expect(!isContByte(0xFF));
 }
+
+/// Terminal display width of a codepoint: 0 for combining marks and
+/// zero-width characters, 2 for East Asian Wide/Fullwidth ranges and
+/// the common emoji blocks, 1 for everything else. A pragmatic wcwidth:
+/// the ranges cover what real files contain (CJK, Hangul, kana, emoji)
+/// without shipping the full Unicode property tables.
+pub fn charWidth(cp: u21) u2 {
+    // Zero width: combining marks, ZWJ/ZWNJ/ZWSP, variation selectors, BOM.
+    if ((cp >= 0x0300 and cp <= 0x036F) or
+        (cp >= 0x1AB0 and cp <= 0x1AFF) or
+        (cp >= 0x1DC0 and cp <= 0x1DFF) or
+        (cp >= 0x200B and cp <= 0x200F) or
+        (cp >= 0x20D0 and cp <= 0x20FF) or
+        (cp >= 0xFE00 and cp <= 0xFE0F) or
+        cp == 0xFEFF or
+        (cp >= 0xE0100 and cp <= 0xE01EF)) return 0;
+    // Wide: East Asian Wide/Fullwidth + emoji.
+    if ((cp >= 0x1100 and cp <= 0x115F) or
+        (cp >= 0x2E80 and cp <= 0x303E) or
+        (cp >= 0x3041 and cp <= 0x33FF) or
+        (cp >= 0x3400 and cp <= 0x4DBF) or
+        (cp >= 0x4E00 and cp <= 0x9FFF) or
+        (cp >= 0xA000 and cp <= 0xA4CF) or
+        (cp >= 0xA960 and cp <= 0xA97F) or
+        (cp >= 0xAC00 and cp <= 0xD7A3) or
+        (cp >= 0xF900 and cp <= 0xFAFF) or
+        (cp >= 0xFE30 and cp <= 0xFE4F) or
+        (cp >= 0xFE68 and cp <= 0xFE6B) or
+        (cp >= 0xFF00 and cp <= 0xFF60) or
+        (cp >= 0xFFE0 and cp <= 0xFFE6) or
+        (cp >= 0x1F000 and cp <= 0x1F02F) or
+        (cp >= 0x1F300 and cp <= 0x1F64F) or
+        (cp >= 0x1F680 and cp <= 0x1F6FF) or
+        (cp >= 0x1F900 and cp <= 0x1F9FF) or
+        (cp >= 0x1FA70 and cp <= 0x1FAFF) or
+        (cp >= 0x20000 and cp <= 0x2FFFD) or
+        (cp >= 0x30000 and cp <= 0x3FFFD)) return 2;
+    return 1;
+}
+
+/// Sum of charWidth over a UTF-8 string — the number of terminal
+/// columns the string occupies when rendered.
+pub fn stringWidth(bytes: []const u8) usize {
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const r = decode(bytes[i..]);
+        w += charWidth(r.codepoint);
+        i += @max(@as(usize, r.len), 1);
+    }
+    return w;
+}
+
+test "charWidth: ASCII narrow, CJK and emoji wide, combining zero" {
+    try std.testing.expectEqual(@as(u2, 1), charWidth('a'));
+    try std.testing.expectEqual(@as(u2, 1), charWidth(0xE9)); // é
+    try std.testing.expectEqual(@as(u2, 2), charWidth(0x4F60)); // 你
+    try std.testing.expectEqual(@as(u2, 2), charWidth(0x597D)); // 好
+    try std.testing.expectEqual(@as(u2, 2), charWidth(0x1F680)); // 🚀
+    try std.testing.expectEqual(@as(u2, 2), charWidth(0x30A2)); // ア
+    try std.testing.expectEqual(@as(u2, 2), charWidth(0xAC00)); // 가
+    try std.testing.expectEqual(@as(u2, 0), charWidth(0x0301)); // combining acute
+    try std.testing.expectEqual(@as(u2, 0), charWidth(0x200D)); // ZWJ
+    try std.testing.expectEqual(@as(u2, 1), charWidth(0x2192)); // →
+}
+
+test "stringWidth mixes widths correctly" {
+    // "a你b" = 1 + 2 + 1
+    try std.testing.expectEqual(@as(usize, 4), stringWidth("a\xe4\xbd\xa0b"));
+    try std.testing.expectEqual(@as(usize, 2), stringWidth("\xf0\x9f\x9a\x80")); // 🚀
+}

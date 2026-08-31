@@ -369,15 +369,24 @@ pub const Renderer = struct {
                     else
                         false;
 
-                    // In non-wrap mode, skip chars before scroll_left
+                    // In non-wrap mode, skip chars before scroll_left.
+                    // The skip must advance by the same decode + width
+                    // rules as the draw path below, or a line with
+                    // invalid UTF-8 or wide glyphs renders shifted when
+                    // horizontally scrolled.
                     if (!wrap_enabled and buf_col < ed.scroll_left) {
                         if (ch == '\t') {
                             const tw = ed.effectiveTabWidth();
                             buf_col += tw - (buf_col % tw);
+                            byte_idx += cp_len;
+                        } else if (ch >= 0x80) {
+                            const r = unicode.decode(line_data[byte_idx..]);
+                            buf_col += unicode.charWidth(r.codepoint);
+                            byte_idx += @max(@as(usize, r.len), 1);
                         } else {
                             buf_col += 1;
+                            byte_idx += cp_len;
                         }
-                        byte_idx += cp_len;
                         continue;
                     }
 
@@ -420,16 +429,32 @@ pub const Renderer = struct {
                         // byte (0xC2..0xF4) in cell.char would emit it as
                         // U+00C2..U+00F4 — that is the source of the
                         // garbled `â` glyphs the user reported.
+                        //
+                        // A wide (CJK/emoji) glyph occupies two columns:
+                        // the glyph cell plus a char==0 continuation
+                        // sentinel that flushDiff never emits — writing
+                        // anything at the second column would split the
+                        // glyph and blank it. Zero-width codepoints
+                        // (combining marks) draw nothing.
                         const r = unicode.decode(line_data[byte_idx..]);
-                        if (col < code_end) {
+                        const cw: usize = unicode.charWidth(r.codepoint);
+                        if (cw > 0 and col < code_end) {
                             const cell = self.cellAt(screen_row, col);
                             cell.char = r.codepoint;
                             cell.fg = tokenColor(tokens, byte_idx, theme);
                             if (in_sel) cell.bg = theme.selection;
                             if (in_cur) cell.underline = true;
                             col += 1;
+                            if (cw == 2 and col < code_end) {
+                                const cont = self.cellAt(screen_row, col);
+                                cont.char = 0;
+                                cont.fg = cell.fg;
+                                if (in_sel) cont.bg = theme.selection;
+                                if (in_cur) cont.underline = true;
+                                col += 1;
+                            }
                         }
-                        buf_col += 1;
+                        buf_col += cw;
                         byte_idx += r.len;
                         continue;
                     }
@@ -547,11 +572,25 @@ pub const Renderer = struct {
         const cap = @min(max_col, self.cols);
         while (i < text.len and c < cap) {
             const r = unicode.decode(text[i..]);
+            // Same wide-glyph convention as the content area: glyph cell
+            // plus a char==0 continuation sentinel; zero-width skipped.
+            const w = unicode.charWidth(r.codepoint);
+            if (w == 0) {
+                i += r.len;
+                continue;
+            }
             const cell = self.cellAt(row, c);
             cell.char = r.codepoint;
             cell.fg = fg;
             cell.dim = dim;
             c += 1;
+            if (w == 2 and c < cap) {
+                const cont = self.cellAt(row, c);
+                cont.char = 0;
+                cont.fg = fg;
+                cont.dim = dim;
+                c += 1;
+            }
             i += r.len;
         }
         return c;
@@ -583,9 +622,12 @@ pub const Renderer = struct {
         const msg = ed.getStatusMsg();
         var name = ed.getFilename();
         var ellipsized = false;
-        if (msg.len > 0) {
-            const overhead: usize = pos_str.len + 5 + @as(usize, if (ed.modified) 2 else 0);
-            const budget = @as(usize, right_edge) -| msg.len -| overhead;
+        {
+            // With no message pending the filename still may not overrun
+            // the right-aligned line:col field.
+            const msg_overhead: usize = if (msg.len > 0) msg.len + 3 else 0;
+            const overhead: usize = pos_str.len + 2 + @as(usize, if (ed.modified) 2 else 0) + msg_overhead;
+            const budget = @as(usize, right_edge) -| overhead;
             if (name.len > budget) {
                 ellipsized = true;
                 if (budget <= 1) {
@@ -791,6 +833,11 @@ pub const Renderer = struct {
                 const curr = self.cellAt(row, col);
                 const prev = self.prevAt(row, col);
 
+                // Wide-glyph continuation sentinel: the glyph in the cell
+                // to the left already covers this column on the real
+                // terminal; emitting anything here would split it.
+                if (curr.char == 0) continue;
+
                 if (curr.char == prev.char and
                     colorEq(curr.fg, prev.fg) and
                     colorEq(curr.bg, prev.bg) and
@@ -847,18 +894,18 @@ pub const Renderer = struct {
         }
 
         if (ed.mode == .search or ed.mode == .command or ed.mode == .replace) {
-            // Prompt text renders one cell per codepoint, so the
-            // hardware cursor must count codepoints, not bytes.
-            const search_cps = unicode.countCodepoints(ed.search_pattern[0..ed.search_len]);
+            // Prompt text renders width-aware cells, so the hardware
+            // cursor must count display columns, not bytes or codepoints.
+            const search_w = unicode.stringWidth(ed.search_pattern[0..ed.search_len]);
             const prompt_col: u16 = switch (ed.mode) {
-                .search => @intCast(@min(search_cps, self.cols - 1)),
-                .command => @intCast(@min(unicode.countCodepoints(ed.prompt_buf[0..ed.prompt_len]), self.cols - 1)),
+                .search => @intCast(@min(search_w, self.cols - 1)),
+                .command => @intCast(@min(unicode.stringWidth(ed.prompt_buf[0..ed.prompt_len]), self.cols - 1)),
                 .replace => blk: {
                     if (ed.replace_phase == .search) {
-                        break :blk @intCast(@min(search_cps, self.cols - 1));
+                        break :blk @intCast(@min(search_w, self.cols - 1));
                     } else {
-                        const repl_cps = unicode.countCodepoints(ed.getReplaceText());
-                        break :blk @intCast(@min(search_cps + 4 + repl_cps, self.cols - 1));
+                        const repl_w = unicode.stringWidth(ed.getReplaceText());
+                        break :blk @intCast(@min(search_w + 4 + repl_w, self.cols - 1));
                     }
                 },
                 else => 0,
@@ -1325,4 +1372,27 @@ test "status message stays visible past a long filename" {
     try std.testing.expect(std.mem.indexOf(u8, &row_text, "Save failed: AccessDenied") != null);
     // The truncated filename leads with an ellipsis.
     try std.testing.expectEqual(@as(u21, 0x2026), renderer.cellAt(status_row, 0).char);
+}
+
+test "wide glyph occupies a glyph cell plus a continuation sentinel" {
+    var cfg = config_mod.Config.init();
+    cfg.line_numbers = false;
+    cfg.left_padding = 0;
+    cfg.gutter_padding = 0;
+
+    var ed = try editor_mod.Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+    try ed.buf.insert(0, "\xe4\xbd\xa0x"); // 你x
+    ed.visible_cols = 20;
+    ed.visible_rows = 4;
+
+    var renderer = try Renderer.init(std.testing.allocator, 4, 20);
+    defer renderer.deinit();
+    _ = renderer.paintFrame(&ed);
+
+    try std.testing.expectEqual(@as(u21, 0x4F60), renderer.cellAt(0, 0).char);
+    // Continuation sentinel — flushDiff must never emit this cell.
+    try std.testing.expectEqual(@as(u21, 0), renderer.cellAt(0, 1).char);
+    // The next glyph lands after the wide pair.
+    try std.testing.expectEqual(@as(u21, 'x'), renderer.cellAt(0, 2).char);
 }

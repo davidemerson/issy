@@ -1431,14 +1431,18 @@ pub const Editor = struct {
                 const b = data[i];
                 if (b == '\n') break;
 
-                const cp_visual: usize = if (b == '\t')
-                    (tw - (visual % tw))
-                else
-                    1;
-                const cp_len: usize = if (b == '\t' or b < 0x80)
-                    1
-                else
-                    @max(@as(usize, unicode.utf8Len(b)), 1);
+                var cp_visual: usize = 1;
+                var cp_len: usize = 1;
+                if (b == '\t') {
+                    cp_visual = tw - (visual % tw);
+                } else if (b >= 0x80) {
+                    // Wide glyphs consume two columns of the wrap width;
+                    // measuring them as one used to overfill visual rows
+                    // so wrapped CJK lines spilled past the margin.
+                    const r = unicode.decode(data[i..]);
+                    cp_visual = unicode.charWidth(r.codepoint);
+                    cp_len = @max(@as(usize, r.len), 1);
+                }
 
                 // If this codepoint would push us past avail, stop here.
                 if (visual + cp_visual > avail) break;
@@ -2237,7 +2241,11 @@ pub const Editor = struct {
                 i += 1;
             } else {
                 const r = unicode.decode(data[i..]);
-                visual += 1;
+                // CJK/emoji occupy two terminal columns, combining marks
+                // zero — the same widths the renderer draws with, so the
+                // hardware cursor lands on the glyph the buffer position
+                // actually refers to.
+                visual += unicode.charWidth(r.codepoint);
                 i += @max(@as(usize, r.len), 1);
             }
         }
@@ -2274,9 +2282,12 @@ pub const Editor = struct {
                 // Defensive: landed inside a multi-byte sequence.
                 i += 1;
             } else {
-                if (target_visual <= visual) return i;
                 const r = unicode.decode(data[i..]);
-                visual += 1;
+                const w: usize = unicode.charWidth(r.codepoint);
+                // A click on either column of a wide glyph snaps to the
+                // glyph itself; zero-width codepoints are skipped over.
+                if (w > 0 and target_visual < visual + w) return i;
+                visual += w;
                 i += @max(@as(usize, r.len), 1);
             }
         }
@@ -5955,4 +5966,28 @@ test "clean quit never deletes a foreign crash-recovery swap" {
     try std.testing.expect(ed.swap_written);
     ed.removeSwap();
     try std.testing.expectError(error.FileNotFound, fsx.access(swap));
+}
+
+test "byteColToVisualCol counts wide glyphs as two columns" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+    // "a你b" — bytes: a(1) 你(3) b(1); visual: a(1) 你(2) b(1)
+    try ed.buf.insert(0, "a\xe4\xbd\xa0b");
+    try std.testing.expectEqual(@as(usize, 0), ed.byteColToVisualCol(0, 0));
+    try std.testing.expectEqual(@as(usize, 1), ed.byteColToVisualCol(0, 1));
+    try std.testing.expectEqual(@as(usize, 3), ed.byteColToVisualCol(0, 4));
+    try std.testing.expectEqual(@as(usize, 4), ed.byteColToVisualCol(0, 5));
+}
+
+test "visualColToByteCol snaps a click on either half of a wide glyph to the glyph" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+    try ed.buf.insert(0, "a\xe4\xbd\xa0b");
+    // visual 1 and 2 are the two halves of 你 (byte offset 1)
+    try std.testing.expectEqual(@as(usize, 1), ed.visualColToByteCol(0, 1));
+    try std.testing.expectEqual(@as(usize, 1), ed.visualColToByteCol(0, 2));
+    // visual 3 is b (byte offset 4)
+    try std.testing.expectEqual(@as(usize, 4), ed.visualColToByteCol(0, 3));
 }
