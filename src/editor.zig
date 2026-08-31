@@ -610,23 +610,55 @@ pub const Editor = struct {
     /// clipboard reads.
     fn insertPastedText(self: *Editor, text: []const u8) void {
         if (text.len == 0) return;
+
+        // Normalize CR line endings out of the paste stream: the buffer
+        // holds LF only (CRLF files are normalized at load and every \n
+        // re-expanded at save), so a raw \r\n pasted from a Windows
+        // terminal would save as \r\r\n, and a lone \r silently produced
+        // a mixed-endings file. (A 64 KB chunk boundary can in principle
+        // split \r|\n into one extra blank line — strictly better than
+        // corrupting the file's line endings.)
+        var norm_owned: ?[]u8 = null;
+        defer if (norm_owned) |nb| self.allocator.free(nb);
+        var body = text;
+        if (std.mem.indexOfScalar(u8, text, '\r') != null) {
+            const nb = self.allocator.alloc(u8, text.len) catch {
+                self.setStatusMessage("Paste failed: out of memory.");
+                return;
+            };
+            var w: usize = 0;
+            var i: usize = 0;
+            while (i < text.len) : (i += 1) {
+                if (text[i] == '\r') {
+                    nb[w] = '\n';
+                    w += 1;
+                    if (i + 1 < text.len and text[i + 1] == '\n') i += 1;
+                } else {
+                    nb[w] = text[i];
+                    w += 1;
+                }
+            }
+            norm_owned = nb;
+            body = nb[0..w];
+        }
+
         // Paste applies at every cursor, like typing and deletion do.
         if (self.cursors.items.len > 0) {
-            self.multiCursorInsert(text);
+            self.multiCursorInsert(body);
             return;
         }
         if (self.sel_active) self.deleteSelection();
         const pos = self.cursorBytePos();
-        self.buf.insert(pos, text) catch {
+        self.buf.insert(pos, body) catch {
             self.setStatusMessage("Paste failed: out of memory.");
             return;
         };
         // Undo record only after the insert succeeded — recording first
         // left an entry claiming bytes that never landed, and a later
         // undo then deleted real content.
-        self.pushUndo(pos, null, text.len);
+        self.pushUndo(pos, null, body.len);
         self.modified = true;
-        self.repositionCursorToBytePos(pos + text.len);
+        self.repositionCursorToBytePos(pos + body.len);
     }
 
     /// Paste the system clipboard (or the primary selection, for middle-click)
@@ -2567,6 +2599,16 @@ pub const Editor = struct {
     fn insertNewline(self: *Editor) void {
         if (self.sel_active) self.deleteSelection();
 
+        // Enter applies at every cursor like other edits (chars, delete,
+        // paste); inserting only at the primary used to leave secondaries
+        // one line off, so the NEXT keystroke edited untargeted lines.
+        // Auto-indent is skipped — each cursor would need its own line's
+        // indent and the tick must stay one grouped undo unit.
+        if (self.cursors.items.len > 0) {
+            self.multiCursorInsert("\n");
+            return;
+        }
+
         const pos = self.cursorBytePos();
         var indent_buf: [256]u8 = undefined;
         var indent_len: usize = 0;
@@ -2609,6 +2651,12 @@ pub const Editor = struct {
 
     fn insertTab(self: *Editor) void {
         if (self.sel_active) self.deleteSelection();
+
+        // Tab applies at every cursor (see insertNewline).
+        if (self.cursors.items.len > 0) {
+            self.multiCursorTab();
+            return;
+        }
 
         const pos = self.cursorBytePos();
         if (self.effectiveExpandTabs()) {
@@ -2729,6 +2777,13 @@ pub const Editor = struct {
 
     fn deleteSelection(self: *Editor) void {
         if (!self.sel_active) return;
+        // Selection operations are single-cursor operations: there is
+        // one selection, anchored to the primary. Secondary cursors kept
+        // alive across the deletion would hold stale byte positions and
+        // the next multi-cursor edit would land on text the user never
+        // targeted — so clear them (and any armed rename) first.
+        self.cursors.clearRetainingCapacity();
+        self.mc_word_len = 0;
         const sel = self.getSelectionRange() orelse return;
         if (sel.len == 0) {
             self.sel_active = false;
@@ -3098,6 +3153,12 @@ pub const Editor = struct {
                 self.buf.delete(pos, pattern.len);
                 self.buf.insert(pos, replacement) catch return;
                 self.modified = true;
+                // Resume past the replacement, as replaceAll does:
+                // findNext searches from cursor+1, and a cursor left at
+                // the match start used to re-match the pattern inside
+                // its own replacement forever when the replacement
+                // contains the pattern (e.g. "a" -> "aa").
+                self.repositionCursorToBytePos(pos + replacement.len -| 1);
             }
         }
         self.findNext();
@@ -3378,6 +3439,39 @@ pub const Editor = struct {
         self.ensureCursorVisible();
     }
 
+    /// Tab at every cursor: each gets its own expansion (spaces to ITS
+    /// next tab stop, or a literal tab), one undo group per tick.
+    fn multiCursorTab(self: *Editor) void {
+        var positions: [MAX_CURSORS]usize = undefined;
+        const n = self.collectCursorPositionsDesc(&positions);
+        if (n == 0) return;
+
+        const group_id = self.nextUndoGroupId();
+        const expand = self.effectiveExpandTabs();
+        const tw = @min(self.effectiveTabWidth(), 8);
+        const spaces: [8]u8 = .{' '} ** 8;
+
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const pos = positions[i];
+            var bytes: []const u8 = "\t";
+            if (expand) {
+                const lc = self.bytePosToLineCol(pos);
+                const vis = self.byteColToVisualCol(lc.line, lc.col);
+                const need = tw - @as(u8, @intCast(vis % tw));
+                bytes = spaces[0..need];
+            }
+            self.pushUndoGrouped(pos, null, bytes.len, group_id);
+            self.buf.insert(pos, bytes) catch return;
+            for (0..i) |j| positions[j] += bytes.len;
+            positions[i] = pos + bytes.len;
+        }
+
+        self.assignCursorPositions(positions[0..n]);
+        self.modified = true;
+        self.ensureCursorVisible();
+    }
+
     const DeleteDir = enum { forward, backward };
 
     /// Delete one byte at every active cursor. `.backward` is Backspace
@@ -3393,9 +3487,13 @@ pub const Editor = struct {
         var i: usize = 0;
         while (i < n) : (i += 1) {
             const cursor_pos = positions[i];
-            // Compute the byte position to delete and what the cursor's
-            // new position becomes after the delete.
+            // Compute the byte range to delete and what the cursor's new
+            // position becomes. Whole codepoints, like the single-cursor
+            // paths: deleting exactly one byte used to strand invalid
+            // UTF-8 lead bytes at every cursor on non-ASCII text, and
+            // Ctrl+S then persisted the corruption to disk.
             var delete_pos: usize = undefined;
+            var del_len: usize = undefined;
             var new_cursor_pos: usize = undefined;
             switch (dir) {
                 .backward => {
@@ -3405,7 +3503,13 @@ pub const Editor = struct {
                         positions[i] = 0;
                         continue;
                     }
-                    delete_pos = cursor_pos - 1;
+                    // Walk back over continuation bytes (at most 3) to
+                    // include the codepoint's lead byte.
+                    var k: usize = 0;
+                    while (k < 3 and cursor_pos > k + 1 and
+                        unicode.isContByte(self.buf.byteAt(cursor_pos - 1 - k))) k += 1;
+                    del_len = k + 1;
+                    delete_pos = cursor_pos - del_len;
                     new_cursor_pos = delete_pos;
                 },
                 .forward => {
@@ -3413,23 +3517,25 @@ pub const Editor = struct {
                         // Nothing to delete at the end of the buffer.
                         continue;
                     }
+                    const claim = @max(@as(usize, unicode.utf8Len(self.buf.byteAt(cursor_pos))), 1);
+                    del_len = @min(claim, self.buf.logicalLen() - cursor_pos);
                     delete_pos = cursor_pos;
                     new_cursor_pos = cursor_pos;
                 },
             }
 
-            var tmp: [1]u8 = undefined;
-            const ch = self.buf.contiguousSlice(delete_pos, 1, &tmp);
+            var tmp: [4]u8 = undefined;
+            const ch = self.buf.contiguousSlice(delete_pos, del_len, &tmp);
             const saved = self.allocator.dupe(u8, ch) catch continue;
             self.pushUndoGrouped(delete_pos, saved, 0, group_id);
-            self.buf.delete(delete_pos, 1);
+            self.buf.delete(delete_pos, del_len);
 
             // Update all previously-processed positions (indices < i,
             // positions > delete_pos by construction of desc sort): they
-            // each shift left by 1 because we removed a byte earlier in
-            // the buffer.
+            // each shift left because bytes were removed earlier in the
+            // buffer.
             for (0..i) |j| {
-                if (positions[j] > 0) positions[j] -= 1;
+                positions[j] -|= del_len;
             }
             positions[i] = new_cursor_pos;
         }
@@ -3485,6 +3591,11 @@ pub const Editor = struct {
             self.cursor.col = start;
             self.cursor.col_want = start;
             self.mc_word_len = word.len;
+            // The armed word supersedes any shift/mouse selection: the
+            // first typed character must replace the word at every
+            // cursor, not the selection (whose deletion would shift the
+            // secondaries' positions out from under them).
+            self.sel_active = false;
         }
     }
 
@@ -6039,4 +6150,121 @@ test "horizontal scroll window respects right_margin" {
     // The renderer draws only right_margin (40) columns; the cursor's
     // on-screen offset must fit inside them, not the terminal's 100.
     try std.testing.expect(80 - ed.scroll_left < 40);
+}
+
+test "multi-cursor backspace deletes whole codepoints, never splitting UTF-8" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+    // "éfoo\néfoo" — é is 2 bytes; cursors after each é.
+    try ed.buf.insert(0, "\xc3\xa9foo\n\xc3\xa9foo");
+    ed.cursor.line = 0;
+    ed.cursor.col = 2;
+    ed.cursor.col_want = 2;
+    try ed.cursors.append(std.testing.allocator, .{ .line = 1, .col = 2, .col_want = 2 });
+
+    _ = ed.handleKey(.backspace);
+    var tmp: [32]u8 = undefined;
+    var got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
+    try std.testing.expectEqualStrings("foo\nfoo", got);
+
+    // One undo restores both codepoints.
+    _ = ed.handleKey(.{ .ctrl = 'z' });
+    got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
+    try std.testing.expectEqualStrings("\xc3\xa9foo\n\xc3\xa9foo", got);
+}
+
+test "multi-cursor forward delete removes whole codepoints" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+    try ed.buf.insert(0, "\xe4\xbd\xa0a\n\xe4\xbd\xa0b"); // 你a / 你b
+    ed.cursor.line = 0;
+    ed.cursor.col = 0;
+    try ed.cursors.append(std.testing.allocator, .{ .line = 1, .col = 0, .col_want = 0 });
+
+    _ = ed.handleKey(.delete);
+    var tmp: [32]u8 = undefined;
+    const got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
+    try std.testing.expectEqualStrings("a\nb", got);
+}
+
+test "pasted CR and CRLF normalize to LF" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+    _ = ed.handleKey(.{ .paste = "A\r\nB\rC" });
+    var tmp: [16]u8 = undefined;
+    const got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
+    try std.testing.expectEqualStrings("A\nB\nC", got);
+}
+
+test "Ctrl+D rename ignores a coexisting shift-selection" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+    for ("foo foo foo foo") |c| _ = ed.handleKey(.{ .char = c });
+    _ = ed.handleKey(.home);
+    var i: usize = 0;
+    while (i < 7) : (i += 1) _ = ed.handleKey(.shift_right);
+    try std.testing.expect(ed.sel_active);
+
+    // Cursor sits at the space after the 2nd foo, so the armed word is
+    // the 2nd foo and the secondary lands on the 3rd. Arming must drop
+    // the selection: replacing it would shift the secondary's offsets
+    // and the rename would hit text the user never targeted.
+    _ = ed.handleKey(.{ .ctrl = 'd' });
+    try std.testing.expect(!ed.sel_active);
+    _ = ed.handleKey(.{ .char = 'X' });
+    var tmp: [32]u8 = undefined;
+    const got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
+    try std.testing.expectEqualStrings("foo X X foo", got);
+}
+
+test "Enter and Tab apply at every cursor" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+    for ("ab ab") |c| _ = ed.handleKey(.{ .char = c });
+    ed.cursor.line = 0;
+    ed.cursor.col = 0;
+    _ = ed.handleKey(.{ .ctrl = 'd' }); // secondary at the other "ab"
+    try std.testing.expectEqual(@as(usize, 1), ed.cursors.items.len);
+
+    _ = ed.handleKey(.enter); // disarms rename, splits at both cursors
+    var tmp: [32]u8 = undefined;
+    var got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
+    try std.testing.expectEqualStrings("\nab \nab", got);
+
+    // Tab at both cursors (expand_tabs default on, tab_width 4; both
+    // cursors sit at visual col 0 -> 4 spaces each).
+    _ = ed.handleKey(.tab);
+    got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
+    try std.testing.expectEqualStrings("\n    ab \n    ab", got);
+}
+
+test "replace-and-next never re-matches inside its own replacement" {
+    var cfg = config_mod.Config.init();
+    var ed = try Editor.init(&cfg, std.testing.allocator);
+    defer ed.deinit();
+    for ("a b a") |c| _ = ed.handleKey(.{ .char = c });
+    ed.cursor.line = 0;
+    ed.cursor.col = 0;
+    _ = ed.handleKey(.{ .ctrl = 'h' });
+    _ = ed.handleKey(.{ .char = 'a' });
+    _ = ed.handleKey(.tab);
+    for ("aa") |c| _ = ed.handleKey(.{ .char = c });
+    // The first Enter must replace the first match AND advance the
+    // cursor to the second original match — it used to stay inside its
+    // own replacement ("a" -> "aa" re-matched itself forever, and the
+    // second real match was unreachable).
+    _ = ed.handleKey(.enter);
+    var tmp: [32]u8 = undefined;
+    var got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
+    try std.testing.expectEqualStrings("aa b a", got);
+    try std.testing.expectEqual(@as(usize, 5), ed.cursorBytePos());
+    _ = ed.handleKey(.enter);
+    _ = ed.handleKey(.escape);
+    got = ed.buf.contiguousSlice(0, ed.buf.logicalLen(), &tmp);
+    try std.testing.expectEqualStrings("aa b aa", got);
 }

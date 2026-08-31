@@ -491,9 +491,14 @@ pub const Renderer = struct {
                 if (at_line_end and ed.config.trailing_whitespace and line_data.len > 0 and !line_in_sel) {
                     const stripped = std.mem.trimEnd(u8, line_data, " \t\n\r");
                     if (stripped.len > 0 and stripped.len < line_data.len) {
-                        // Highlight trailing whitespace cells on this row
-                        if (stripped.len >= row_start_buf_col) {
-                            const tw_start_offset = stripped.len - row_start_buf_col;
+                        // Highlight trailing whitespace cells on this row.
+                        // stripped.len is a BYTE offset while the row
+                        // window is in visual columns — convert first, or
+                        // tabs/multi-byte text before the trailing run
+                        // shift the paint onto non-whitespace glyphs.
+                        const tw_start_visual = ed.byteColToVisualCol(file_line, stripped.len);
+                        if (tw_start_visual >= row_start_buf_col) {
+                            const tw_start_offset = tw_start_visual - row_start_buf_col;
                             var tw_col = screenColSat(code_start + this_indent, tw_start_offset);
                             while (tw_col < col and tw_col < code_end) : (tw_col += 1) {
                                 self.cellAt(screen_row, tw_col).bg = theme.trailing_ws;
