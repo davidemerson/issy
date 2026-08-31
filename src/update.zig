@@ -212,6 +212,19 @@ fn upgradeToStagedIfReady(
     if (stat.kind != .file) return;
     if (stat.size < 1024) return; // refuse empty/truncated binaries
 
+    // Don't advertise (or later try to apply) a staged binary that isn't
+    // strictly newer than us — apply() would refuse it anyway, and the
+    // status bar would be claiming an upgrade that can never happen.
+    const manifest_path = std.fmt.allocPrint(allocator, "{s}/sha256sums.txt", .{cache_dir}) catch return;
+    defer allocator.free(manifest_path);
+    const manifest = fsx.readFileAlloc(allocator, manifest_path, max_manifest_size) catch return;
+    defer allocator.free(manifest);
+    if (!applyOrderingOk(
+        build_info.commit_epoch,
+        manifestHeaderField(manifest, commit_header),
+        manifestEpoch(manifest),
+    )) return;
+
     state.status = .staged;
     var msg_buf: [128]u8 = undefined;
     const msg = std.fmt.bufPrint(&msg_buf, "update staged: {s}", .{state.latest_sha[0..7]}) catch {
@@ -747,6 +760,32 @@ fn copyFileBestEffort(src: []const u8, dst: []const u8) void {
 /// Verify the staged binary's SHA-256 against the cached signed
 /// manifest. Any failure (missing manifest, bad signature, hash
 /// mismatch) rejects the staged binary.
+/// May a staged binary described by this SIGNED manifest replace the
+/// running one?
+///
+/// Requires the manifest to name its release and to be strictly newer
+/// than the binary executing right now. Signature-and-hash alone is not
+/// enough: an authentic manifest for an OLDER release describes an
+/// authentic older binary, and installing it is a silent downgrade.
+/// That needs no attacker — stage release N+1, upgrade by hand to N+2,
+/// and the next idle would reinstall N+1 over it.
+///
+/// Fails CLOSED when our own epoch is unknown, the opposite of
+/// shouldNotify's fail-open. A refused apply costs the user nothing
+/// (they are still notified, and brew/install.sh still work), while an
+/// unordered apply is exactly the bug. Unlike the notify path this
+/// epoch comes from inside the signed manifest, so it cannot be forged
+/// without the signing key.
+fn applyOrderingOk(our_epoch: u64, manifest_commit: ?[]const u8, manifest_epoch: ?u64) bool {
+    const mc = manifest_commit orelse return false;
+    if (mc.len < 40) return false;
+    // Never reinstall the exact binary we are already running.
+    if (std.mem.eql(u8, mc[0..40], build_info.commit_sha[0..40])) return false;
+    if (our_epoch == 0) return false;
+    const me = manifest_epoch orelse return false;
+    return me > our_epoch;
+}
+
 fn verifyStagedBinary(
     allocator: std.mem.Allocator,
     cache_dir: []const u8,
@@ -763,6 +802,16 @@ fn verifyStagedBinary(
     defer allocator.free(sig_bytes);
 
     try verifyManifestSignature(manifest, sig_bytes);
+
+    // Bind the staged binary to a release that is actually newer than
+    // ours. Until this check existed, apply() re-verified only the
+    // signature and hash against the CACHED manifest, which an older
+    // authentic release satisfies perfectly.
+    if (!applyOrderingOk(
+        build_info.commit_epoch,
+        manifestHeaderField(manifest, commit_header),
+        manifestEpoch(manifest),
+    )) return error.StagedNotNewer;
 
     const asset_name = currentAssetName() orelse return error.NoAssetForPlatform;
     const expected_hex = findAssetHash(manifest, asset_name) orelse return error.AssetNotInManifest;
@@ -1164,4 +1213,29 @@ test "canAutoApply refuses once demoted to error_state" {
     try std.testing.expect(!canAutoApply(&state, &ed, &cfg, 0, min_idle_ms_default)); // not idle yet
     ed.modified = true;
     try std.testing.expect(!canAutoApply(&state, &ed, &cfg, 120_000, min_idle_ms_default)); // dirty buffer
+}
+
+test "applyOrderingOk refuses anything not strictly newer" {
+    const ours = build_info.commit_sha[0..];
+    const other = "2222222222222222222222222222222222222222";
+
+    // THE DOWNGRADE REPRO, which needs no attacker: release N+1 was
+    // staged, the user then upgraded by hand to N+2, and the staged
+    // older binary must not be installed over it.
+    try std.testing.expect(!applyOrderingOk(2000, other, 1000));
+
+    // Strictly newer: allowed.
+    try std.testing.expect(applyOrderingOk(1000, other, 2000));
+
+    // Same epoch is not newer.
+    try std.testing.expect(!applyOrderingOk(1000, other, 1000));
+
+    // Never reinstall the binary we're already running.
+    try std.testing.expect(!applyOrderingOk(1000, ours, 9999));
+
+    // Fails CLOSED on anything unknown — the opposite of shouldNotify.
+    try std.testing.expect(!applyOrderingOk(0, other, 2000)); // our epoch unknown
+    try std.testing.expect(!applyOrderingOk(1000, other, null)); // manifest epoch missing
+    try std.testing.expect(!applyOrderingOk(1000, null, 2000)); // manifest commit missing
+    try std.testing.expect(!applyOrderingOk(1000, "tooshort", 2000));
 }
