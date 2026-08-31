@@ -383,7 +383,12 @@ fn realMain() !void {
                 // apply either succeeds (noreturn, process is replaced) or
                 // returns an error — in which case we keep running and
                 // show the error in the status bar.
-                update_mod.apply(allocator, &ed) catch |e| {
+                update_mod.apply(allocator, &ed, .{
+                    .config_path = args.config_path,
+                    .theme = args.theme,
+                    .font = args.font,
+                    .no_config = args.no_config,
+                }) catch |e| {
                     var buf: [128]u8 = undefined;
                     const msg = std.fmt.bufPrint(&buf, "auto-update failed: {s}", .{@errorName(e)}) catch "auto-update failed";
                     ed.setStatusMessage(msg);

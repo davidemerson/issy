@@ -646,9 +646,80 @@ pub const ApplyError = error{
 /// On success this function does not return. On failure the caller
 /// should keep running the current binary; the staged binary is left
 /// in place for a retry on the next cycle.
+/// CLI state the re-exec must carry across the binary swap. Defined
+/// here (not in main.zig) because main.zig already imports this module
+/// and the reverse would be a circular import.
+pub const ReExecArgs = struct {
+    config_path: ?[]const u8 = null,
+    theme: ?[]const u8 = null,
+    font: ?[]const u8 = null,
+    no_config: bool = false,
+};
+
+/// Maximum argv the re-exec can produce: argv0, --resume V, --config V,
+/// --theme V, --font V, --no-config, file = 11.
+const max_reexec_argv = 12;
+
+/// Build the argv for the post-swap re-exec.
+///
+/// Pure so it can be tested: there is no way to integration-test a real
+/// re-exec without a signed staged binary, and this runs after the
+/// terminal has been torn down and the binary replaced — the least
+/// recoverable point in the program.
+///
+/// `filename` is null for an untitled buffer. It must NOT be
+/// Editor.getFilename(), which returns the literal "[untitled]" — that
+/// used to be passed as a real path, and the successor bound a buffer to
+/// it so the next Ctrl+S created a file called "[untitled]".
+fn buildReExecArgv(
+    buf: *[max_reexec_argv][]const u8,
+    argv0: []const u8,
+    resume_path: []const u8,
+    filename: ?[]const u8,
+    reexec: ReExecArgs,
+) []const []const u8 {
+    var n: usize = 0;
+    buf[n] = argv0;
+    n += 1;
+    buf[n] = "--resume";
+    n += 1;
+    buf[n] = resume_path;
+    n += 1;
+    // Preserve the flags the session was started with; dropping them
+    // silently changed the user's theme/font/config after an update.
+    if (reexec.no_config) {
+        buf[n] = "--no-config";
+        n += 1;
+    }
+    if (reexec.config_path) |v| {
+        buf[n] = "--config";
+        n += 1;
+        buf[n] = v;
+        n += 1;
+    }
+    if (reexec.theme) |v| {
+        buf[n] = "--theme";
+        n += 1;
+        buf[n] = v;
+        n += 1;
+    }
+    if (reexec.font) |v| {
+        buf[n] = "--font";
+        n += 1;
+        buf[n] = v;
+        n += 1;
+    }
+    if (filename) |f| {
+        buf[n] = f;
+        n += 1;
+    }
+    return buf[0..n];
+}
+
 pub fn apply(
     allocator: std.mem.Allocator,
     ed: *const editor_mod.Editor,
+    reexec: ReExecArgs,
 ) ApplyError!noreturn {
     const cache_dir = ensureCacheDir(allocator) catch return ApplyError.NoCacheDir;
     defer allocator.free(cache_dir);
@@ -710,15 +781,13 @@ pub fn apply(
     // flushes the write buffer.
     term.deinit();
 
-    // Build argv: [argv0, "--resume", resume_path, filename]. If the
-    // editor doesn't currently have an open file, omit the last argument.
-    const filename_slice = ed.getFilename();
-    var argv_slice = [_][]const u8{ undefined, undefined, undefined, undefined };
-    argv_slice[0] = argv0;
-    argv_slice[1] = "--resume";
-    argv_slice[2] = resume_path;
-    argv_slice[3] = filename_slice;
-    const argv = if (filename_slice.len == 0) argv_slice[0..3] else argv_slice[0..4];
+    // Ask the editor whether it HAS a filename rather than what
+    // getFilename() renders: that returns "[untitled]" for an untitled
+    // buffer, so the old `len == 0` guard was dead and the placeholder
+    // was passed to the successor as a real path.
+    const filename: ?[]const u8 = if (ed.filename_len == 0) null else ed.getFilename();
+    var argv_buf: [max_reexec_argv][]const u8 = undefined;
+    const argv = buildReExecArgv(&argv_buf, argv0, resume_path, filename, reexec);
 
     // fsx.execv replaces the current process image on success.
     fsx.execv(allocator, argv) catch {
@@ -1238,4 +1307,48 @@ test "applyOrderingOk refuses anything not strictly newer" {
     try std.testing.expect(!applyOrderingOk(1000, other, null)); // manifest epoch missing
     try std.testing.expect(!applyOrderingOk(1000, null, 2000)); // manifest commit missing
     try std.testing.expect(!applyOrderingOk(1000, "tooshort", 2000));
+}
+
+test "buildReExecArgv preserves CLI state and never invents a filename" {
+    var buf: [max_reexec_argv][]const u8 = undefined;
+
+    // Untitled buffer: exactly 3 args. Passing Editor.getFilename() here
+    // used to hand the successor the literal "[untitled]", which it bound
+    // as a real path — the next Ctrl+S then created a file by that name.
+    const bare = buildReExecArgv(&buf, "/bin/issy", "/c/r.txt", null, .{});
+    try std.testing.expectEqual(@as(usize, 3), bare.len);
+    try std.testing.expectEqualStrings("/bin/issy", bare[0]);
+    try std.testing.expectEqualStrings("--resume", bare[1]);
+    try std.testing.expectEqualStrings("/c/r.txt", bare[2]);
+
+    // With a file.
+    const withfile = buildReExecArgv(&buf, "/bin/issy", "/c/r.txt", "notes.md", .{});
+    try std.testing.expectEqual(@as(usize, 4), withfile.len);
+    try std.testing.expectEqualStrings("notes.md", withfile[3]);
+
+    // Flags survive the swap; previously all four were dropped, so an
+    // update silently changed the user's theme, font and config.
+    const full = buildReExecArgv(&buf, "/bin/issy", "/c/r.txt", "notes.md", .{
+        .config_path = "/etc/issyrc",
+        .theme = "paper",
+        .font = "/f.ttf",
+        .no_config = true,
+    });
+    try std.testing.expectEqual(@as(usize, 11), full.len);
+    try std.testing.expect(full.len <= max_reexec_argv);
+    var joined: [256]u8 = undefined;
+    var w: usize = 0;
+    for (full) |a| {
+        @memcpy(joined[w..][0..a.len], a);
+        w += a.len;
+        joined[w] = ' ';
+        w += 1;
+    }
+    const line = joined[0..w];
+    try std.testing.expect(std.mem.indexOf(u8, line, "--no-config") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "--config /etc/issyrc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "--theme paper") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "--font /f.ttf") != null);
+    // The file always comes last, so it is never mistaken for a flag value.
+    try std.testing.expectEqualStrings("notes.md", full[full.len - 1]);
 }
