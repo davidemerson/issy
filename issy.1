@@ -728,10 +728,22 @@ Auto-apply is a no-op when:
 .IP \(bu 2
 The install path is owned by root (the binary is not writable by the
 running user).
+In that case nothing is downloaded either \(em the check stays
+notify-only, with no wasted bandwidth and no recurring failure notice.
 .IP \(bu 2
 The binary is a dev build.
 .IP \(bu 2
 The platform has no prebuilt binary (macOS \(em see below).
+.IP \(bu 2
+The staged release is not strictly newer than the running binary.
+Both carry their commit timestamp, and an authentic but older staged
+binary is refused rather than installed as a downgrade.
+.PP
+For the same reason,
+.B "update available"
+appears only for a release that is genuinely newer, not merely one whose
+commit differs \(em otherwise a cache left over from a manual upgrade
+would advertise the version you just replaced.
 .PP
 On macOS,
 .B issy

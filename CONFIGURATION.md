@@ -51,16 +51,16 @@ Blank lines and lines starting with `#` are ignored. Unknown keys are silently s
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `notify_updates` | bool | `true` | On startup, check whether a newer release exists and show `update available: <sha>` in the status bar. Set to `false` to disable the check (and the background network fetch that refreshes its cache) entirely. |
-| `autoupdate` | bool | `false` | Opt into automatic download, signature verification, and in-session apply. When on, the editor downloads the signed `sha256sums.txt` manifest from the latest release, verifies it against the Ed25519 public key committed to `src/update_key.zig`, checks the manifest's embedded commit + monotonic epoch against the cached high-water mark (rejecting replayed older releases), downloads the matching platform binary, hashes it, stages it at `~/.cache/issy/issy.staged`, and — when the buffer is clean and the editor has been idle for 60 seconds — re-verifies the staged binary against the cached signed manifest, atomic-renames it into place, and re-execs. |
+| `notify_updates` | bool | `true` | On startup, check whether a **newer** release exists and show `update available: <sha>` in the status bar. Newer is decided by the commit timestamp both the release and the running binary carry, so a stale cache (right after a manual upgrade, or while offline) can't advertise a downgrade. Set to `false` to disable the check (and the background network fetch that refreshes its cache) entirely. |
+| `autoupdate` | bool | `false` | Opt into automatic download, signature verification, and in-session apply. When on, the editor downloads the signed `sha256sums.txt` manifest from the latest release, verifies it against the Ed25519 public key committed to `src/update_key.zig`, checks the manifest's embedded commit + monotonic epoch against the cached high-water mark (rejecting replayed older releases), downloads the matching platform binary, hashes it, stages it at `~/.cache/issy/issy.staged`, and — when the buffer is clean, the binary is writable, and the editor has been idle for 60 seconds — re-verifies the staged binary against the cached signed manifest, confirms the release it names is strictly newer than the running build, atomic-renames it into place, and re-execs (preserving `--config`/`--theme`/`--font`/`--no-config`). |
 
-Both keys are no-ops for `dev` builds (any working tree that wasn't built from a clean CI checkout). When the editor binary itself is not writable by the running user — the common case for distro-packaged installs at `/usr/bin/issy` — the background worker still fetches, verifies, and stages the update in the cache, but the in-session apply is silently skipped, so the editor effectively stays in notify-only mode.
+Both keys are no-ops for `dev` builds (any working tree that wasn't built from a clean CI checkout). When the editor binary itself is not writable by the running user — the common case for distro-packaged installs at `/usr/bin/issy` — the worker refreshes the release check but downloads nothing and never attempts an apply. It is genuinely notify-only: no wasted bandwidth, and no recurring "auto-update failed" notice.
 
 **macOS specifically**: `autoupdate = true` is silently a no-op because issy does not ship prebuilt macOS binaries (cross-compiled Mach-O from Linux has no code signature and is refused by the Apple Silicon kernel). `notify_updates` still works — macOS users see the "update available" notice and run `brew upgrade issy` (or `brew upgrade --fetch-HEAD issy` if they installed with `--HEAD`) to actually update.
 
 The complete cache layout (all under `~/.cache/issy/`):
 
-- `commit.txt` — latest-release commit SHA
+- `commit.txt` — latest-release commit SHA and its timestamp (`<sha> <epoch>`), the pair that decides whether a release is newer
 - `sha256sums.txt` / `sha256sums.txt.sig` — verified signed manifest + signature; used to re-verify `issy.staged` at apply time
 - `manifest_epoch.txt` — highest manifest epoch ever accepted (anti-rollback high-water mark)
 - `issy.staged` — verified replacement binary, waiting to be applied

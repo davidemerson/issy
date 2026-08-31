@@ -358,9 +358,10 @@ seed_rc() {
 
 # ── Auto-update ──
 #
-# Release builds check the latest GitHub release on startup. Both keys
-# are silent no-ops if the issy binary is not writable by the current
-# user (e.g. a root-owned install).
+# Release builds check the latest GitHub release on startup. If the
+# binary is not writable by you (e.g. a root-owned install), the check
+# still runs but nothing is downloaded and no apply is attempted —
+# notify-only, with no recurring failure notice.
 
 # notify_updates = true      # status-bar "update available" hint
 # autoupdate = false         # opt-in: auto-download + verify + in-session re-exec
