@@ -23,6 +23,22 @@ TMPDIR="$(mktemp -d)"
 export TMPDIR
 trap 'rm -rf "$TMPDIR"' EXIT
 
+# Everything past this point runs against a scratch HOME. Two separate
+# leaks made that necessary: a clean tree stamps build_type=.release, so
+# every spawned editor forks an update worker that fetches from
+# github.com and rewrites ~/.cache/issy/commit.txt; and every suite
+# writes ~/.cache/issy/positions.txt. A test run must not touch the
+# developer's (or CI's) real state, and must not depend on the network.
+# The build above deliberately ran with the real HOME so zig's global
+# cache is reused; suites that need it back read ISSY_TESTS_REAL_HOME.
+export ISSY_TESTS_REAL_HOME="$HOME"
+REAL_CACHE_FINGERPRINT="$(find "$HOME/.cache/issy" -type f -printf '%p %s %T@\n' 2>/dev/null | sort)"
+export HOME="$TMPDIR/home"
+mkdir -p "$HOME"
+# Belt and braces: current suites all pass --no-config, so this is only
+# read by suites that deliberately omit it.
+printf 'notify_updates = false\nautoupdate = false\n' > "$HOME/.issyrc"
+
 PASS=0
 FAIL=0
 SKIP=0
@@ -57,6 +73,15 @@ for exp in "$SCRIPT_DIR"/t[0-9][0-9]_*.exp; do
     TOTAL=$((TOTAL + 1))
     echo ""
 done
+
+# Isolation check: no suite may touch the developer's real update cache.
+# A suite that regresses on this would otherwise fail silently and start
+# depending on network state again.
+NOW_FINGERPRINT="$(find "$ISSY_TESTS_REAL_HOME/.cache/issy" -type f -printf '%p %s %T@\n' 2>/dev/null | sort)"
+if [ "$NOW_FINGERPRINT" != "$REAL_CACHE_FINGERPRINT" ]; then
+    echo "ISOLATION FAILURE: the suite modified $ISSY_TESTS_REAL_HOME/.cache/issy"
+    FAIL=$((FAIL + 1))
+fi
 
 echo "==============================="
 echo "  SUITES: $TOTAL"
