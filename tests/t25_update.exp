@@ -91,7 +91,31 @@ if {[catch {
 }
 set pubkey [string trim [exec cat "$tmpdir/rel-good/pubkey.hex"]]
 
-set port 18421
+# Port 0 lets the OS pick a free one, which the server prints; a
+# hard-coded port is a classic CI flake when anything else on the runner
+# happens to hold it. Resolved after the server starts, below.
+set port 0
+set base ""
+
+
+# --- Fixture server -------------------------------------------------
+set server_pid [exec python3 -u -m http.server -b 127.0.0.1 -d "$tmpdir/serve" 0 \
+                > "$tmpdir/server.log" 2>@1 &]
+# "Serving HTTP on 127.0.0.1 port NNNNN" — wait for it rather than
+# assuming the server is up after a fixed sleep.
+set port ""
+for {set i 0} {$i < 100} {incr i} {
+    after 100
+    if {[catch {set fh [open "$tmpdir/server.log" r]}]} continue
+    set logtext [read $fh]
+    close $fh
+    if {[regexp {port (\d+)} $logtext -> p]} { set port $p; break }
+}
+if {$port eq ""} {
+    puts stderr "SKIP t25_update: fixture server did not start"
+    cleanup
+    exit 77
+}
 set base "http://127.0.0.1:$port/"
 
 # The override build deliberately warns on stderr, and Tcl's exec treats
@@ -124,11 +148,6 @@ proc make_variant {name variant} {
         --asset "$tmpdir/new/bin/issy" --commit $NEW_SHA --epoch $NEW_EPOCH --variant $variant 2>@1
 }
 foreach v {good bad-sig commit-mismatch epoch-old hash-wrong} { make_variant $v $v }
-
-# --- Fixture server -------------------------------------------------
-set server_pid [exec python3 -m http.server -b 127.0.0.1 -d "$tmpdir/serve" $port \
-                > "$tmpdir/server.log" 2>@1 &]
-sleep 1
 
 proc serve {name} {
     global tmpdir
