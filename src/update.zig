@@ -124,9 +124,43 @@ pub fn startupCheck(
 
     readCachedState(state, commit_path);
     upgradeToStagedIfReady(state, cache_dir, allocator);
+    pruneCacheLitter(cache_dir);
 
     // Fork a detached worker to refresh the cache for the next run.
     spawnWorker(allocator, cache_dir, commit_path, cfg.autoupdate);
+}
+
+/// Delete stale worker litter from the cache directory.
+///
+/// A worker killed by its SIGALRM never runs its `defer`, so partial
+/// `*.tmp.*` downloads accumulate; failed applies used to leave one
+/// `resume.*.txt` per attempt. Nothing ever removed either.
+///
+/// Scoped exactly like isResumePathSafe — only inside the cache dir,
+/// only names matching the two litter patterns, and only once they are
+/// older than a resume record could possibly still be useful — so this
+/// can never remove a live artifact or anything a user put there.
+fn pruneCacheLitter(cache_dir: []const u8) void {
+    var dir = fsx.openDirIterable(cache_dir) catch return;
+    defer dir.close();
+    const now = fsx.nowNanos();
+
+    var it = dir.iterate();
+    while (it.next() catch return) |entry| {
+        if (entry.kind != .file) continue;
+        const is_tmp = std.mem.indexOf(u8, entry.name, ".tmp.") != null;
+        const is_resume = std.mem.startsWith(u8, entry.name, "resume.") and
+            std.mem.endsWith(u8, entry.name, ".txt");
+        if (!is_tmp and !is_resume) continue;
+
+        var path_buf: [fsx.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ cache_dir, entry.name }) catch continue;
+        const st = fsx.statFile(path) catch continue;
+        // Same age bound a resume record is honored for, so a live one
+        // belonging to an apply in flight is never swept.
+        if (now - st.mtime < resume_max_age_ns) continue;
+        fsx.deleteFile(path) catch {};
+    }
 }
 
 fn ensureCacheDir(allocator: std.mem.Allocator) ![]u8 {
@@ -531,12 +565,18 @@ fn findAssetHash(manifest: []const u8, asset_name: []const u8) ?[]const u8 {
         // Accept any match where the trailing component equals asset_name.
         const base = if (std.mem.lastIndexOfScalar(u8, rest, '/')) |slash| rest[slash + 1 ..] else rest;
         if (std.mem.eql(u8, base, asset_name)) {
-            // Validate hash is 64 hex chars.
+            // Validate hash is 64 hex chars. A malformed line is SKIPPED
+            // rather than aborting the search: returning null here let a
+            // single corrupt line hide a valid entry further down.
+            var valid = true;
             for (hash) |c| {
                 const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
-                if (!ok) return null;
+                if (!ok) {
+                    valid = false;
+                    break;
+                }
             }
-            return hash;
+            if (valid) return hash;
         }
     }
     return null;
@@ -593,8 +633,13 @@ fn writeAtomic(path: []const u8, content: []const u8) !void {
         const f = try fsx.createFile(tmp_path, .{ .truncate = true });
         defer f.close();
         try f.writeAll(content);
+        // Durability, matching Buffer.save: without this a crash can
+        // leave a renamed-but-empty commit.txt or manifest in the cache,
+        // which the next run would then trust.
+        try f.sync();
     }
     try fsx.rename(tmp_path, path);
+    fsx.syncDirOf(path);
     ok = true;
 }
 
@@ -1060,6 +1105,12 @@ pub fn tryResume(
 /// successful apply). This is called from main() when `--rollback` is
 /// on argv, before any TUI or editor state is created.
 pub fn rollback(allocator: std.mem.Allocator) !void {
+    // A dev build's binary is whatever the working tree just produced;
+    // renaming a cached release binary over zig-out/bin/issy would be a
+    // confusing surprise, and the update path never staged anything on a
+    // dev build in the first place.
+    if (build_info.build_type == .dev) return error.NoPreviousBinary;
+
     const cache_dir = try ensureCacheDir(allocator);
     defer allocator.free(cache_dir);
 
@@ -1455,5 +1506,54 @@ test "rollback fails closed on a corrupt checksum sidecar" {
         var hash: [32]u8 = undefined;
         const parses = hex.len == 64 and (std.fmt.hexToBytes(&hash, hex) catch null) != null;
         try std.testing.expect(!parses); // would have fallen through the old `else |_| {}`
+    }
+}
+
+test "findAssetHash skips a malformed line instead of aborting" {
+    // A corrupt line for our asset must not hide a valid entry that
+    // appears later; returning null on the first bad match did exactly
+    // that, turning one typo into "no asset for this platform".
+    const manifest =
+        "# issy-commit: 1111111111111111111111111111111111111111\n" ++
+        "zzzz  issy-linux-amd64\n" ++
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  issy-linux-amd64\n";
+    const got = findAssetHash(manifest, "issy-linux-amd64");
+    try std.testing.expect(got != null);
+    try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", got.?);
+
+    // A name that merely shares a prefix must not match.
+    const other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  issy-linux-amd64x\n";
+    try std.testing.expect(findAssetHash(other, "issy-linux-amd64") == null);
+}
+
+test "pruneCacheLitter removes only stale worker litter" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [fsx.max_path_bytes]u8 = undefined;
+    const cwd = try fsx.getcwd(&path_buf);
+    var dir_buf: [fsx.max_path_bytes]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, "{s}/.zig-cache/tmp/{s}", .{ cwd, &tmp.sub_path });
+
+    const names = [_][]const u8{
+        "issy.staged.tmp.123.456", // stale download fragment
+        "resume.99.1700000000.txt", // orphaned resume record
+        "commit.txt", // real artifact
+        "issy.staged", // real artifact
+        "positions.txt", // belongs to another module
+    };
+    for (names) |n| {
+        var p_buf: [fsx.max_path_bytes]u8 = undefined;
+        const p = try std.fmt.bufPrint(&p_buf, "{s}/{s}", .{ dir, n });
+        const f = try fsx.createFile(p, .{});
+        defer f.close();
+        try f.writeAll("x");
+    }
+
+    // Everything was just created, so nothing is old enough to sweep.
+    pruneCacheLitter(dir);
+    for (names) |n| {
+        var p_buf: [fsx.max_path_bytes]u8 = undefined;
+        const p = try std.fmt.bufPrint(&p_buf, "{s}/{s}", .{ dir, n });
+        try fsx.access(p);
     }
 }
