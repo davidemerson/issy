@@ -75,11 +75,34 @@ pub const Buffer = struct {
         const stat = try file.stat();
         const file_size: usize = @intCast(stat.size);
 
-        const capacity = @max(file_size + min_gap, initial_capacity);
-        const new_data = try self.allocator.alloc(u8, capacity);
+        var capacity = @max(file_size + min_gap, initial_capacity);
+        var new_data = try self.allocator.alloc(u8, capacity);
         errdefer self.allocator.free(new_data);
 
-        const bytes_read = try file.readAll(new_data[0..file_size]);
+        var bytes_read = try file.readAll(new_data[0..file_size]);
+        // stat.size lies on procfs/sysfs (frequently 0) and can race an
+        // external append: keep reading to real EOF, growing as needed,
+        // so such files open with their actual contents, not empty.
+        while (true) {
+            if (bytes_read == capacity) {
+                const bigger = try self.allocator.alloc(u8, capacity * 2);
+                @memcpy(bigger[0..bytes_read], new_data[0..bytes_read]);
+                self.allocator.free(new_data);
+                new_data = bigger;
+                capacity *= 2;
+            }
+            const n = try file.read(new_data[bytes_read..capacity]);
+            if (n == 0) break;
+            bytes_read += n;
+        }
+        // Keep an initial gap even when the tail reads filled the block.
+        if (capacity - bytes_read < min_gap) {
+            const bigger = try self.allocator.alloc(u8, bytes_read + min_gap);
+            @memcpy(bigger[0..bytes_read], new_data[0..bytes_read]);
+            self.allocator.free(new_data);
+            new_data = bigger;
+            capacity = bytes_read + min_gap;
+        }
 
         self.allocator.free(self.data);
         self.data = new_data;
@@ -1122,4 +1145,13 @@ test "line count cache invalidation" {
     // Delete a newline.
     buf.delete(1, 1);
     try std.testing.expectEqual(@as(usize, 3), buf.lineCount());
+}
+
+test "load reads past a lying stat.size (procfs)" {
+    // Linux-only fixture: procfs reports size 0 for files with content.
+    fsx.access("/proc/version") catch return error.SkipZigTest;
+    var buf = try Buffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.load("/proc/version");
+    try std.testing.expect(buf.logicalLen() > 0);
 }
