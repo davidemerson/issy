@@ -209,6 +209,11 @@ fn realMain() !void {
     var cfg_path_buf: [fsx.max_path_bytes]u8 = undefined;
     var cfg_path_len: usize = 0;
     var cfg_mtime: i128 = 0;
+    // Reload debounce: an mtime change is only acted on once it has held
+    // still for a full tick, so a non-atomic external save can never be
+    // read mid-write (which applied a half-written config — defaults for
+    // everything after the cut — for a second).
+    var cfg_pending_mtime: i128 = 0;
 
     if (!args.no_config) {
         if (args.config_path) |p| {
@@ -331,19 +336,24 @@ fn realMain() !void {
             ed.maybeAutosaveSwap();
             // Config auto-reload: if ~/.issyrc (or --config path) has a
             // newer mtime than what we last loaded, reread it and
-            // reapply CLI overrides. A zero-byte read is skipped (and
-            // cfg_mtime is NOT advanced) so the truncate window of a
-            // non-atomic external save doesn't momentarily blank the
-            // settings back to defaults; the next tick retries once the
-            // write completes.
+            // reapply CLI overrides. Two guards against catching a
+            // non-atomic external save mid-write: a zero-byte read is
+            // skipped (cfg_mtime NOT advanced), and the reload is
+            // debounced — it only fires once the new mtime has held
+            // still for a full tick, so a half-written file (defaults
+            // for everything after the cut) is never applied.
             if (cfg_path_len > 0) {
                 if (config_mod.statMtime(cfg_path_buf[0..cfg_path_len])) |m| {
                     if (m != cfg_mtime and config_mod.hasContent(cfg_path_buf[0..cfg_path_len])) {
-                        cfg = config_mod.load(cfg_path_buf[0..cfg_path_len]);
-                        applyCliOverrides(&cfg, args);
-                        cfg_mtime = m;
-                        ed.setStatusMessage("Config reloaded.");
-                        needs_redraw = true;
+                        if (m == cfg_pending_mtime) {
+                            cfg = config_mod.load(cfg_path_buf[0..cfg_path_len]);
+                            applyCliOverrides(&cfg, args);
+                            cfg_mtime = m;
+                            ed.setStatusMessage("Config reloaded.");
+                            needs_redraw = true;
+                        } else {
+                            cfg_pending_mtime = m;
+                        }
                     }
                 }
             }
