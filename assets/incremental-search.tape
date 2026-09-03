@@ -19,6 +19,10 @@ Set Theme "Dracula"
 Set TypingSpeed 120ms
 
 Hide
+# Isolate from the recording user's real ~/.cache/issy (saved cursor
+# positions would otherwise change where the file opens).
+Type "export HOME=$(mktemp -d)"
+Enter
 Type "./zig-out/bin/issy --no-config src/editor.zig"
 Enter
 Sleep 1s
@@ -47,5 +51,7 @@ Sleep 1200ms
 Escape
 Sleep 600ms
 
+# Quit (hidden, so the GIF ends on the editor).
+Hide
 Ctrl+Q
 Sleep 400ms

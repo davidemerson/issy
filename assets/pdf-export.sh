@@ -6,19 +6,31 @@
 # use pdftoppm to rasterize the first page to PNG for the README.
 #
 # Dependencies:
-#   - A monospace TTF/OTF font (override FONT below if yours differs)
-#   - pdftoppm (brew install poppler)
+#   - A monospace TTF/OTF font (set FONT if neither default candidate exists)
+#   - pdftoppm (brew install poppler / apt install poppler-utils)
 #
 # Run from the repo root:  bash assets/pdf-export.sh
 
 set -eu
 
-FONT="${FONT:-/Users/david/Library/Fonts/Berkeley Mono Variable NNIX.ttf}"
+# First existing candidate wins. The Linux entry is a static instance of
+# the variable font (PDF has no CFF2, so the variable OTF itself embeds
+# as an invalid font program that viewers have to substitute around).
+if [ -z "${FONT:-}" ]; then
+    for candidate in \
+        "/Users/david/Library/Fonts/Berkeley Mono Variable NNIX.ttf" \
+        "$HOME/.local/share/issy/BerkeleyMonoNNIX-Regular.otf"; do
+        if [ -f "$candidate" ]; then
+            FONT="$candidate"
+            break
+        fi
+    done
+fi
 INPUT="${INPUT:-src/editor.zig}"
 OUT="${OUT:-assets/pdf-export.png}"
 
-if [ ! -f "$FONT" ]; then
-    echo "error: font not found at $FONT" >&2
+if [ -z "${FONT:-}" ] || [ ! -f "$FONT" ]; then
+    echo "error: font not found${FONT:+ at $FONT}" >&2
     echo "       set FONT to a TTF/OTF path and re-run" >&2
     exit 1
 fi

@@ -21,6 +21,10 @@ Set Padding 20
 Set Theme "Builtin Solarized Light"
 
 Hide
+# Isolate from the recording user's real ~/.cache/issy (saved cursor
+# positions would otherwise change where the file opens).
+Type "export HOME=$(mktemp -d)"
+Enter
 Type "./zig-out/bin/issy --no-config --theme paper src/editor.zig"
 Enter
 Sleep 1500ms
@@ -31,5 +35,6 @@ Show
 
 Sleep 2s
 
+Hide
 Ctrl+Q
 Sleep 300ms

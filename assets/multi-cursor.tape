@@ -1,9 +1,10 @@
-# Multi-cursor demo for issy's README.
+# Multi-cursor rename demo for issy's README.
 #
-# Opens a small Zig file with three `u8` fields, uses Ctrl+D twice to
-# add a cursor on each subsequent occurrence of the word under the
-# primary cursor, then deletes "u8" at all three positions and types
-# "f32" in its place — all three fields are renamed in one shot.
+# Opens a small Zig file with three `u8` fields. Ctrl+D selects the word
+# under the cursor and adds a cursor at the next occurrence; pressing it
+# again keeps adding. Each press arms a rename: the word is highlighted
+# at every secondary cursor, and the first character typed replaces it
+# everywhere in one shot. Subsequent characters insert at every cursor.
 #
 # Rebuild with:  vhs assets/multi-cursor.tape
 
@@ -19,6 +20,10 @@ Set Theme "Dracula"
 Set TypingSpeed 70ms
 
 Hide
+# Isolate from the recording user's real ~/.cache/issy (saved cursor
+# positions would otherwise change where the file opens).
+Type "export HOME=$(mktemp -d)"
+Enter
 Type "./zig-out/bin/issy --no-config assets/demo/palette.zig"
 Enter
 Sleep 800ms
@@ -34,18 +39,15 @@ Sleep 300ms
 Right Right Right Right Right Right Right Right Right
 Sleep 800ms
 
-# Ctrl+D twice — adds a cursor at the next two occurrences of "u8".
+# Ctrl+D twice — adds a cursor at the next two occurrences of "u8" and
+# arms the rename. The armed word is highlighted at each secondary.
 Ctrl+D
-Sleep 500ms
+Sleep 700ms
 Ctrl+D
-Sleep 800ms
+Sleep 1400ms
 
-# Remove "u8" at all three cursors.
-Delete
-Delete
-Sleep 400ms
-
-# Type the replacement. All three cursors get "f32".
+# Type the replacement. The first character replaces "u8" at all three
+# cursors; the rest insert at all three.
 Type "f32"
 Sleep 1500ms
 
@@ -53,7 +55,8 @@ Sleep 1500ms
 Escape
 Sleep 800ms
 
-# Quit without saving.
+# Quit without saving (hidden, so the GIF ends on the editor).
+Hide
 Ctrl+Q
 Sleep 400ms
 Ctrl+Q
